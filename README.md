@@ -1,0 +1,11 @@
+# Code Compass (AIForge)
+
+A web-based AI coding editor with Chat, Composer, and Agent modes. Bring your own LLM keys (OpenRouter, OpenAI, Gemini, Perplexity).
+
+## GitHub integration (short pitch)
+
+My app can log into your GitHub, work directly on your repo on a separate branch, and—with your consent each time—commit, push, and open PRs for you, very similar to how Perplexity's GitHub connector works.
+
+## Getting started
+
+See `.env.local.example` for required environment variables. Run `npm install` and `npm run dev`.
