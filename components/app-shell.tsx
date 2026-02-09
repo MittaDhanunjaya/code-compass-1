@@ -12,6 +12,9 @@ import { EditorArea } from "@/components/editor-area";
 import { FileTree } from "@/components/file-tree";
 import { UserMenu } from "@/components/user-menu";
 import { WorkspaceSelector } from "@/components/workspace-selector";
+import { CmdKOverlay } from "@/components/cmd-k-overlay";
+import { FirstRunChecklist } from "@/components/first-run-checklist";
+import { RulesEditorDialog } from "@/components/rules-editor-dialog";
 
 type AIPanelTab = "chat" | "composer" | "agent";
 
@@ -24,6 +27,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
       ? pathname.replace("/app/", "").split("/")[0]
       : null;
   const [aiPanelTab, setAiPanelTab] = useState<AIPanelTab>("chat");
+  const [rulesDialogOpen, setRulesDialogOpen] = useState(false);
 
   useEffect(() => {
     if (pathname !== "/app" || isSettings) return;
@@ -40,6 +44,12 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     };
   }, [pathname, isSettings, router]);
 
+  useEffect(() => {
+    const openRules = () => setRulesDialogOpen(true);
+    window.addEventListener("open-rules-editor", openRules);
+    return () => window.removeEventListener("open-rules-editor", openRules);
+  }, []);
+
   return (
     <div className="flex h-screen w-full overflow-hidden bg-background">
       {/* Left sidebar */}
@@ -49,11 +59,27 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
         </div>
         <div className="flex-1 overflow-y-auto p-2">
           <WorkspaceSelector />
+          {workspaceId && (
+            <button
+              type="button"
+              onClick={() => setRulesDialogOpen(true)}
+              className="mt-2 flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+              title="Edit project rules (.aiforge-rules) used by Agent and Composer"
+            >
+              Project rules
+            </button>
+          )}
           <div className="mt-4">
             <FileTree workspaceId={workspaceId} />
           </div>
         </div>
         <div className="border-t border-border p-2 space-y-1">
+          <Link
+            href="/app/get-started"
+            className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+          >
+            Get started
+          </Link>
           <Link
             href="/app/settings"
             className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground"
@@ -92,6 +118,27 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
         <ChatPanel workspaceId={workspaceId} activeTab={aiPanelTab} />
       </aside>
       <CommandPalette />
+      <FirstRunChecklist />
+      <RulesEditorDialog
+        workspaceId={workspaceId}
+        open={rulesDialogOpen}
+        onOpenChange={setRulesDialogOpen}
+      />
+      {workspaceId && (
+        <CmdKOverlay
+          workspaceId={workspaceId}
+          onAction={(action, selection, filePath) => {
+            // Switch to chat tab and send action as message
+            setAiPanelTab("chat");
+            // Trigger action via custom event that ChatPanel will listen to
+            window.dispatchEvent(
+              new CustomEvent("cmd-k-action", {
+                detail: { action, selection, filePath },
+              })
+            );
+          }}
+        />
+      )}
     </div>
   );
 }

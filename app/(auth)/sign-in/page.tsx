@@ -31,24 +31,23 @@ export default function SignInPage() {
     router.refresh();
   }
 
-  async function handleSignInWithGitHub() {
+  async function handleSignInWithOAuth(provider: "github" | "google") {
     setError(null);
     try {
       const supabase = createClient();
       const origin = typeof window !== "undefined" ? window.location.origin : "";
+      const options: { redirectTo: string; scopes?: string } = { redirectTo: `${origin}/auth/callback` };
+      if (provider === "github") options.scopes = "repo read:user";
       const { error } = await supabase.auth.signInWithOAuth({
-        provider: "github",
-        options: {
-          redirectTo: `${origin}/auth/callback`,
-          scopes: "repo read:user",
-        },
+        provider,
+        options,
       });
       if (error) {
         setError(error.message);
         return;
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Sign in with GitHub failed");
+      setError(e instanceof Error ? e.message : `Sign in with ${provider === "github" ? "GitHub" : "Google"} failed`);
     }
   }
 
@@ -99,17 +98,27 @@ export default function SignInPage() {
           <span className="w-full border-t border-border" />
         </div>
         <div className="relative flex justify-center text-xs uppercase text-muted-foreground">
-          <span className="bg-background px-2">Or</span>
+          <span className="bg-background px-2">Or sign in with</span>
         </div>
       </div>
-      <Button
-        type="button"
-        variant="outline"
-        className="w-full"
-        onClick={handleSignInWithGitHub}
-      >
-        Sign in with GitHub
-      </Button>
+      <div className="grid grid-cols-2 gap-2">
+        <Button
+          type="button"
+          variant="outline"
+          className="w-full"
+          onClick={() => handleSignInWithOAuth("google")}
+        >
+          Google
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          className="w-full"
+          onClick={() => handleSignInWithOAuth("github")}
+        >
+          GitHub
+        </Button>
+      </div>
       <p className="text-sm text-muted-foreground">
         You can connect your GitHub account, open any repo (including private ones), and let the AI read and understand your code. When you ask it to, it can create a branch, apply edits, commit, push, and open a pull request for you. Every write goes through a confirmation dialog first, and it never modifies your default branch without your explicit approval.
       </p>

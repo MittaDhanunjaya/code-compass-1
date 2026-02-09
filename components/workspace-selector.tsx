@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
-import { Download, FolderOpen, Github, GitBranch, GitPullRequest, MoreHorizontal, Pencil, Plus, Settings, Trash2 } from "lucide-react";
+import { Download, FolderOpen, Github, GitBranch, GitPullRequest, MoreHorizontal, Pencil, Plus, RefreshCw, Settings, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -20,6 +20,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { ErrorWithAction } from "@/components/error-with-action";
 
 type Workspace = {
   id: string;
@@ -51,7 +52,7 @@ export function WorkspaceSelector() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [loading, setLoading] = useState(true);
   const [createOpen, setCreateOpen] = useState(false);
-  const [createMode, setCreateMode] = useState<"empty" | "github" | "myRepos">("empty");
+  const [createMode, setCreateMode] = useState<"empty" | "github" | "myRepos" | "local">("empty");
   const [createRepoUrl, setCreateRepoUrl] = useState("");
   const [createBranch, setCreateBranch] = useState("main");
   const [myRepos, setMyRepos] = useState<RepoItem[]>([]);
@@ -78,6 +79,10 @@ export function WorkspaceSelector() {
   const [createSuccess, setCreateSuccess] = useState<string | null>(null);
   const [testsFailingForWorkspace, setTestsFailingForWorkspace] = useState<string | null>(null);
   const [savingSafeEdit, setSavingSafeEdit] = useState(false);
+  const [resyncing, setResyncing] = useState(false);
+  const [supportsFolderPicker] = useState(() => typeof window !== "undefined" && typeof (window as any).showDirectoryPicker === "function");
+  const [localFolderWorkspaceId, setLocalFolderWorkspaceId] = useState<string | null>(null);
+  const lastLocalFolderRef = useRef<{ workspaceId: string; handle: FileSystemDirectoryHandle } | null>(null);
 
   const workspaceId = pathname.startsWith("/app/")
     ? pathname.replace("/app/", "").split("/")[0]
@@ -127,6 +132,131 @@ export function WorkspaceSelector() {
     }
   }
 
+  async function handleCreateFromLocal(
+    files: Array<{ path: string; content: string }>,
+    dirHandle?: FileSystemDirectoryHandle
+  ) {
+    if (files.length === 0) return;
+    setError(null);
+    setCreateSuccess(null);
+    setSubmitting(true);
+    try {
+      const res = await fetch("/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: createName?.trim() || "Local folder",
+          files: files.slice(0, 500).map((f) => ({ path: f.path, content: f.content.slice(0, 500_000) })),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to create");
+      if (dirHandle && data.id) {
+        lastLocalFolderRef.current = { workspaceId: data.id, handle: dirHandle };
+        setLocalFolderWorkspaceId(data.id);
+      }
+      const filesImported = data.filesImported;
+      const { filesImported: _fi, ...ws } = data;
+      setCreateOpen(false);
+      setCreateName("");
+      setCreateMode("empty");
+      setWorkspaces((prev) => [
+        { ...ws, safe_edit_mode: ws.safe_edit_mode ?? true, github_repo_url: ws.github_repo_url ?? null, github_default_branch: ws.github_default_branch ?? null, github_owner: ws.github_owner ?? null, github_repo: ws.github_repo ?? null, github_is_private: ws.github_is_private ?? null, github_current_branch: ws.github_current_branch ?? null },
+        ...prev,
+      ]);
+      try {
+        await fetch(`/api/workspaces/${data.id}/set-active`, { method: "POST" });
+      } catch {
+        // non-blocking
+      }
+      router.push(`/app/${data.id}`);
+      if (typeof filesImported === "number") setCreateSuccess(`Imported ${filesImported} file(s) from local folder.`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to create workspace");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handlePickLocalFolder() {
+    setError(null);
+    if (typeof (window as any).showDirectoryPicker === "function") {
+      try {
+        const dir = await (window as any).showDirectoryPicker();
+        const files: Array<{ path: string; content: string }> = [];
+        async function walk(handle: any, prefix: string) {
+          for await (const [name, entry] of handle.entries()) {
+            const path = prefix ? `${prefix}/${name}` : name;
+            if (entry.kind === "file") {
+              try {
+                const file = await entry.getFile();
+                if (file.size > 500_000) continue;
+                const text = await file.text();
+                files.push({ path, content: text });
+              } catch {
+                // skip binary or unreadable
+              }
+            } else if (entry.kind === "directory" && files.length < 500) {
+              await walk(entry, path);
+            }
+          }
+        }
+        await walk(dir, "");
+        if (files.length > 0) await handleCreateFromLocal(files, dir);
+        else setError("No readable files found in the folder.");
+      } catch (e) {
+        if ((e as Error).name !== "AbortError") setError(e instanceof Error ? e.message : "Failed to read folder");
+      }
+      return;
+    }
+    setError("Opening a folder is supported in Chrome or Edge. Use the file input below to upload a folder.");
+  }
+
+  async function handleReSyncFromFolder(wsId: string) {
+    const entry = lastLocalFolderRef.current;
+    if (!entry || entry.workspaceId !== wsId) return;
+    setResyncing(true);
+    setError(null);
+    try {
+      const files: Array<{ path: string; content: string }> = [];
+      async function walk(handle: FileSystemDirectoryHandle, prefix: string) {
+        for await (const [name, entry] of handle.entries()) {
+          const path = prefix ? `${prefix}/${name}` : name;
+          if (entry.kind === "file") {
+            try {
+              const file = await entry.getFile();
+              if (file.size > 500_000) continue;
+              const text = await file.text();
+              files.push({ path, content: text });
+            } catch {
+              // skip
+            }
+          } else if (entry.kind === "directory" && files.length < 500) {
+            await walk(entry as FileSystemDirectoryHandle, path);
+          }
+        }
+      }
+      await walk(entry.handle, "");
+      if (files.length === 0) {
+        setError("No readable files found in the folder.");
+        return;
+      }
+      const res = await fetch(`/api/workspaces/${wsId}/files/sync`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ files: files.map((f) => ({ path: f.path, content: f.content.slice(0, 500_000) })) }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Sync failed");
+      setCreateSuccess(`Re-synced ${data.synced ?? 0} file(s) from folder. Only available in this session; re-open folder next time for a fresh sync.`);
+      window.dispatchEvent(new CustomEvent("workspace-files-synced", { detail: { workspaceId: wsId } }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Re-sync failed");
+    } finally {
+      setResyncing(false);
+    }
+  }
+
   async function handleCreate() {
     setError(null);
     setCreateSuccess(null);
@@ -152,6 +282,7 @@ export function WorkspaceSelector() {
           isPrivate: selectedMyRepo.private,
         };
       }
+      if (createMode === "local") return;
       const res = await fetch("/api/workspaces", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -383,6 +514,11 @@ export function WorkspaceSelector() {
       <p className="px-2 text-xs font-medium text-muted-foreground">
         Workspaces
       </p>
+      {workspaces.length === 0 && !loading && (
+        <p className="px-2 py-1 text-xs text-muted-foreground">
+          Create a workspace to get started. Add an API key in Settings, then try <kbd className="rounded border border-border bg-muted/50 px-1 font-mono text-[10px]">Cmd+K</kbd> on a selection.
+        </p>
+      )}
       <div className="space-y-0.5">
         {workspaces.map((ws) => (
           <div
@@ -431,6 +567,16 @@ export function WorkspaceSelector() {
                   <Pencil className="mr-2 h-4 w-4" />
                   Rename
                 </DropdownMenuItem>
+                {localFolderWorkspaceId === ws.id && (
+                  <DropdownMenuItem
+                    onClick={() => handleReSyncFromFolder(ws.id)}
+                    disabled={resyncing}
+                    title="Pull latest changes from the same folder in this session. Re-open the folder from Create → Open local folder next time for a fresh sync."
+                  >
+                    <RefreshCw className={`mr-2 h-4 w-4 ${resyncing ? "animate-spin" : ""}`} />
+                    Re-sync from folder
+                  </DropdownMenuItem>
+                )}
                 <DropdownMenuItem
                   onClick={async () => {
                     try {
@@ -549,18 +695,111 @@ export function WorkspaceSelector() {
                     Connect GitHub in Settings first; includes private repos
                   </span>
                 </button>
+                <button
+                  type="button"
+                  className={`flex flex-col items-start rounded-lg border p-3 text-left transition-colors ${
+                    createMode === "local"
+                      ? "border-primary bg-primary/5"
+                      : "border-border hover:bg-muted/50"
+                  }`}
+                  onClick={() => setCreateMode("local")}
+                >
+                  <span className="font-medium">Open local folder</span>
+                  <span className="text-xs text-muted-foreground mt-0.5">
+                    Pick a folder on your computer (Chrome/Edge) or upload files — no GitHub needed
+                  </span>
+                </button>
               </div>
             </div>
             <div className="space-y-2">
               <Label htmlFor="create-name">Workspace name</Label>
               <Input
                 id="create-name"
-                placeholder={createMode !== "empty" ? "e.g. my-repo" : "Untitled Workspace"}
+                placeholder={createMode === "local" ? "e.g. my-project" : createMode !== "empty" ? "e.g. my-repo" : "Untitled Workspace"}
                 value={createName}
                 onChange={(e) => setCreateName(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && handleCreate()}
+                onKeyDown={(e) => e.key === "Enter" && createMode !== "local" && handleCreate()}
               />
             </div>
+                {createMode === "local" && (
+              <div className="space-y-2">
+                {supportsFolderPicker ? (
+                  <>
+                    <Button
+                      type="button"
+                      className="w-full"
+                      onClick={handlePickLocalFolder}
+                      disabled={submitting}
+                      title={submitting ? "Creating workspace…" : "Pick a folder (Chrome/Edge only)"}
+                    >
+                      Pick folder (Chrome/Edge)
+                    </Button>
+                    <p className="text-xs text-muted-foreground">
+                      Re-sync in this session: use the workspace menu (⋮) → &quot;Re-sync from folder&quot; to pull latest changes.
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      Or upload a folder (one-time):{" "}
+                      <input
+                        type="file"
+                        {...({ webkitdirectory: "", directory: "" } as any)}
+                        multiple
+                        className="text-xs"
+                        onChange={async (e) => {
+                          const fileList = e.target.files;
+                          if (!fileList?.length) return;
+                          const files: Array<{ path: string; content: string }> = [];
+                          for (let i = 0; i < Math.min(fileList.length, 500); i++) {
+                            const f = fileList[i];
+                            const path = (f as any).webkitRelativePath?.replace(/^[^/]+\//, "") || f.name;
+                            try {
+                              const content = await f.text();
+                              files.push({ path, content: content.slice(0, 500_000) });
+                            } catch {
+                              // skip
+                            }
+                          }
+                          e.target.value = "";
+                          if (files.length > 0) await handleCreateFromLocal(files);
+                        }}
+                      />
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p className="text-xs font-medium text-amber-600 dark:text-amber-400">
+                      Live folder picker is only available in Chrome or Edge.
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      Upload a folder below for a one-time import (max 500 files, 500 KB per file). To pick a folder with re-sync, use Chrome or Edge.
+                    </p>
+                    <p className="text-xs font-medium text-muted-foreground">Upload folder</p>
+                    <input
+                      type="file"
+                      {...({ webkitdirectory: "", directory: "" } as any)}
+                      multiple
+                      className="block w-full text-xs"
+                      onChange={async (e) => {
+                        const fileList = e.target.files;
+                        if (!fileList?.length) return;
+                        const files: Array<{ path: string; content: string }> = [];
+                        for (let i = 0; i < Math.min(fileList.length, 500); i++) {
+                          const f = fileList[i];
+                          const path = (f as any).webkitRelativePath?.replace(/^[^/]+\//, "") || f.name;
+                          try {
+                            const content = await f.text();
+                            files.push({ path, content: content.slice(0, 500_000) });
+                          } catch {
+                            // skip
+                          }
+                        }
+                        e.target.value = "";
+                        if (files.length > 0) await handleCreateFromLocal(files);
+                      }}
+                    />
+                  </>
+                )}
+              </div>
+            )}
             {createMode === "github" && (
               <>
                 <div className="space-y-2">
@@ -612,7 +851,7 @@ export function WorkspaceSelector() {
               </div>
             )}
             {error && (
-              <p className="text-sm text-destructive">{error}</p>
+              <ErrorWithAction message={error} />
             )}
           </div>
           <DialogFooter>
@@ -623,24 +862,35 @@ export function WorkspaceSelector() {
             >
               Cancel
             </Button>
-            <Button
-              onClick={handleCreate}
-              disabled={
-                submitting ||
-                (createMode === "github" && !createRepoUrl.trim()) ||
-                (createMode === "myRepos" && !selectedMyRepo)
-              }
-            >
-              {submitting
-                ? createMode !== "empty"
-                  ? "Importing…"
-                  : "Creating…"
-                : createMode === "github"
-                  ? "Import"
-                  : createMode === "myRepos"
-                    ? "Create workspace"
-                    : "Create"}
-            </Button>
+            {createMode !== "local" && (
+              <Button
+                onClick={handleCreate}
+                disabled={
+                  submitting ||
+                  (createMode === "github" && !createRepoUrl.trim()) ||
+                  (createMode === "myRepos" && !selectedMyRepo)
+                }
+                title={
+                  submitting
+                    ? "Please wait…"
+                    : createMode === "github" && !createRepoUrl.trim()
+                      ? "Enter a GitHub repo URL"
+                      : createMode === "myRepos" && !selectedMyRepo
+                        ? "Select a repository"
+                        : undefined
+                }
+              >
+                {submitting
+                  ? createMode !== "empty"
+                    ? "Importing…"
+                    : "Creating…"
+                  : createMode === "github"
+                    ? "Import"
+                    : createMode === "myRepos"
+                      ? "Create workspace"
+                      : "Create"}
+              </Button>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -661,7 +911,7 @@ export function WorkspaceSelector() {
               />
             </div>
             {error && (
-              <p className="text-sm text-destructive">{error}</p>
+              <ErrorWithAction message={error} />
             )}
           </div>
           <DialogFooter>
@@ -891,7 +1141,7 @@ export function WorkspaceSelector() {
                 <p className="text-sm text-muted-foreground">This workspace is not linked to a GitHub repo. Create a new workspace with &quot;Import from GitHub&quot; to link one.</p>
               )}
               {error && (
-                <p className="text-sm text-destructive">{error}</p>
+                <ErrorWithAction message={error} />
               )}
             </div>
           )}

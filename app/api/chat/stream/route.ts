@@ -2,6 +2,7 @@ import { createClient } from "@/lib/supabase/server";
 import { decrypt } from "@/lib/encrypt";
 import { getProvider, getModelForProvider, PROVIDERS, PROVIDER_LABELS, type ProviderId } from "@/lib/llm/providers";
 import type { ChatMessage, ChatContext } from "@/lib/llm/types";
+import { safeEnqueue, safeClose } from "@/lib/stream-utils";
 
 function isRateLimitError(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : String(e);
@@ -50,16 +51,24 @@ async function getApiKey(
   userId: string,
   provider: ProviderId
 ): Promise<string | null> {
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("provider_keys")
     .select("key_encrypted")
     .eq("user_id", userId)
     .eq("provider", provider)
-    .single();
+    .maybeSingle(); // Use maybeSingle() instead of single() to avoid throwing on no rows
+  
+  if (error) {
+    console.error(`Error fetching key for ${provider}:`, error);
+    return null;
+  }
+  
   if (!data?.key_encrypted) return null;
+  
   try {
     return decrypt(data.key_encrypted);
-  } catch {
+  } catch (decryptError) {
+    console.error(`Error decrypting key for ${provider}:`, decryptError);
     return null;
   }
 }
@@ -111,11 +120,14 @@ export async function POST(request: Request) {
   }
 
   if (providersWithKeys.length === 0) {
-      const requestedLabel = requestedProvider ? PROVIDER_LABELS[requestedProvider] : "Selected provider";
-      return new Response(
+    const triedLabels = providersToTry.map(p => PROVIDER_LABELS[p]).join(", ");
+    const freeOptions = "OpenRouter (free models available) or Gemini (free tier)";
+    return new Response(
       JSON.stringify({
         error:
-          `No API key configured for ${requestedLabel}. Add one in API Key settings.`,
+          `No API key configured for any provider. Tried: ${triedLabels}. ` +
+          `Add an API key in Settings → API Keys. Recommended: ${freeOptions}. ` +
+          `Get free keys at: OpenRouter (https://openrouter.ai/keys) or Gemini (https://aistudio.google.com/apikey)`,
       }),
       { status: 400, headers: { "Content-Type": "application/json" } }
     );
@@ -133,26 +145,26 @@ export async function POST(request: Request) {
             context: body.context,
             model: modelOpt,
           })) {
-            controller.enqueue(encoder.encode(chunk));
+            safeEnqueue(controller, encoder, chunk);
           }
           lastError = null;
           break;
         } catch (e) {
           lastError = e;
           if (!isRateLimitError(e) && !isInvalidModelError(e)) {
-            controller.enqueue(
-              encoder.encode(`[Error: ${getUserFacingError(e)}]`)
-            );
+            safeEnqueue(controller, encoder, `[Error: ${getUserFacingError(e)}]`);
             break;
           }
         }
       }
       if (lastError != null && (isRateLimitError(lastError) || isInvalidModelError(lastError))) {
-        controller.enqueue(
-          encoder.encode(`[Error: ${getUserFacingError(lastError)}. Try selecting a different provider (e.g. OpenAI) in the dropdown above if you have an API key.]`)
+        safeEnqueue(
+          controller,
+          encoder,
+          `[Error: ${getUserFacingError(lastError)}. Try selecting a different provider (e.g. OpenAI) in the dropdown above if you have an API key.]`
         );
       }
-      controller.close();
+      safeClose(controller);
     },
   });
 

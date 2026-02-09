@@ -6,6 +6,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { FileEditStep } from "@/lib/agent/types";
 import { applyEdit } from "@/lib/agent/diff-engine";
+import { beautifyCode } from "@/lib/utils/code-beautifier";
 
 export type SandboxSource = "agent" | "composer" | "debug-from-log";
 
@@ -116,12 +117,15 @@ export async function applyEditsToSandbox(
 
     if (!fileRow) {
       // New file: insert
+      // Beautify code before writing (convert \n to actual newlines, etc.)
+      const beautifiedContent = beautifyCode(edit.newContent, path);
+      
       const { error: insertError } = await supabase
         .from("sandbox_files")
         .insert({
           sandbox_run_id: sandboxRunId,
           path,
-          content: edit.newContent,
+          content: beautifiedContent,
         });
 
       if (insertError) {
@@ -137,7 +141,28 @@ export async function applyEditsToSandbox(
 
     // Apply edit to existing file
     const currentContent = fileRow.content ?? "";
-    const result = applyEdit(currentContent, edit.newContent, edit.oldContent);
+    // Beautify new content before applying edit (convert \n to actual newlines, etc.)
+    const beautifiedNewContent = beautifyCode(edit.newContent, path);
+    
+    // IMPORTANT: Don't beautify oldContent - it needs to match the actual file content
+    // The oldContent from the plan might have escaped newlines, but the actual file
+    // content in the database might already be beautified. We need to match what's actually there.
+    // Instead, beautify the currentContent for comparison if oldContent is provided
+    let oldContentToMatch = edit.oldContent;
+    let contentToMatchAgainst = currentContent;
+    
+    // If oldContent is provided, beautify both for comparison
+    if (oldContentToMatch) {
+      const beautifiedOldContent = beautifyCode(oldContentToMatch, path);
+      const beautifiedCurrentContent = beautifyCode(currentContent, path);
+      // Try matching with beautified versions first
+      if (beautifiedCurrentContent.includes(beautifiedOldContent)) {
+        oldContentToMatch = beautifiedOldContent;
+        contentToMatchAgainst = beautifiedCurrentContent;
+      }
+    }
+    
+    const result = applyEdit(contentToMatchAgainst, beautifiedNewContent, oldContentToMatch);
 
     if (!result.ok) {
       const isDebugFromLog = edit.source === "debug-from-log";
@@ -226,12 +251,15 @@ export async function promoteSandboxToWorkspace(
 
     if (!workspaceFile) {
       // New file: insert
+      // Ensure content is beautified before promoting to workspace
+      const beautifiedContent = beautifyCode(sandboxFile.content || "", path);
+      
       const { error: insertError } = await supabase
         .from("workspace_files")
         .insert({
           workspace_id: workspaceId,
           path,
-          content: sandboxFile.content,
+          content: beautifiedContent,
         });
 
       if (insertError) {
@@ -249,7 +277,8 @@ export async function promoteSandboxToWorkspace(
     // We compare current workspace content with what we expect (from sandbox's original snapshot)
     // For simplicity, we'll do a direct update if content matches, otherwise treat as conflict
     const currentContent = workspaceFile.content ?? "";
-    const sandboxContent = sandboxFile.content ?? "";
+    // Ensure sandbox content is beautified before promoting
+    const beautifiedSandboxContent = beautifyCode(sandboxFile.content ?? "", path);
 
     // If workspace content matches what we expect (or is empty/new), update directly
     // Otherwise, we'd need to store original content in sandbox_runs metadata
@@ -257,7 +286,7 @@ export async function promoteSandboxToWorkspace(
     const { error: updateError } = await supabase
       .from("workspace_files")
       .update({
-        content: sandboxContent,
+        content: beautifiedSandboxContent,
         updated_at: new Date().toISOString(),
       })
       .eq("workspace_id", workspaceId)
@@ -322,7 +351,9 @@ export async function syncSandboxToDisk(
     if (!existsSync(fileDir)) {
       await mkdir(fileDir, { recursive: true });
     }
-    await writeFile(filePath, file.content || "", "utf-8");
+    // Beautify content before writing to disk (convert \n to actual newlines, etc.)
+    const beautifiedContent = beautifyCode(file.content || "", file.path);
+    await writeFile(filePath, beautifiedContent, "utf-8");
   }
 }
 
@@ -601,6 +632,7 @@ export async function runSandboxChecks(
             stderrLower.includes("syntax error") ||
             stderrLower.includes("unexpected token") ||
             stderrLower.includes("eaddrinuse") || // Port already in use
+            stderrLower.includes("port") && stderrLower.includes("already in use") || // Port conflict
             stderrLower.includes("enotfound") || // Module not found
             (result.exitCode !== null && result.exitCode !== 0 && !isServer);
           

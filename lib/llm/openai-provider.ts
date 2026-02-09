@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import type { ChatMessage, ChatOptions, LLMProvider, LLMUsage } from "./types";
+import { generateEmbeddings } from "./embeddings";
 
 function buildMessages(messages: ChatMessage[], context?: ChatOptions["context"]): OpenAI.Chat.ChatCompletionMessageParam[] {
   const systemParts: string[] = [];
@@ -73,5 +74,9 @@ export const openAIProvider: LLMProvider = {
       const delta = chunk.choices[0]?.delta?.content;
       if (delta) yield delta;
     }
+  },
+
+  async embeddings(texts: string[], apiKey: string): Promise<number[][]> {
+    return generateEmbeddings(texts, apiKey, "openai");
   },
 };

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ChevronRight,
   Database,
@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { buildFileTree, type FileTreeNode } from "@/lib/file-tree";
 import { useEditor } from "@/lib/editor-context";
+import { ErrorWithAction } from "@/components/error-with-action";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -50,7 +51,10 @@ export function FileTree({ workspaceId }: FileTreeProps) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [indexing, setIndexing] = useState(false);
+  const [indexStatus, setIndexStatus] = useState<"idle" | "indexing" | "completed" | "failed">("idle");
+  const [indexFileCount, setIndexFileCount] = useState(0);
   const { openFile, getTab } = useEditor();
+  const lastAutoIndexedWorkspaceRef = useRef<string | null>(null);
 
   const isDirty = (path: string) => getTab(path)?.dirty ?? false;
 
@@ -82,16 +86,58 @@ export function FileTree({ workspaceId }: FileTreeProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspaceId]);
 
-  // Listen for file tree refresh events (e.g., after Agent execution)
+  // Fetch index status when workspace changes (for "Indexed N files" and progress)
   useEffect(() => {
-    const handleRefresh = () => {
-      if (workspaceId) {
-        fetchFiles();
+    if (!workspaceId) return;
+    let cancelled = false;
+    const fetchStatus = async () => {
+      try {
+        const res = await fetch(`/api/workspaces/${workspaceId}/index-status`);
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        if (cancelled) return;
+        setIndexStatus(data.status ?? "idle");
+        setIndexFileCount(data.fileCount ?? 0);
+        if (data.status === "indexing") setIndexing(true);
+        else setIndexing(false);
+      } catch {
+        if (!cancelled) setIndexing(false);
       }
     };
+    fetchStatus();
+    const interval = setInterval(fetchStatus, 2500);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [workspaceId]);
+
+  // Automatic indexing on workspace load (one-shot per workspace)
+  useEffect(() => {
+    if (!workspaceId || lastAutoIndexedWorkspaceRef.current === workspaceId) return;
+    lastAutoIndexedWorkspaceRef.current = workspaceId;
+    setIndexing(true);
+    fetch("/api/index/rebuild-background", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspaceId, generateEmbeddings: true }),
+    }).catch(() => {});
+  }, [workspaceId]);
+
+  // Listen for file tree refresh events (e.g., after Agent execution or Re-sync from folder)
+  useEffect(() => {
+    const handleRefresh = () => {
+      if (workspaceId) fetchFiles();
+    };
+    const handleSynced = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { workspaceId?: string };
+      if (detail?.workspaceId === workspaceId) fetchFiles();
+    };
     window.addEventListener("refresh-file-tree", handleRefresh);
+    window.addEventListener("workspace-files-synced", handleSynced);
     return () => {
       window.removeEventListener("refresh-file-tree", handleRefresh);
+      window.removeEventListener("workspace-files-synced", handleSynced);
     };
   }, [workspaceId]);
 
@@ -197,7 +243,8 @@ export function FileTree({ workspaceId }: FileTreeProps) {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Index rebuild failed");
-      alert(`Index rebuilt: ${data.message || "Success"}`);
+      setIndexFileCount(data.indexedFiles ?? 0);
+      setIndexStatus("completed");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to rebuild index");
     } finally {
@@ -241,7 +288,7 @@ export function FileTree({ workspaceId }: FileTreeProps) {
             className="h-6 w-6"
             onClick={handleRebuildIndex}
             disabled={indexing}
-            title="Rebuild codebase index (for @codebase search)"
+            title={indexing ? "Indexing…" : indexStatus === "completed" && indexFileCount > 0 ? `Indexed ${indexFileCount} files. Click to rebuild (for @codebase and cross-file go-to-def).` : "Rebuild codebase index (for @codebase search and cross-file go-to-def). Index also runs when you open a workspace."}
           >
             <Database className={`h-4 w-4 ${indexing ? "animate-pulse" : ""}`} />
           </Button>
@@ -290,7 +337,7 @@ export function FileTree({ workspaceId }: FileTreeProps) {
                 </p>
               </div>
               {error && (
-                <p className="text-sm text-destructive">{error}</p>
+                <ErrorWithAction message={error} />
               )}
             </div>
             <DialogFooter>
@@ -362,7 +409,7 @@ export function FileTree({ workspaceId }: FileTreeProps) {
               />
             </div>
             {error && (
-              <p className="text-sm text-destructive">{error}</p>
+              <ErrorWithAction message={error} />
             )}
           </div>
           <DialogFooter>

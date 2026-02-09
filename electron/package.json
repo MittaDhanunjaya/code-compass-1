@@ -1,0 +1,13 @@
+{
+  "name": "code-compass-desktop",
+  "version": "1.0.0",
+  "description": "Code Compass desktop app (Electron wrapper)",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "APP_URL=http://localhost:3000 electron ."
+  },
+  "devDependencies": {
+    "electron": "^28.0.0"
+  }
+}

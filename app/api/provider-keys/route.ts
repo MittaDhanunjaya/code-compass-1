@@ -24,14 +24,38 @@ export async function GET(request: Request) {
     );
   }
 
-  const { data } = await supabase
+  const { data: keyRow, error } = await supabase
     .from("provider_keys")
-    .select("id")
+    .select("key_encrypted")
     .eq("user_id", user.id)
     .eq("provider", provider)
-    .single();
+    .maybeSingle(); // Use maybeSingle() to avoid throwing on no rows
 
-  return NextResponse.json({ configured: !!data });
+  if (error) {
+    console.error(`Error checking key for ${provider}:`, error);
+    return NextResponse.json({ configured: false, error: error.message });
+  }
+
+  if (!keyRow?.key_encrypted) {
+    return NextResponse.json({ configured: false });
+  }
+
+  // Check if we can decrypt the key (to detect encryption key mismatch)
+  let canDecrypt = false;
+  try {
+    const { decrypt } = await import("@/lib/encrypt");
+    decrypt(keyRow.key_encrypted);
+    canDecrypt = true;
+  } catch {
+    // Decryption failed - likely encryption key mismatch
+    canDecrypt = false;
+  }
+
+  return NextResponse.json({ 
+    configured: true,
+    canDecrypt,
+    needsReentry: !canDecrypt // Flag to indicate key needs to be re-entered
+  });
 }
 
 /**

@@ -1,17 +1,22 @@
 import OpenAI from "openai";
 import type { ChatMessage, ChatOptions, LLMProvider, LLMUsage } from "./types";
+import { generateEmbeddings } from "./embeddings";
 
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 
 const OPENROUTER_DEFAULT_MODEL = "openrouter/free";
-const DEPRECATED_MODELS = new Set([
-  "deepseek/deepseek-coder:free",
-  "deepseek/deepseek-r1:free",
-]);
 
+/**
+ * All OpenRouter ":free" model IDs are routed through openrouter/free so we never
+ * hit 404s when OpenRouter changes or disables specific free endpoints (e.g.
+ * deepseek/deepseek-chat:free, deepseek-chat-v3-0324:free). The router picks an
+ * available free model automatically.
+ */
 function normalizeModel(model: string | undefined): string {
   if (!model) return OPENROUTER_DEFAULT_MODEL;
-  return DEPRECATED_MODELS.has(model) ? OPENROUTER_DEFAULT_MODEL : model;
+  if (model === OPENROUTER_DEFAULT_MODEL) return model;
+  if (model.endsWith(":free")) return OPENROUTER_DEFAULT_MODEL;
+  return model;
 }
 
 function buildMessages(
@@ -99,5 +104,9 @@ export const openRouterProvider: LLMProvider = {
       const delta = chunk.choices[0]?.delta?.content;
       if (delta) yield delta;
     }
+  },
+
+  async embeddings(texts: string[], apiKey: string): Promise<number[][]> {
+    return generateEmbeddings(texts, apiKey, "openrouter");
   },
 };

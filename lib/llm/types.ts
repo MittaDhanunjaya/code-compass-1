@@ -40,4 +40,14 @@ export type LLMProvider = {
     apiKey: string,
     options?: ChatOptions
   ): AsyncIterable<string>;
+
+  /**
+   * Generate embeddings for text chunks.
+   * Returns array of embedding vectors (1536 dimensions for OpenAI text-embedding-3-small).
+   * If provider doesn't support embeddings, returns empty array.
+   */
+  embeddings?(
+    texts: string[],
+    apiKey: string
+  ): Promise<number[][]>;
 };

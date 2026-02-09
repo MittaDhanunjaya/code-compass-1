@@ -2,14 +2,14 @@
 
 import { useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { Github, Key, Settings, Shield, User } from "lucide-react";
+import { Github, Key, Keyboard, Settings, Shield, User } from "lucide-react";
 import { DEFAULT_PROTECTED_PATTERNS } from "@/lib/protected-paths";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { KeySettingsContent } from "@/components/key-settings-content";
 
-type SettingsTab = "general" | "keys" | "safety" | "github";
+type SettingsTab = "general" | "keys" | "safety" | "shortcuts" | "github";
 
 type GitHubStatus = {
   linked: boolean;
@@ -73,6 +73,7 @@ export default function SettingsPage() {
     const github = searchParams.get("github");
     if (tab === "keys") setActiveTab("keys");
     else if (tab === "safety") setActiveTab("safety");
+    else if (tab === "shortcuts") setActiveTab("shortcuts");
     else if (github) setActiveTab("github");
   }, [searchParams]);
 
@@ -147,7 +148,21 @@ export default function SettingsPage() {
     { id: "general", label: "General", icon: <User className="h-4 w-4" /> },
     { id: "keys", label: "API Keys", icon: <Key className="h-4 w-4" /> },
     { id: "safety", label: "Safety", icon: <Shield className="h-4 w-4" /> },
+    { id: "shortcuts", label: "Shortcuts", icon: <Keyboard className="h-4 w-4" /> },
     { id: "github", label: "GitHub", icon: <Github className="h-4 w-4" /> },
+  ];
+
+  const isMac = typeof navigator !== "undefined" && navigator.platform?.toUpperCase().includes("MAC");
+  const mod = isMac ? "⌘" : "Ctrl";
+  const shortcutsList = [
+    { keys: `${mod}+K`, desc: "Quick actions (refactor, explain, docs) on selection" },
+    { keys: "Ctrl+Shift+D", desc: "Toggle diff (current file vs last saved)" },
+    { keys: "Ctrl+`", desc: "Toggle terminal" },
+    { keys: `${mod}+S`, desc: "Save current file" },
+    { keys: "F12", desc: "Go to definition (symbol under cursor)" },
+    { keys: "Shift+F12", desc: "Find references" },
+    { keys: "Agent: Rerun", desc: "Generate a new plan from the same instruction" },
+    { keys: "Agent: Re-run same plan", desc: "Execute the same plan again (no new plan)" },
   ];
 
   return (
@@ -190,6 +205,12 @@ export default function SettingsPage() {
               <Key className="h-4 w-4" />
               LLM provider API keys
             </Label>
+            <p className="text-sm text-muted-foreground">
+              The app picks a best default model from your connected APIs and free models (Chat, Cmd+K, tab completion, Agent). You can change it anytime in the model dropdown in Chat or in the Agent panel.
+            </p>
+            <p className="text-sm text-muted-foreground">
+              Tab completion tries <strong>Ollama first</strong> when you have an Ollama model in your default group (fast, local). Otherwise it uses a fast OpenRouter model (e.g. GPT-4o mini, Claude Haiku) when available. Set your default model group in Chat or Agent to control which model is used for completions.
+            </p>
             <KeySettingsContent />
           </section>
         </div>
@@ -208,6 +229,29 @@ export default function SettingsPage() {
               Protected files the AI won&apos;t edit without extra confirmation:{" "}
               <span className="font-mono text-xs">{DEFAULT_PROTECTED_PATTERNS.join(", ")}</span>
             </p>
+          </section>
+        </div>
+      )}
+      {activeTab === "shortcuts" && (
+        <div className="space-y-4">
+          <section className="space-y-2">
+            <Label className="text-base font-medium flex items-center gap-2">
+              <Keyboard className="h-4 w-4" />
+              Keyboard shortcuts & actions
+            </Label>
+            <p className="text-sm text-muted-foreground">
+              In-app shortcuts and Agent actions you can use while coding.
+            </p>
+            <ul className="space-y-2 mt-3">
+              {shortcutsList.map((s) => (
+                <li key={s.keys} className="flex items-start gap-3 text-sm">
+                  <kbd className="shrink-0 rounded border border-border bg-muted/60 px-2 py-1 font-mono text-xs">
+                    {s.keys}
+                  </kbd>
+                  <span className="text-muted-foreground">{s.desc}</span>
+                </li>
+              ))}
+            </ul>
           </section>
         </div>
       )}

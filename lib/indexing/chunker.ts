@@ -1,6 +1,7 @@
 /**
  * Simple chunking and symbol extraction for TS/JS files (v1).
  * Uses regex-based parsing - good enough for v1.
+ * Enhanced version available in enhanced-chunker.ts with multi-language support.
  */
 
 export type SymbolInfo = {

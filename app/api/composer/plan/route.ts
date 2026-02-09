@@ -6,6 +6,8 @@ import type { FileEditStep } from "@/lib/agent/types";
 import type { ComposerPlan, ComposerScope } from "@/lib/composer/types";
 import type { SearchResult } from "@/lib/indexing/types";
 import { resolveWorkspaceId } from "@/lib/workspaces/active-workspace";
+import { loadRules, formatRulesForPrompt } from "@/lib/rules";
+import { parseJSONRobust } from "@/lib/utils/json-parser";
 
 const WORKSPACE_FILE_CAP = 20;
 
@@ -203,28 +205,44 @@ export async function POST(request: Request) {
 
   let apiKey: string | null = null;
   let providerId: ProviderId | null = null;
+  const triedProviders: ProviderId[] = [];
+  
   for (const p of providersToTry) {
-    const { data: keyRow } = await supabase
+    triedProviders.push(p);
+    const { data: keyRow, error: keyError } = await supabase
       .from("provider_keys")
       .select("key_encrypted")
       .eq("user_id", user.id)
       .eq("provider", p)
-      .single();
+      .maybeSingle(); // Use maybeSingle() instead of single() to avoid throwing on no rows
+    
+    if (keyError) {
+      console.error(`Error fetching key for ${p}:`, keyError);
+      continue;
+    }
+    
     if (keyRow?.key_encrypted) {
       try {
         apiKey = decrypt(keyRow.key_encrypted);
         providerId = p;
         break;
-      } catch {
+      } catch (decryptError) {
+        console.error(`Error decrypting key for ${p}:`, decryptError);
         continue;
       }
     }
   }
 
   if (!apiKey || !providerId) {
-    const requestedLabel = requestedProvider ? PROVIDER_LABELS[requestedProvider] : "Selected provider";
+    const triedLabels = triedProviders.map(p => PROVIDER_LABELS[p]).join(", ");
+    const freeOptions = "OpenRouter (free models available) or Gemini (free tier)";
     return NextResponse.json(
-      { error: `No API key configured for ${requestedLabel}. Add one in API Key settings.` },
+      {
+        error:
+          `No API key configured for any provider. Tried: ${triedLabels}. ` +
+          `Add an API key in Settings → API Keys. Recommended: ${freeOptions}. ` +
+          `Get free keys at: OpenRouter (https://openrouter.ai/keys) or Gemini (https://aistudio.google.com/apikey)`,
+      },
       { status: 400 }
     );
   }
@@ -243,12 +261,17 @@ export async function POST(request: Request) {
     }
   }
 
+  // Load project rules
+  const rules = await loadRules(supabase, workspaceId);
+  const rulesPrompt = formatRulesForPrompt(rules);
+  const systemPromptWithRules = COMPOSER_SYSTEM + rulesPrompt;
+
   try {
     const provider = getProvider(providerId);
     const modelOpt = getModelForProvider(providerId, body.model);
     const { content: raw, usage } = await provider.chat(
       [
-        { role: "system", content: COMPOSER_SYSTEM },
+        { role: "system", content: systemPromptWithRules },
         { role: "user", content: userContent },
       ],
       apiKey,
@@ -256,37 +279,16 @@ export async function POST(request: Request) {
     );
 
     const trimmed = raw.trim();
-    let jsonStr = trimmed
-      .replace(/^```json\s*/i, "")
-      .replace(/^```\s*/, "")
-      .replace(/\s*```$/g, "");
-    const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      return NextResponse.json(
-        { error: `LLM did not return valid JSON. Raw preview: ${raw.slice(0, 200)}` },
-        { status: 500 }
-      );
-    }
-    jsonStr = jsonMatch[0];
-    if (jsonStr.includes("'") && !jsonStr.includes('"')) {
-      jsonStr = jsonStr
-        .replace(/'/g, '"')
-        .replace(/True/g, "true")
-        .replace(/False/g, "false")
-        .replace(/None/g, "null");
-    }
-
-    let plan: ComposerPlan;
-    try {
-      plan = JSON.parse(jsonStr) as ComposerPlan;
-    } catch (parseError) {
+    const parseResult = parseJSONRobust<ComposerPlan>(trimmed, ["steps"]);
+    if (!parseResult.success || !parseResult.data) {
       return NextResponse.json(
         {
-          error: `Failed to parse JSON: ${parseError instanceof Error ? parseError.message : "Unknown"}. Raw preview: ${jsonStr.slice(0, 300)}`,
+          error: `Failed to parse JSON: ${parseResult.error ?? "Unknown"}. Raw preview: ${(parseResult.raw ?? trimmed).slice(0, 500)}`,
         },
         { status: 500 }
       );
     }
+    const plan = parseResult.data;
 
     if (!plan || !Array.isArray(plan.steps)) {
       return NextResponse.json(

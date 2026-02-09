@@ -1,16 +1,30 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { decrypt } from "@/lib/encrypt";
-import { getProvider, getModelForProvider, PROVIDERS, PROVIDER_LABELS, type ProviderId } from "@/lib/llm/providers";
+import { getProvider, getModelForProvider, OPENROUTER_FREE_MODELS, PROVIDERS, PROVIDER_LABELS, type ProviderId } from "@/lib/llm/providers";
+import { isRateLimitError } from "@/lib/llm/rate-limit";
 import type { AgentPlan } from "@/lib/agent/types";
 import { createAgentEvent, formatStreamEvent, type AgentEvent } from "@/lib/agent-events";
 import { detectErrorLogKind } from "@/lib/agent/error-log-utils";
+import { safeClose, safeEnqueue } from "@/lib/stream-utils";
 import { resolveWorkspaceId } from "@/lib/workspaces/active-workspace";
+import { loadRules, formatRulesForPrompt } from "@/lib/rules";
+import { buildIntelligentContext, formatIntelligentContext } from "@/lib/indexing/intelligent-context";
+import { learnCodebasePatterns, formatLearnedPatterns } from "@/lib/indexing/pattern-learning";
+import { multiStepReasoning } from "@/lib/agent/chain-of-thought";
 
 // Same system prompt as plan route, but with instruction to emit reasoning messages
-const PLAN_SYSTEM = `You are a coding agent planner. Given a user instruction and optional workspace context, you should think through the task and then output a JSON plan.
+const PLAN_SYSTEM = `You are an intelligent coding agent planner. Your job is to understand the user's request, analyze the codebase, and create a plan that accomplishes the task.
 
-CRITICAL: You MUST output valid JSON only. Use double quotes for all strings, not single quotes. Do not use Python dictionary syntax.
+CRITICAL JSON OUTPUT RULES:
+1. **Output ONLY valid JSON** - no explanatory text before or after the JSON
+2. **No leading text** - Do NOT write "Looking at...", "Here's...", "I'll..." before the JSON
+3. **No trailing text** - Do NOT add explanations after the JSON
+4. **Use double quotes** - Never use single quotes for strings
+5. **No trailing commas** - Remove all trailing commas before } or ]
+6. **No comments** - Do not include // or /* */ comments in JSON
+7. **Valid syntax** - Ensure all commas, braces, and brackets are properly balanced
+8. **DO NOT output code** - Do NOT output actual code files, functions, or implementations. Output ONLY a JSON plan with steps.
+9. **DO NOT output markdown** - Do NOT wrap the JSON in markdown code blocks. Output raw JSON only.
 
 IMPORTANT - Show Your Thinking:
 As you plan and analyze the task, periodically emit short, user-friendly status messages describing what you are doing. These messages help users understand your reasoning in real-time. Examples:
@@ -20,13 +34,20 @@ As you plan and analyze the task, periodically emit short, user-friendly status 
 - "Planning to create 5 files: main app component, sign-up form, billing page, product listing, and API routes."
 - "Identifying which files need to be modified based on the error logs..."
 
-Before outputting the JSON plan, briefly explain your approach (1-3 sentences). Then output the JSON plan.
+**CRITICAL**: After your reasoning messages, output ONLY the JSON plan object. Do NOT add any text before or after it.
 
 Keep reasoning messages concise and focused on what you're actively doing or thinking about.
 
+Your approach:
+1. **Understand the task**: What is the user asking for? What's the goal?
+2. **Understand the codebase**: What files exist? How is the project structured? What patterns are used?
+3. **Plan systematically**: Break down the task into logical steps. What needs to be created? What needs to be modified? What needs to be tested?
+4. **Think about completeness**: Will the result actually work? Are all dependencies included? Are all configuration files present?
+5. **Consider edge cases**: What could go wrong? How can you prevent common errors?
+
 Output format:
-1. Brief reasoning/explanation (optional but helpful)
-2. A single JSON object with this exact shape:
+1. Reasoning messages (emitted during thinking - see above)
+2. **ONLY** a single JSON object with this exact shape (no text before or after):
 {
   "steps": [
     { "type": "file_edit", "path": "<file path>", "oldContent": "<exact snippet to replace or omit for full replace>", "newContent": "<new content>", "description": "<optional>" },
@@ -35,125 +56,47 @@ Output format:
   "summary": "<optional short summary>"
 }
 
+**CRITICAL - "steps" must be an array of OBJECTS, NOT strings:**
+- Each element in "steps" MUST be an object (curly braces {}), never a plain text string.
+- WRONG: "steps": ["Modify package.json", "Update README"]  ← strings are invalid
+- CORRECT: "steps": [{"type": "file_edit", "path": "package.json", "newContent": "..."}, {"type": "command", "command": "npm start"}]
+- Every step object MUST have: "type": "file_edit" or "type": "command"
+- file_edit: must also have "path" and "newContent" (both strings)
+- command: must also have "command" (string)
+- Do NOT put description-only strings in the steps array. Each step must be a full object with type, path/newContent or command.
+
 Rules:
 - path must be relative to workspace root (e.g. "src/app/page.tsx").
 - For file_edit: include oldContent only when replacing a specific snippet; omit for full file replace.
 - Order steps in dependency order (e.g. create file before editing it).
 - Use "command" steps for npm install, npm test, etc. Keep commands simple and allowlist-friendly.
-- Output ONLY the JSON object, no surrounding text, no markdown code blocks, no Python syntax.
+- Output ONLY the JSON object, no surrounding text, no markdown code blocks, no Python syntax, no explanatory prefixes like "Looking at..." or "Here's the plan:".
+- Start directly with { and end with }. No text before { or after }.
 
-CRITICAL - Create WORKING, RUNNABLE Projects:
-When creating a new project or application, you MUST ensure it actually runs and works. The application will be tested in a sandbox before being delivered to the user. If it doesn't run, it will be rejected.
+CRITICAL - Step Requirements:
+- Every file_edit step MUST have: "type": "file_edit", "path": "<file path>", "newContent": "<content>"
+- Every command step MUST have: "type": "command", "command": "<shell command>"
+- Do NOT create steps with empty or missing fields. Every step must be complete and valid.
 
-QUALITY REQUIREMENTS:
-1. **Testability**: Every project MUST be runnable. Include all dependencies, configuration files, and setup steps.
-2. **Completeness**: Don't create partial implementations. If you're building an app, make sure it has all necessary files to actually run.
-3. **Error Prevention**: Think through common errors:
-   - Missing dependencies? Add them to package.json/requirements.txt
-   - Missing environment variables? Create .env.example
-   - Port conflicts? Use environment variables for ports
-   - Import errors? Check all file paths and exports
-   - Missing scripts? Add proper start/dev scripts
-4. **Verification**: After creating files, include command steps to verify the app works:
-   - Install dependencies first
-   - Then run the app to verify it starts
-   - Fix any errors that appear
+When creating projects or fixing errors:
+- **Think about completeness**: Will this actually work? What's needed to make it run?
+- **Understand the project structure**: Look at existing files to understand patterns and conventions
+- **Consider dependencies**: What packages/libraries are needed? Where should they be declared?
+- **Think about configuration**: Are there config files needed? Environment variables? Port settings?
+- **Plan for testing**: Include steps to verify the solution works
+- **Learn from the codebase**: Use existing patterns, conventions, and structure
 
-IMPORTANT - Create Complete Projects:
-When creating a new project or application, ALWAYS include ALL necessary supporting files:
+When fixing errors or bugs (CRITICAL - minimal edits):
+- **Make MINIMAL, surgical edits only.** Never replace or delete large sections of a file unless the user explicitly asked to remove or rewrite them.
+- **Prefer oldContent/newContent** for targeted replacements of the specific lines that cause the bug. Do not replace entire files or handlers when fixing a single bug.
+- If the user says "fix the error" or "fix the 500", identify the single root cause and change only what is necessary. Do not simplify, refactor, or remove unrelated code.
+- **Never delete code the user did not ask to remove.** Preserve existing logic; only fix the faulty part (e.g. a wrong URL, a missing character, a typo).
 
-For Python projects (CRITICAL - ALWAYS FOLLOW THESE RULES):
-- STEP 1: ALWAYS create a virtual environment FIRST as the FIRST command step: "python3 -m venv venv"
-- STEP 2: Create requirements.txt with all dependencies (even if empty initially, include it)
-- STEP 3: For ALL pip install commands, ALWAYS use venv's pip: "venv/bin/pip install -r requirements.txt" (NEVER use system pip or pip3)
-- STEP 4: For running Python scripts, ALWAYS use venv's python: "venv/bin/python script.py" (NEVER use system python or python3)
-- Create README.md with project description, setup instructions, usage examples
-- Create .gitignore with Python-specific ignores (__pycache__, *.pyc, venv/, .env, etc.)
-- Include virtual environment setup instructions in README (python3 -m venv venv, source venv/bin/activate, pip install -r requirements.txt)
-- If the project needs environment variables, create a .env.example file
-- CRITICAL: The command order MUST be: 1) python3 -m venv venv, 2) venv/bin/pip install commands, 3) venv/bin/python run commands
-- NEVER use "pip install", "pip3 install", "python script.py", or "python3 script.py" - ALWAYS use "venv/bin/pip" and "venv/bin/python" after venv creation
+When creating projects:
+- **Think about completeness**: Will this actually run? Include README or HOW_TO_RUN, dependencies, and verify steps in dependency order.
+- Use existing codebase patterns and structure.
 
-For Node.js/TypeScript projects:
-- Create package.json with name, version, scripts, dependencies
-- Create README.md with project description, setup instructions (npm install), usage examples
-- Create .gitignore with Node-specific ignores (node_modules/, .next/, dist/, .env, etc.)
-- Create tsconfig.json if TypeScript is used
-- Include npm install command step
-
-For any project:
-- ALWAYS create a run-instructions document: either README.md (with a clear "How to run" section) OR a dedicated HOW_TO_RUN.txt. This document is MANDATORY and must list exact step-by-step instructions to run the application or complete the sample task (e.g. create venv, install dependencies, run command, or open URL). Never skip this.
-- Always create a README.md explaining what the project does, how to set it up, and how to run it (or HOW_TO_RUN.txt if the task is minimal)
-- Include a .gitignore appropriate for the project type
-- Add setup/installation commands as command steps (e.g., "npm install", "pip install -r requirements.txt")
-- Structure files logically (e.g., src/, lib/, tests/ directories when appropriate)
-
-Example for Python project: If user asks for "a weather app in Python", create:
-1. Main application file (weather_app.py)
-2. requirements.txt with dependencies (e.g., "requests")
-3. README.md with full setup and usage instructions
-4. .gitignore with Python patterns
-5. Command steps in THIS EXACT ORDER:
-   - Step 1: "python3 -m venv venv" (create virtual environment)
-   - Step 2: "venv/bin/pip install -r requirements.txt" (install dependencies)
-   - Step 3: "venv/bin/python weather_app.py" (run the app)
-
-Example for Node.js project: If user asks for "a weather app in Node", create:
-1. Main application file (app.js)
-2. package.json with dependencies
-3. README.md with full setup and usage instructions
-4. .gitignore with Node patterns
-5. Command step: "npm install"
-
-Do NOT create only the main file - always include supporting files for a complete, production-ready project.
-Do NOT use system pip/python for Python projects - ALWAYS create venv first and use venv/bin/pip and venv/bin/python.
-
-RUN INSTRUCTIONS (MANDATORY): Every plan MUST include at least one file that documents how to run the app or complete the task: README.md (with "How to run" / "Usage" section) or HOW_TO_RUN.txt. The content must be concrete steps (e.g. "1. Create venv: python3 -m venv venv 2. Install: venv/bin/pip install -r requirements.txt 3. Run: venv/bin/python main.py").
-
-CRITICAL - Application Must Actually Run:
-After creating all files, you MUST include command steps to:
-1. Install dependencies (npm install, pip install, etc.)
-2. Run the application (npm start, npm run dev, python app.py, etc.)
-3. Verify it starts without errors
-
-If the application fails to run, your plan will be rejected. Think through:
-- Are all imports correct?
-- Are all dependencies listed?
-- Are configuration files present?
-- Are environment variables set up?
-- Does the main entry point exist and work?
-
-The sandbox will test that your application actually runs. If it fails, you must fix the errors before the plan is accepted.
-
-CRITICAL - Fixing Errors and Debugging:
-When the user provides error logs, stack traces, or asks to fix existing code:
-1. FIRST: Identify which files are mentioned in the error (file paths, line numbers, function names)
-2. Read those files from the workspace context (they should be provided in fileContents or fileList)
-3. Parse the error message to understand:
-   - What type of error it is (syntax error, import error, runtime error, type error, etc.)
-   - Which line(s) are causing the problem
-   - What the expected vs actual behavior is
-4. Make MINIMAL, TARGETED fixes:
-   - Only edit the specific files that need changes
-   - Use oldContent/newContent to replace only the problematic sections
-   - Don't recreate entire files unless absolutely necessary
-   - Preserve working code that isn't related to the error
-5. After fixing, include a command step to test/run the code to verify the fix works
-6. If the error mentions missing dependencies, add them to requirements.txt/package.json and include an install command
-
-IMPORTANT: You MUST ALWAYS return at least one step in your plan. Even if you're unsure, make your best attempt:
-- If files are mentioned in errors but not found in workspace, create them or note the issue
-- If the error is unclear, make reasonable assumptions based on common error patterns
-- Always include at least one file_edit step to address the error
-
-Example: If user says "I got this error: NameError: name 'x' is not defined at line 5 in app.py", you should:
-- Read app.py from the workspace (or create it if missing)
-- Find line 5 and the surrounding context
-- Fix the specific issue (define 'x', fix typo, etc.) using oldContent/newContent
-- Include a command step to test: "venv/bin/python app.py" or similar
-- Don't rewrite the entire file unless it's necessary
-
-When fixing errors, prioritize understanding the root cause and making the smallest change that fixes it. NEVER return an empty steps array - always provide at least one fix attempt.`;
+Remember: Your goal is to create working, maintainable solutions. Think through the problem systematically and use the codebase context to inform your decisions.`;
 
 function emitEvent(controller: ReadableStreamDefaultController, encoder: TextEncoder, event: AgentEvent) {
   try {
@@ -177,6 +120,8 @@ export async function POST(request: Request) {
     workspaceId?: string;
     provider?: ProviderId;
     model?: string;
+    modelId?: string;
+    modelGroupId?: string;
     fileList?: string[];
     fileContents?: Record<string, string>;
     useIndex?: boolean;
@@ -209,71 +154,115 @@ export async function POST(request: Request) {
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
+      let eventMeta: { modelId?: string; modelLabel?: string; modelGroupId?: string; modelRole?: "planner" | "coder" | "reviewer" } = {};
+      const emit = (event: AgentEvent) => {
+        if (Object.keys(eventMeta).length > 0) {
+          event = { ...event, meta: { ...eventMeta, ...event.meta } };
+        }
+        emitEvent(controller, encoder, event);
+      };
+
       try {
-        emitEvent(controller, encoder, createAgentEvent('status', 'Agent started planning...'));
+        emit(createAgentEvent('status', 'Agent started planning...'));
 
         const messageKind = detectErrorLogKind(instruction);
         if (messageKind === "error_log") {
-          emitEvent(controller, encoder, createAgentEvent('reasoning', 'Detected runtime logs; will plan fixes from error context.', { kind: 'error_log' }));
+          emit(createAgentEvent('reasoning', 'Detected runtime logs; will plan fixes from error context.', { kind: 'error_log' }));
         }
-
-        const requestedProvider = (body.provider ?? "openrouter") as ProviderId;
-        const providersToTry = PROVIDERS.includes(requestedProvider)
-          ? [requestedProvider, ...PROVIDERS.filter((p) => p !== requestedProvider)]
-          : [...PROVIDERS];
 
         let apiKey: string | null = null;
         let providerId: ProviderId | null = null;
-        
-        emitEvent(controller, encoder, createAgentEvent('reasoning', 'Checking API keys...'));
-        
-        for (const p of providersToTry) {
-          const { data: keyRow } = await supabase
-            .from("provider_keys")
-            .select("key_encrypted")
-            .eq("user_id", user.id)
-            .eq("provider", p)
-            .single();
-          if (keyRow?.key_encrypted) {
-            try {
-              apiKey = decrypt(keyRow.key_encrypted);
-              providerId = p;
-              break;
-            } catch {
-              continue;
-            }
-          }
+        let modelOpt: string | undefined;
+
+        const { resolveInvocationConfig, getConfigByRole } = await import("@/lib/models/invocation-config");
+        const configs = await resolveInvocationConfig(supabase, user.id, {
+          modelId: body.modelId,
+          modelGroupId: body.modelGroupId,
+        });
+        if (configs.length === 0) {
+          emit(createAgentEvent('status', 'Error: No model selected or no API key for the selected model/group. Add API keys in Settings or Models & groups.'));
+          safeClose(controller);
+          return;
+        }
+        const inv = getConfigByRole(configs, "planner") ?? configs[0];
+        apiKey = inv.apiKey || "";
+        providerId = inv.providerId;
+        modelOpt = inv.modelSlug;
+        eventMeta = {
+          modelId: inv.modelId,
+          modelLabel: inv.modelLabel,
+          modelGroupId: body.modelGroupId ?? undefined,
+          modelRole: inv.role ?? "planner",
+        };
+        if (configs.length > 1) {
+          emit(createAgentEvent('reasoning', `Swarm: using ${inv.modelLabel} as planner (${configs.length} models in group).`));
+        } else {
+          emit(createAgentEvent('reasoning', `Using ${inv.modelLabel}...`));
         }
 
-        if (!apiKey || !providerId) {
-          const requestedLabel = requestedProvider ? PROVIDER_LABELS[requestedProvider] : "Selected provider";
-          emitEvent(controller, encoder, createAgentEvent('status', `Error: No API key configured for ${requestedLabel}`));
-          controller.close();
+        if (!providerId || (providerId !== "ollama" && !apiKey)) {
+          const triedLabels = PROVIDERS.map((p) => PROVIDER_LABELS[p]).join(", ");
+          const errorMsg = `No API key configured. Tried: ${triedLabels}. Add a key in Settings → API Keys.`;
+          emit(createAgentEvent('status', `Error: ${errorMsg}`));
+          safeClose(controller);
           return;
         }
 
-        emitEvent(controller, encoder, createAgentEvent('reasoning', `Using ${PROVIDER_LABELS[providerId]}...`));
+        const resolvedModel =
+          modelOpt ??
+          getModelForProvider(providerId, body.model) ??
+          (providerId === "openrouter" ? "openrouter/free" : undefined);
+
+        if (!eventMeta.modelId) {
+          emit(createAgentEvent('reasoning', `Using ${PROVIDER_LABELS[providerId]}...`));
+        }
 
         let userContent = `Instruction: ${instruction}`;
         
         // Index search
         let indexedFiles: any[] = [];
         if (body.useIndex && workspaceId) {
-          emitEvent(controller, encoder, createAgentEvent('tool_call', 'Searching codebase index...', { toolName: 'search_index' }));
+          emit(createAgentEvent('tool_call', 'Searching codebase index...', { toolName: 'search_index' }));
           try {
             const searchTerms = instruction
               .split(/\s+/)
               .filter((w) => w.length > 3 && !/^(the|and|or|for|with|from)$/i.test(w))
-              .slice(0, 3)
+              .slice(0, 5)
               .join(" ");
             
             if (searchTerms) {
-              const { data: chunks } = await supabase
-                .from("code_chunks")
-                .select("file_path, content, symbols, chunk_index")
-                .eq("workspace_id", workspaceId)
-                .ilike("content", `%${searchTerms}%`)
-                .limit(15);
+              // Use semantic search API for better results
+              const origin = request.headers.get("origin") || "http://localhost:3000";
+              const searchRes = await fetch(
+                `${origin}/api/search?query=${encodeURIComponent(searchTerms)}&workspaceId=${workspaceId}&limit=15&semantic=true`
+              );
+              
+              let chunks: any[] = [];
+              if (searchRes.ok) {
+                const searchData = await searchRes.json();
+                // Fetch full chunk content for results
+                if (searchData.results && searchData.results.length > 0) {
+                  const paths = [...new Set(searchData.results.map((r: any) => r.path))];
+                  const { data: fullChunks } = await supabase
+                    .from("code_chunks")
+                    .select("file_path, content, symbols, chunk_index")
+                    .eq("workspace_id", workspaceId)
+                    .in("file_path", paths)
+                    .limit(15);
+                  chunks = fullChunks || [];
+                }
+              }
+              
+              // Fallback to text search if semantic search didn't return results
+              if (chunks.length === 0) {
+                const { data: textChunks } = await supabase
+                  .from("code_chunks")
+                  .select("file_path, content, symbols, chunk_index")
+                  .eq("workspace_id", workspaceId)
+                  .ilike("content", `%${searchTerms}%`)
+                  .limit(15);
+                chunks = textChunks || [];
+              }
               
               if (chunks) {
                 const queryLower = searchTerms.toLowerCase();
@@ -306,14 +295,14 @@ export async function POST(request: Request) {
                 indexedFiles = Array.from(resultsMap.values()).slice(0, 5);
               }
             }
-            emitEvent(controller, encoder, createAgentEvent('tool_result', `Found ${indexedFiles.length} relevant files in index`, { toolName: 'search_index' }));
+            emit(createAgentEvent('tool_result', `Found ${indexedFiles.length} relevant files in index`, { toolName: 'search_index' }));
           } catch (e) {
-            emitEvent(controller, encoder, createAgentEvent('tool_result', 'Index search failed, continuing without it', { toolName: 'search_index' }));
+            emit(createAgentEvent('tool_result', 'Index search failed, continuing without it', { toolName: 'search_index' }));
           }
         }
 
         if (body.fileList?.length) {
-          emitEvent(controller, encoder, createAgentEvent('reasoning', `Analyzing ${body.fileList.length} files in workspace...`));
+          emit(createAgentEvent('reasoning', `Analyzing ${body.fileList.length} files in workspace...`));
           userContent += `\n\nFiles in workspace (paths):\n${body.fileList.join("\n")}`;
         }
         
@@ -342,7 +331,7 @@ export async function POST(request: Request) {
         const filesToRead = new Set<string>(body.fileContents ? Object.keys(body.fileContents) : []);
         if (errorFiles.size > 0 && workspaceId) {
           const detectedFiles = Array.from(errorFiles);
-          emitEvent(controller, encoder, createAgentEvent('reasoning', `Detected error logs mentioning ${errorFiles.size} file(s): ${detectedFiles.join(', ')}`));
+          emit(createAgentEvent('reasoning', `Detected error logs mentioning ${errorFiles.size} file(s): ${detectedFiles.join(', ')}`));
           
           // Try to match error files with workspace files (handle variations)
           const workspaceFiles = body.fileList || [];
@@ -370,9 +359,9 @@ export async function POST(request: Request) {
           }
           
           if (matchedFiles.length > 0) {
-            emitEvent(controller, encoder, createAgentEvent('reasoning', `Found ${matchedFiles.length} matching file(s) in workspace, reading them...`));
+            emit(createAgentEvent('reasoning', `Found ${matchedFiles.length} matching file(s) in workspace, reading them...`));
           } else if (errorFiles.size > 0) {
-            emitEvent(controller, encoder, createAgentEvent('reasoning', `Warning: Files mentioned in errors (${detectedFiles.join(', ')}) were not found in workspace. The agent will need to create them or work with existing files.`));
+            emit(createAgentEvent('reasoning', `Warning: Files mentioned in errors (${detectedFiles.join(', ')}) were not found in workspace. The agent will need to create them or work with existing files.`));
           }
           
           // Fetch file contents for error-related files
@@ -390,16 +379,42 @@ export async function POST(request: Request) {
                   body.fileContents[row.path] = row.content || "";
                 }
               }
-              emitEvent(controller, encoder, createAgentEvent('reasoning', `Read ${fileRows.length} file(s) for error analysis`));
+              emit(createAgentEvent('reasoning', `Read ${fileRows.length} file(s) for error analysis`));
             }
           }
         }
         
         if (indexedFiles.length > 0) {
-          userContent += "\n\nRelevant codebase context (from index):\n";
+          userContent += "\n\nRelevant codebase context (from semantic search):\n";
           for (const result of indexedFiles) {
             userContent += `\n--- ${result.path}${result.line ? ` (line ${result.line})` : ""} ---\n${result.preview}\n`;
           }
+        }
+
+        // Build intelligent context automatically (codebase structure, relationships, dependencies)
+        try {
+          const intelligentContext = await buildIntelligentContext(
+            supabase,
+            workspaceId,
+            null, // Could detect current file from instruction
+            instruction
+          );
+          const formattedContext = formatIntelligentContext(intelligentContext);
+          if (formattedContext.trim()) {
+            userContent += "\n\nCodebase structure and relationships (discovered automatically):\n";
+            userContent += formattedContext;
+          }
+
+          // Learn patterns from codebase
+          const learnedPatterns = await learnCodebasePatterns(supabase, workspaceId);
+          const patternsText = formatLearnedPatterns(learnedPatterns);
+          if (patternsText.trim()) {
+            userContent += "\n\nLearned codebase patterns:\n";
+            userContent += patternsText;
+          }
+        } catch (e) {
+          console.error("Failed to build intelligent context:", e);
+          // Continue without it
         }
         
         // Always re-read latest file contents from workspace before planning (avoids stale state after user edits)
@@ -423,33 +438,123 @@ export async function POST(request: Request) {
         }
 
         if (body.fileContents && Object.keys(body.fileContents).length > 0) {
-          emitEvent(controller, encoder, createAgentEvent('reasoning', `Reading ${Object.keys(body.fileContents).length} file(s)...`));
+          emit(createAgentEvent('reasoning', `Reading ${Object.keys(body.fileContents).length} file(s)...`));
           userContent += "\n\nRelevant file contents (path -> content):\n";
           for (const [path, content] of Object.entries(body.fileContents)) {
-            emitEvent(controller, encoder, createAgentEvent('tool_call', `Reading file ${path}`, { toolName: 'read_file', filePath: path }));
+            emit(createAgentEvent('tool_call', `Reading file ${path}`, { toolName: 'read_file', filePath: path }));
             userContent += `\n--- ${path} ---\n${content.slice(0, 8000)}\n`;
           }
         }
 
-        emitEvent(controller, encoder, createAgentEvent('reasoning', 'Generating plan...'));
+        emit(createAgentEvent('reasoning', 'Generating plan...'));
         
         const provider = getProvider(providerId);
-        const modelOpt = getModelForProvider(providerId, body.model);
+        const freeModelIds = OPENROUTER_FREE_MODELS.map((m) => m.id);
+        const modelsToTry: string[] =
+          providerId === "openrouter" && resolvedModel && freeModelIds.includes(resolvedModel)
+            ? [...freeModelIds]
+            : resolvedModel
+              ? [resolvedModel]
+              : [];
+        let modelUsed = resolvedModel ?? undefined;
+        let modelFallback: { from: string; to: string } | null = null;
+
+        // Load project rules
+        const rules = await loadRules(supabase, workspaceId);
+        const rulesPrompt = formatRulesForPrompt(rules);
+        const systemPromptWithRules = PLAN_SYSTEM + rulesPrompt;
         
-        // Use streaming to get real-time output
+        // Use direct planning by default. Only use chain-of-thought for genuinely complex creation tasks.
+        const lowerInstruction = instruction.toLowerCase();
+        const looksLikeErrorFix =
+          lowerInstruction.includes("eaddrinuse") ||
+          (lowerInstruction.includes("port") && (lowerInstruction.includes("already in use") || lowerInstruction.includes("in use") || lowerInstruction.includes("conflict"))) ||
+          (lowerInstruction.includes("error") && (lowerInstruction.includes("fix") || lowerInstruction.includes("address already in use"))) ||
+          lowerInstruction.includes("traceback") ||
+          lowerInstruction.includes("exception") ||
+          messageKind === "error_log";
+        const looksLikeSimpleRequest =
+          instruction.length < 500 &&
+          instruction.split("\n").length <= 10 &&
+          !(lowerInstruction.includes("create") && (lowerInstruction.includes("application") || lowerInstruction.includes("full ") || lowerInstruction.includes("entire ")));
+        const isComplexTask =
+          !looksLikeErrorFix &&
+          !looksLikeSimpleRequest &&
+          instruction.length > 800 &&
+          instruction.split("\n").length > 15 &&
+          (lowerInstruction.includes("create") && (lowerInstruction.includes("application") || lowerInstruction.includes("from scratch") || lowerInstruction.includes("full project")));
+
+        let plan: AgentPlan | null = null;
+
+        // Only for rare, genuinely complex creation tasks: use chain-of-thought. Otherwise use fast direct planning.
+        if (!isComplexTask && (looksLikeErrorFix || looksLikeSimpleRequest)) {
+          emit(createAgentEvent('reasoning', 'Using direct planning for fast response...'));
+        }
+        if (isComplexTask) {
+          emit(createAgentEvent('reasoning', 'Using multi-step reasoning for complex task...'));
+          
+          try {
+            const reasoningResult = await multiStepReasoning(
+              instruction,
+              userContent,
+              {
+                apiKey,
+                providerId,
+                model: resolvedModel,
+              }
+            );
+
+            if (reasoningResult.reasoning.steps.length > 0) {
+              emit(createAgentEvent('reasoning', `Reasoned through ${reasoningResult.reasoning.steps.length} steps`));
+              for (const step of reasoningResult.reasoning.steps.slice(0, 5)) {
+                emit(createAgentEvent('reasoning', `Step ${step.step}: ${step.thought}`));
+              }
+            }
+
+            if (reasoningResult.plan) {
+              plan = reasoningResult.plan;
+              emit(createAgentEvent('reasoning', `Plan generated from reasoning: ${plan.steps.length} step(s)`));
+            }
+          } catch (e) {
+            const reasoningError = e instanceof Error ? e.message : "Unknown error";
+            console.error("Chain-of-thought reasoning failed, falling back to direct planning:", e);
+            emit(createAgentEvent('reasoning', `Chain-of-thought failed: ${reasoningError}. Falling back to direct planning...`));
+            // Fall through to direct planning
+          }
+        }
+
+        // Use streaming to get real-time output (if plan not already generated)
         let raw = "";
         let buffer = "";
         let lastEmitTime = Date.now();
         let usage: any = null;
         
-        try {
-          for await (const chunk of provider.stream(
+        if (!plan) {
+          // Validate API key before attempting to call provider
+          if (!apiKey) {
+            throw new Error(`No API key configured for ${PROVIDER_LABELS[providerId]}. Please add an API key in Settings → API Keys.`);
+          }
+
+          let streamDone = false;
+          for (let i = 0; i < modelsToTry.length && !streamDone; i++) {
+            const tryModel = modelsToTry[i];
+            if (i > 0) {
+              emit(createAgentEvent("reasoning", `Rate limit reached on ${modelsToTry[i - 1]}, trying ${tryModel}...`));
+              emit(createAgentEvent("status", `Trying alternative free model: ${tryModel}`));
+              modelFallback = { from: modelsToTry[0], to: tryModel };
+            }
+            raw = "";
+            buffer = "";
+            lastEmitTime = Date.now();
+            usage = null;
+            try {
+            for await (const chunk of provider.stream(
             [
-              { role: "system", content: PLAN_SYSTEM },
+              { role: "system", content: systemPromptWithRules },
               { role: "user", content: userContent },
             ],
             apiKey,
-            { model: modelOpt }
+            { model: tryModel }
           )) {
             raw += chunk;
             buffer += chunk;
@@ -516,17 +621,17 @@ export async function POST(request: Request) {
                   !isPureJsonStructure;
                 
                 if (cleaned && (looksLikeReasoning || isBeforeJson)) {
-                  emitEvent(controller, encoder, createAgentEvent('reasoning', cleaned));
+                  emit(createAgentEvent('reasoning', cleaned));
                   lastEmitTime = now;
                 } else if (cleaned && cleaned.length > 5 && !hasJsonStart) {
                   // Show progress even for JSON-like chunks if we haven't seen JSON start yet
-                  emitEvent(controller, encoder, createAgentEvent('reasoning', 'Generating plan structure...'));
+                  emit(createAgentEvent('reasoning', 'Generating plan structure...'));
                   lastEmitTime = now;
                 }
               }
             }
           }
-          
+
           // Emit any remaining buffer
           if (buffer.trim()) {
             const cleaned = buffer.trim()
@@ -535,176 +640,344 @@ export async function POST(request: Request) {
               .replace(/\s*```$/, "")
               .trim();
             if (cleaned && !/^[\s{[\],:"]+$/.test(cleaned)) {
-              emitEvent(controller, encoder, createAgentEvent('reasoning', cleaned));
+              emit(createAgentEvent('reasoning', cleaned));
             }
           }
-        } catch (streamError) {
-          // If streaming fails, fall back to non-streaming (this is normal for some providers/models)
-          emitEvent(controller, encoder, createAgentEvent('reasoning', 'Generating plan (non-streaming mode)...'));
-          const fallback = await provider.chat(
-            [
-              { role: "system", content: PLAN_SYSTEM },
-              { role: "user", content: userContent },
-            ],
-            apiKey,
-            { model: modelOpt }
-          );
-          raw = fallback.content;
-          usage = fallback.usage;
-        }
+            modelUsed = tryModel;
+            streamDone = true;
+            } catch (streamError) {
+              const streamErrorMsg = streamError instanceof Error ? streamError.message : "Unknown stream error";
+              if (streamErrorMsg.includes("API key") || streamErrorMsg.includes("authentication") || streamErrorMsg.includes("401") || streamErrorMsg.includes("403")) {
+                throw new Error(`API authentication failed: ${streamErrorMsg}. Please check your API key in Settings → API Keys.`);
+              }
+              if (isRateLimitError(streamError) && i < modelsToTry.length - 1) {
+                continue;
+              }
+              emit(createAgentEvent('reasoning', `Streaming failed: ${streamErrorMsg}. Trying non-streaming mode...`));
+              try {
+                const fallback = await provider.chat(
+                  [
+                    { role: "system", content: systemPromptWithRules },
+                    { role: "user", content: userContent },
+                  ],
+                  apiKey,
+                  { model: tryModel }
+                );
+                raw = fallback.content;
+                usage = fallback.usage;
+                modelUsed = tryModel;
+                streamDone = true;
+              } catch (fallbackError) {
+                if (isRateLimitError(fallbackError) && i < modelsToTry.length - 1) {
+                  continue;
+                }
+                const fallbackMsg = fallbackError instanceof Error ? fallbackError.message : "Unknown fallback error";
+                throw new Error(`Both streaming and non-streaming requests failed. Streaming error: ${streamErrorMsg}. Fallback error: ${fallbackMsg}`);
+              }
+            }
+          }
+        } // End of "if (!plan)" block
 
-        emitEvent(controller, encoder, createAgentEvent('reasoning', 'Parsing plan response...'));
+        // Parse plan from streaming response (if not already generated from chain-of-thought)
+        if (!plan) {
+          const trimmed = raw.trim();
 
-        const trimmed = raw.trim();
-        if (
-          trimmed.startsWith("{") === false &&
-          trimmed.startsWith("[") === false &&
-          !trimmed.includes('"steps"') &&
-          !trimmed.includes("'steps'")
-        ) {
-          if (
-            trimmed.includes("margin:") ||
-            trimmed.includes("font-family:") ||
-            trimmed.includes("def ") ||
-            trimmed.includes("function ") ||
-            trimmed.includes("import ") ||
-            trimmed.includes("const ") ||
-            trimmed.includes("class ")
-          ) {
-            emitEvent(controller, encoder, createAgentEvent('status', 'Error: LLM returned code instead of JSON plan'));
-            controller.close();
+          // Handle empty or missing response (e.g. Perplexity sometimes returns no content)
+          if (!trimmed) {
+            emit(createAgentEvent('status', 'Error: The model returned no content'));
+            emit(createAgentEvent('reasoning', 'The model returned an empty response. This can happen with some providers (e.g. Perplexity) or when the request times out. Try: using OpenRouter (free models) or Gemini, or retrying.'));
+            safeEnqueue(controller, encoder, `data: ${JSON.stringify({ type: 'error', error: 'The model returned no content. Try a different provider (e.g. OpenRouter or Gemini) or retry.' })}\n\n`);
+            safeClose(controller);
             return;
           }
-        }
 
-        /** Extract first complete JSON object by balanced braces (skips content inside double-quoted strings). */
-        function extractJsonObject(text: string): string | null {
-          const start = text.indexOf("{");
-          if (start === -1) return null;
-          let depth = 0;
-          let inString = false;
-          let escape = false;
-          const q = '"';
-          for (let i = start; i < text.length; i++) {
-            const c = text[i];
-            if (escape) {
-              escape = false;
-              continue;
+          emit(createAgentEvent('reasoning', 'Parsing plan response...'));
+          
+          /** Extract first complete JSON object by balanced braces; respects both double- and single-quoted strings (all providers). */
+          function extractJsonObject(text: string): string | null {
+            const start = text.indexOf("{");
+            if (start === -1) return null;
+            let depth = 0;
+            let stringChar: '"' | "'" | null = null;
+            let escape = false;
+            for (let i = start; i < text.length; i++) {
+              const c = text[i];
+              if (escape) {
+                escape = false;
+                continue;
+              }
+              if (c === "\\" && stringChar !== null) {
+                escape = true;
+                continue;
+              }
+              if (stringChar !== null) {
+                if (c === stringChar) stringChar = null;
+                continue;
+              }
+              if (c === '"' || c === "'") {
+                stringChar = c;
+                continue;
+              }
+              if (c === "{") depth++;
+              else if (c === "}") {
+                depth--;
+                if (depth === 0) return text.slice(start, i + 1);
+              }
             }
-            if (c === "\\" && inString) {
-              escape = true;
-              continue;
-            }
-            if (inString) {
-              if (c === q) inString = false;
-              continue;
-            }
-            if (c === q) {
-              inString = true;
-              continue;
-            }
-            if (c === "{") depth++;
-            else if (c === "}") {
-              depth--;
-              if (depth === 0) return text.slice(start, i + 1);
+            return null;
+          }
+          
+          // First, try to parse JSON using robust parser (handles code blocks, single quotes, all providers)
+          const { parseJSONRobust } = await import("@/lib/utils/json-parser");
+          const { logError } = await import("@/lib/utils/error-handler");
+          
+          let parseResult = parseJSONRobust<AgentPlan>(trimmed, ["steps"]);
+          
+          // If that fails, try extracting JSON object first (double- or single-quoted "steps")
+          if (!parseResult.success) {
+            const extracted = extractJsonObject(trimmed);
+            const hasSteps = extracted && (extracted.includes('"steps"') || extracted.includes("'steps'"));
+            if (extracted && hasSteps) {
+              parseResult = parseJSONRobust<AgentPlan>(extracted, ["steps"]);
             }
           }
-          return null;
-        }
-
-        let jsonStr = trimmed;
-        // 1) Prefer content inside ```json ... ``` or ``` ... ```
-        const codeBlock = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
-        if (codeBlock) {
-          jsonStr = codeBlock[1].trim();
-        }
-        // 2) Try balanced-brace extraction (handles leading/trailing text and nested objects)
-        let extracted = extractJsonObject(jsonStr);
-        if (extracted && extracted.includes('"steps"')) {
-          jsonStr = extracted;
-        } else {
-          const fallback = extractJsonObject(trimmed);
-          if (fallback && fallback.includes('"steps"')) {
-            jsonStr = fallback;
-          } else if (extracted) {
-            jsonStr = extracted;
+          // Last resort: strip common leading prose and retry (e.g. "Here is the plan:\n\n{...}")
+          if (!parseResult.success && parseResult.error?.includes("No JSON object or array")) {
+            const jsonStart = trimmed.search(/\{\s*["']steps["']\s*:/i);
+            if (jsonStart > 0) {
+              parseResult = parseJSONRobust<AgentPlan>(trimmed.slice(jsonStart), ["steps"]);
+            }
+          }
+          
+          // If we successfully parsed JSON, use it
+          if (parseResult.success && parseResult.data) {
+            plan = parseResult.data;
           } else {
-            const regexMatch = jsonStr.match(/\{[\s\S]*"steps"[\s\S]*\}/) ?? jsonStr.match(/\{[\s\S]*\}/);
-            if (!regexMatch) {
-              emitEvent(controller, encoder, createAgentEvent('status', 'Error: LLM did not return valid JSON'));
-              controller.close();
+            // Only now check if it looks like code (and no JSON was found)
+            const looksLikeCode = (
+              trimmed.includes("margin:") ||
+              trimmed.includes("font-family:") ||
+              trimmed.includes("def ") ||
+              trimmed.includes("function ") ||
+              trimmed.includes("import ") ||
+              trimmed.includes("const ") ||
+              trimmed.includes("class ") ||
+              trimmed.includes("export ") ||
+              trimmed.includes("require(") ||
+              trimmed.includes("from ")
+            );
+            
+            const hasNoJson = (
+              trimmed.startsWith("{") === false &&
+              trimmed.startsWith("[") === false &&
+              !trimmed.includes('"steps"') &&
+              !trimmed.includes("'steps'") &&
+              trimmed.indexOf("{") === -1
+            );
+            
+            if (looksLikeCode && hasNoJson) {
+              emit(createAgentEvent('status', 'Error: LLM returned code instead of JSON plan'));
+              emit(createAgentEvent('reasoning', 'The model returned code instead of a JSON plan. This might happen if:'));
+              emit(createAgentEvent('reasoning', '1. The instruction was unclear or asked for code directly'));
+              emit(createAgentEvent('reasoning', '2. The model misunderstood the task'));
+              emit(createAgentEvent('reasoning', 'Try: Rephrasing your instruction as a task request (e.g., "Create a file X" or "Add feature Y")'));
+              emit(createAgentEvent('reasoning', `Response preview: ${trimmed.slice(0, 200)}`));
+              safeClose(controller);
               return;
             }
-            jsonStr = regexMatch[0];
+            
+            // If we still don't have a plan, log the parsing error
+            logError(
+              `Plan JSON parse failed: ${parseResult.error}`,
+              { category: "parsing", severity: "high" },
+              { raw: parseResult.raw || trimmed.slice(0, 500), originalLength: trimmed.length }
+            );
+            emit(createAgentEvent('status', `Error: Failed to parse JSON plan. ${parseResult.error}`));
+            emit(createAgentEvent('reasoning', `Parse error: ${parseResult.error}. Raw preview (first 500 chars): ${parseResult.raw || trimmed.slice(0, 500)}`));
+            safeClose(controller);
+            return;
           }
-        }
-        // Remove trailing commas before ] or } (invalid in JSON, some LLMs emit them)
-        jsonStr = jsonStr.replace(/,(\s*[}\]])/g, "$1");
-
-        if (jsonStr.includes("'") && !jsonStr.includes('"')) {
-          try {
-            jsonStr = jsonStr
-              .replace(/'/g, '"')
-              .replace(/True/g, "true")
-              .replace(/False/g, "false")
-              .replace(/None/g, "null");
-          } catch {
-            // Continue
-          }
-        }
-
-        let plan: AgentPlan;
-        try {
-          plan = JSON.parse(jsonStr) as AgentPlan;
-        } catch (parseError) {
-          console.error("Plan JSON parse error:", parseError);
-          console.error("Raw JSON string (first 500 chars):", jsonStr.slice(0, 500));
-          emitEvent(controller, encoder, createAgentEvent('status', `Error: Failed to parse JSON plan. The model may have returned invalid JSON.`));
-          // Try to extract error details
-          const errorDetail = parseError instanceof Error ? parseError.message : String(parseError);
-          emitEvent(controller, encoder, createAgentEvent('reasoning', `Parse error: ${errorDetail}`));
-          controller.close();
-          return;
-        }
+        } // End of "if (!plan)" parsing block
 
         if (!plan || !Array.isArray(plan.steps)) {
           console.error("Invalid plan structure:", plan);
-          emitEvent(controller, encoder, createAgentEvent('status', 'Error: Invalid plan (missing steps array)'));
+          emit(createAgentEvent('status', 'Error: Invalid plan (missing steps array)'));
           if (plan && typeof plan === 'object') {
-            emitEvent(controller, encoder, createAgentEvent('reasoning', `Plan object keys: ${Object.keys(plan).join(', ')}`));
+            emit(createAgentEvent('reasoning', `Plan object keys: ${Object.keys(plan).join(', ')}`));
+            emit(createAgentEvent('reasoning', `Plan structure: ${JSON.stringify(plan, null, 2).slice(0, 500)}`));
           }
-          controller.close();
+          safeClose(controller);
           return;
+        }
+        
+        // Validate steps array structure
+        if (!Array.isArray(plan.steps)) {
+          emit(createAgentEvent('status', `Error: Plan steps is not an array. Got: ${typeof plan.steps}`));
+          emit(createAgentEvent('reasoning', `Plan structure: ${JSON.stringify(plan, null, 2).slice(0, 1000)}`));
+          safeClose(controller);
+          return;
+        }
+        
+        // Check if steps might be nested (common LLM mistake)
+        if (plan.steps.length > 0 && Array.isArray(plan.steps[0])) {
+          console.warn("Steps appear to be nested arrays, attempting to flatten");
+          plan.steps = plan.steps.flat();
+        }
+        
+        // Check if steps are strings (descriptions) instead of objects - common LLM mistake
+        const allStepsAreStrings = plan.steps.length > 0 && plan.steps.every((s: any) => typeof s === "string");
+        if (allStepsAreStrings) {
+          emit(createAgentEvent('status', 'Error: Plan steps are plain text descriptions instead of step objects.'));
+          emit(createAgentEvent('reasoning', 'The model returned step descriptions (strings) instead of step objects. Each step must be an OBJECT.'));
+          emit(createAgentEvent('reasoning', 'WRONG: "steps": ["Modify package.json", "Update README"]'));
+          emit(createAgentEvent('reasoning', 'CORRECT: "steps": [{"type": "file_edit", "path": "package.json", "newContent": "..."}, {"type": "command", "command": "npm start"}]'));
+          emit(createAgentEvent('reasoning', 'Each step must have: type ("file_edit" or "command"), and for file_edit: path + newContent; for command: command'));
+          safeClose(controller);
+          return;
+        }
+        
+        // Validate that steps have required fields
+        const invalidSteps: Array<{ index: number; step: any; reason: string }> = [];
+        plan.steps.forEach((step: any, index: number) => {
+          if (!step || typeof step !== "object") {
+            invalidSteps.push({ 
+              index, 
+              step, 
+              reason: `Step is not an object. Got: ${typeof step}${step ? ` (${JSON.stringify(step).slice(0, 100)})` : ""}` 
+            });
+            return;
+          }
+          
+          // Log step structure for debugging
+          const stepKeys = Object.keys(step);
+          const stepPreview = JSON.stringify(step, null, 2).slice(0, 300);
+          
+          if (!step.type) {
+            invalidSteps.push({ 
+              index, 
+              step, 
+              reason: `Missing 'type' field. Step has keys: [${stepKeys.join(", ")}]. Step data: ${stepPreview}` 
+            });
+            return;
+          }
+          
+          if (step.type === "file_edit") {
+            if (!step.path || typeof step.path !== "string" || step.path.trim() === "") {
+              invalidSteps.push({ 
+                index, 
+                step, 
+                reason: `Missing or empty 'path' field. Step keys: [${stepKeys.join(", ")}]` 
+              });
+            }
+            if (!step.newContent || typeof step.newContent !== "string") {
+              invalidSteps.push({ 
+                index, 
+                step, 
+                reason: `Missing or invalid 'newContent' field. Step keys: [${stepKeys.join(", ")}]` 
+              });
+            }
+          } else if (step.type === "command") {
+            if (!step.command || typeof step.command !== "string" || step.command.trim() === "") {
+              invalidSteps.push({ 
+                index, 
+                step, 
+                reason: `Missing or empty 'command' field. Step keys: [${stepKeys.join(", ")}]` 
+              });
+            }
+          } else {
+            invalidSteps.push({ 
+              index, 
+              step, 
+              reason: `Unknown step type: "${step.type}". Expected "file_edit" or "command". Step keys: [${stepKeys.join(", ")}]. Step data: ${stepPreview}` 
+            });
+          }
+        });
+        
+        // Filter out invalid steps
+        const validSteps = plan.steps.filter((step: any, index: number) => {
+          return !invalidSteps.some(inv => inv.index === index);
+        });
+        
+        if (validSteps.length === 0) {
+          const errorDetails = invalidSteps.length > 0
+            ? `\n\nInvalid steps:\n${invalidSteps.map(({ index, reason, step }) => 
+                `  Step ${index + 1}: ${reason}\n    Full step: ${JSON.stringify(step, null, 2).slice(0, 400)}`
+              ).join("\n\n")}`
+            : "";
+          emit(createAgentEvent('status', `Error: Plan has no valid steps. All ${plan.steps.length} step(s) are missing required fields.${errorDetails}`));
+          emit(createAgentEvent('reasoning', `Full plan structure: ${JSON.stringify(plan, null, 2).slice(0, 1000)}`));
+          console.error("Invalid plan steps:", JSON.stringify(plan.steps, null, 2));
+          safeClose(controller);
+          return;
+        }
+        
+        // Use validated steps
+        plan.steps = validSteps;
+        
+        if (invalidSteps.length > 0) {
+          console.warn(`Plan has ${invalidSteps.length} invalid step(s) out of ${plan.steps.length + invalidSteps.length} total:`, invalidSteps);
+          emit(createAgentEvent('reasoning', `Warning: ${invalidSteps.length} invalid step(s) were filtered out`));
         }
 
         if (plan.steps.length === 0) {
           console.error("Empty steps array in plan");
           console.error("Raw response (first 1000 chars):", raw.slice(0, 1000));
           console.error("Parsed plan:", JSON.stringify(plan, null, 2));
-          emitEvent(controller, encoder, createAgentEvent('status', 'Error: Plan has no steps. The model may need more context or clearer instructions.'));
-          emitEvent(controller, encoder, createAgentEvent('reasoning', 'The model returned a plan but with no steps. This might happen if:'));
-          emitEvent(controller, encoder, createAgentEvent('reasoning', '1. Files mentioned in errors were not found in the workspace'));
-          emitEvent(controller, encoder, createAgentEvent('reasoning', '2. The error logs are unclear or incomplete'));
-          emitEvent(controller, encoder, createAgentEvent('reasoning', '3. The model needs more specific instructions'));
-          emitEvent(controller, encoder, createAgentEvent('reasoning', 'Try: Including file paths in your error description, or asking to "fix the error in [filename]"'));
-          controller.close();
+          emit(createAgentEvent('status', 'Error: Plan has no steps. The model may need more context or clearer instructions.'));
+          emit(createAgentEvent('reasoning', 'The model returned a plan but with no steps. This might happen if:'));
+          emit(createAgentEvent('reasoning', '1. Files mentioned in errors were not found in the workspace'));
+          emit(createAgentEvent('reasoning', '2. The error logs are unclear or incomplete'));
+          emit(createAgentEvent('reasoning', '3. The model needs more specific instructions'));
+          emit(createAgentEvent('reasoning', 'Try: Including file paths in your error description, or asking to "fix the error in [filename]"'));
+          safeClose(controller);
           return;
         }
 
-        emitEvent(controller, encoder, createAgentEvent('reasoning', `Plan generated: ${plan.steps.length} step(s)`));
+        emit(createAgentEvent('reasoning', `Plan generated: ${plan.steps.length} step(s)`));
 
         // Emit final result
-        emitEvent(controller, encoder, createAgentEvent('status', 'Planning complete', {
+        emit(createAgentEvent('status', 'Planning complete', {
           stepCount: plan.steps.length,
         }));
 
-        // Send the plan as a final event
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'plan', plan, usage })}\n\n`));
-        controller.close();
+        const contextUsedFilePaths = [...new Set([
+          ...indexedFiles.map((r: { path: string }) => r.path),
+          ...(body.fileContents ? Object.keys(body.fileContents) : []),
+        ])];
+
+        // Send the plan as a final event (include model info for free-model fallback UI)
+        safeEnqueue(controller, encoder, `data: ${JSON.stringify({
+          type: 'plan',
+          plan,
+          usage,
+          modelUsed: modelUsed ?? undefined,
+          modelFallback: modelFallback ?? undefined,
+          availableFreeModels: providerId === 'openrouter' ? OPENROUTER_FREE_MODELS.map((m) => ({ id: m.id, label: m.label })) : undefined,
+          contextUsed: contextUsedFilePaths.length > 0 ? { filePaths: contextUsedFilePaths } : undefined,
+        })}\n\n`);
+        safeClose(controller);
       } catch (e) {
         const errorMsg = e instanceof Error ? e.message : "Planning failed";
-        emitEvent(controller, encoder, createAgentEvent('status', `Error: ${errorMsg}`));
-        controller.close();
+        const errorStack = e instanceof Error ? e.stack : undefined;
+        
+        // Emit detailed error information
+        emit(createAgentEvent('status', `Error: ${errorMsg}`));
+        emit(createAgentEvent('reasoning', `Planning failed with error: ${errorMsg}`));
+        
+        // Log additional context if available
+        if (errorStack) {
+          console.error("Plan generation error stack:", errorStack);
+        }
+        console.error("Plan generation error:", e);
+        
+        // Try to send error details in the response
+        safeEnqueue(controller, encoder, `data: ${JSON.stringify({ 
+          type: 'error', 
+          error: errorMsg,
+          details: errorStack ? errorStack.split('\n').slice(0, 5).join('\n') : undefined
+        })}\n\n`);
+        
+        safeClose(controller);
       }
     },
   });

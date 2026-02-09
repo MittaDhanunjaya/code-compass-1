@@ -67,6 +67,7 @@ export async function POST(request: Request) {
     githubRepoUrl?: string;
     githubBranch?: string;
     fromMyRepo?: { owner: string; repo: string; defaultBranch: string; isPrivate: boolean };
+    files?: Array<{ path: string; content?: string }>;
   };
   try {
     body = await request.json();
@@ -81,6 +82,9 @@ export async function POST(request: Request) {
   const fromMyRepo = body.fromMyRepo;
   const githubRepoUrl = body.githubRepoUrl?.trim();
   const githubBranch = (body.githubBranch?.trim() || "main").replace(/^\s+|\s+$/g, "") || "main";
+  const localFiles = Array.isArray(body.files) ? body.files : undefined;
+  const MAX_LOCAL_FILES = 500;
+  const MAX_FILE_SIZE = 500_000;
 
   // Insert workspace first
   const { data: inserted, error: insertError } = await supabase
@@ -94,6 +98,42 @@ export async function POST(request: Request) {
       { error: insertError?.message || "Failed to create workspace" },
       { status: 500 }
     );
+  }
+
+  const workspaceId = inserted.id as string;
+
+  // Create workspace from local files (Open local folder / upload)
+  if (localFiles && localFiles.length > 0) {
+    if (localFiles.length > MAX_LOCAL_FILES) {
+      return NextResponse.json(
+        { error: `Too many files (max ${MAX_LOCAL_FILES}). Use a smaller folder or GitHub import.` },
+        { status: 400 }
+      );
+    }
+    const rows = localFiles
+      .slice(0, MAX_LOCAL_FILES)
+      .filter((f) => typeof f.path === "string" && f.path.trim().length > 0)
+      .map((f) => ({
+        workspace_id: workspaceId,
+        path: f.path.trim().replace(/^\/+/, ""),
+        content: typeof f.content === "string" && f.content.length <= MAX_FILE_SIZE ? f.content : "",
+      }));
+    if (rows.length > 0) {
+      const { error: filesError } = await supabase.from("workspace_files").insert(rows);
+      if (filesError) {
+        return NextResponse.json(
+          { error: filesError.message || "Failed to add files" },
+          { status: 500 }
+        );
+      }
+    }
+    const workspaceData = await supabase
+      .from("workspaces")
+      .select("id, name, created_at, updated_at")
+      .eq("id", workspaceId)
+      .single();
+    const ws = { ...workspaceData.data, safe_edit_mode: true, github_repo_url: null, github_default_branch: null, github_owner: null, github_repo: null, github_is_private: null, github_current_branch: null };
+    return NextResponse.json({ ...ws, filesImported: rows.length });
   }
 
   // Select workspace - start with minimal columns that definitely exist, then add defaults

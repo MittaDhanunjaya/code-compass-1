@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import dynamic from "next/dynamic";
 import { Loader2, Wand2, Check, ChevronDown, ChevronRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -17,6 +17,8 @@ import { PROVIDERS, type ProviderId } from "@/lib/llm/providers";
 import type { FileEditStep } from "@/lib/agent/types";
 import type { ComposerScope } from "@/lib/composer/types";
 import { SAFE_EDIT_MAX_FILES } from "@/lib/protected-paths";
+import { ErrorWithAction } from "@/components/error-with-action";
+import { InlineEditDiffDialog } from "@/components/inline-edit-diff-dialog";
 
 const MonacoDiffEditor = dynamic(
   () => import("@monaco-editor/react").then((mod) => mod.DiffEditor),
@@ -70,6 +72,27 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
   const [protectedConfirmOpen, setProtectedConfirmOpen] = useState(false);
   const [protectedPathsList, setProtectedPathsList] = useState<string[]>([]);
   const [pendingStepsForProtected, setPendingStepsForProtected] = useState<FileEditStep[] | null>(null);
+  // Phase F: review in diff before apply (one or more files)
+  const [reviewQueue, setReviewQueue] = useState<StepWithContent[]>([]);
+  const [reviewIndex, setReviewIndex] = useState(0);
+  const [rulesFile, setRulesFile] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!workspaceId) return;
+    let cancelled = false;
+    fetch(`/api/workspaces/${workspaceId}/rules-info`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (!cancelled && data?.rulesFile != null) setRulesFile(data.rulesFile);
+        else if (!cancelled) setRulesFile(null);
+      })
+      .catch(() => {
+        if (!cancelled) setRulesFile(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId]);
 
   // Reuse Chat provider/model from localStorage
   const getStoredProvider = (): ProviderId => {
@@ -120,9 +143,27 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
           fileContents: Object.keys(fileContents).length ? fileContents : undefined,
         }),
       });
-      const data = await res.json();
+      const rawText = await res.text();
+      let data: { error?: string; stepsWithContent?: StepWithContent[]; plan?: { summary?: string } } = {};
+      try {
+        data = JSON.parse(rawText) as typeof data;
+      } catch {
+        throw new Error("Invalid response from server");
+      }
       if (!res.ok) throw new Error(data.error || "Plan failed");
-      const steps = data.stepsWithContent ?? [];
+      const rawSteps = data.stepsWithContent ?? [];
+      // Merge multiple steps for the same file into one step per file (original → final content)
+      const byPath = new Map<string, StepWithContent>();
+      for (const s of rawSteps) {
+        const existing = byPath.get(s.path);
+        if (!existing) {
+          byPath.set(s.path, { ...s });
+        } else {
+          existing.newContent = s.newContent;
+          existing.description = s.description ?? existing.description;
+        }
+      }
+      const steps = Array.from(byPath.values());
       setStepsWithContent(steps);
       setPlanSummary(data.plan?.summary ?? null);
       setSelectedPaths(new Set(steps.map((s: StepWithContent) => s.path)));
@@ -134,7 +175,7 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
   }, [workspaceId, instruction, scope, currentFilePath, provider, model, getTab]);
 
   const executeApply = useCallback(
-    async (steps: FileEditStep[], confirmedProtectedPaths?: string[]) => {
+    async (steps: FileEditStep[], confirmedProtectedPaths?: string[], clearPlanOnSuccess = true) => {
       if (!workspaceId) return;
       setApplying(true);
       setError(null);
@@ -167,9 +208,19 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
             else openFile(path, content);
           }
         }
-        setStepsWithContent([]);
-        setPlanSummary(null);
-        setSelectedPaths(new Set());
+        if (clearPlanOnSuccess) {
+          setStepsWithContent([]);
+          setPlanSummary(null);
+          setSelectedPaths(new Set());
+        } else {
+          const editedSet = new Set(data.filesEdited ?? []);
+          setStepsWithContent((prev) => prev.filter((s) => !editedSet.has(s.path)));
+          setSelectedPaths((prev) => {
+            const next = new Set(prev);
+            editedSet.forEach((p) => next.delete(p));
+            return next;
+          });
+        }
         window.dispatchEvent(new CustomEvent("refresh-file-tree"));
       } catch (e) {
         setError(e instanceof Error ? e.message : "Apply failed");
@@ -180,17 +231,19 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
     [workspaceId, getTab, updateContent, openFile]
   );
 
+  const stepToFileEditStep = useCallback((s: StepWithContent): FileEditStep => ({
+    type: "file_edit",
+    path: s.path,
+    newContent: s.newContent,
+    oldContent: s.oldContent,
+    description: s.description,
+  }), []);
+
   const applySelected = useCallback(async () => {
     if (!workspaceId || stepsWithContent.length === 0) return;
     const toApply = stepsWithContent.filter((s) => selectedPaths.has(s.path));
     if (toApply.length === 0) return;
-    const steps: FileEditStep[] = toApply.map((s) => ({
-      type: "file_edit" as const,
-      path: s.path,
-      newContent: s.newContent,
-      oldContent: s.oldContent,
-      description: s.description,
-    }));
+    const steps: FileEditStep[] = toApply.map(stepToFileEditStep);
     try {
       const wsRes = await fetch(`/api/workspaces/${workspaceId}`);
       const ws = await wsRes.json();
@@ -201,19 +254,33 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
         setLargeFileConfirmOpen(true);
         return;
       }
-      await executeApply(steps);
+      // Phase F: review in diff before apply
+      setReviewQueue(toApply);
+      setReviewIndex(0);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Apply failed");
     }
-  }, [workspaceId, stepsWithContent, selectedPaths, executeApply]);
+  }, [workspaceId, stepsWithContent, selectedPaths, stepToFileEditStep]);
+
+  const applySingleStep = useCallback((step: StepWithContent) => {
+    if (!workspaceId) return;
+    // Phase F: open diff dialog first; user Accept/Reject then apply
+    setReviewQueue([step]);
+    setReviewIndex(0);
+  }, [workspaceId]);
 
   const confirmLargeFileApply = useCallback(() => {
-    if (pendingStepsForApply) {
-      executeApply(pendingStepsForApply);
+    if (pendingStepsForApply && stepsWithContent.length > 0) {
+      // Phase F: open review queue (map FileEditStep back to StepWithContent for originalContent)
+      const queue = pendingStepsForApply
+        .map((p) => stepsWithContent.find((s) => s.path === p.path))
+        .filter((s): s is StepWithContent => !!s);
+      setReviewQueue(queue);
+      setReviewIndex(0);
       setPendingStepsForApply(null);
       setLargeFileConfirmOpen(false);
     }
-  }, [pendingStepsForApply, executeApply]);
+  }, [pendingStepsForApply, stepsWithContent]);
 
   const confirmProtectedApply = useCallback(() => {
     if (pendingStepsForProtected) {
@@ -252,6 +319,16 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
       <div className="flex shrink-0 flex-col gap-2 border-b border-border p-3">
+        <p className="text-[11px] text-muted-foreground/90 flex items-center gap-1.5 flex-wrap">
+          <span>Rules: {rulesFile ?? "No rules file"}</span>
+          <button
+            type="button"
+            onClick={() => window.dispatchEvent(new CustomEvent("open-rules-editor"))}
+            className="text-primary hover:underline text-[11px]"
+          >
+            Edit rules
+          </button>
+        </p>
         <label className="text-xs font-medium text-muted-foreground">Edit instruction</label>
         <Textarea
           placeholder="e.g. Add logging to all API handlers"
@@ -295,6 +372,15 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
           className="w-full gap-2"
           onClick={generateEdits}
           disabled={loading || !instruction.trim() || (scope !== "workspace" && !currentFilePath)}
+          title={
+            loading
+              ? "Generating…"
+              : !instruction.trim()
+                ? "Enter an instruction"
+                : scope !== "workspace" && !currentFilePath
+                  ? "Open a file when editing current file"
+                  : undefined
+          }
         >
           {loading ? (
             <>
@@ -312,7 +398,7 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
 
       {error && (
         <div className="shrink-0 px-3 py-2">
-          <div className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>
+          <ErrorWithAction message={error} />
         </div>
       )}
 
@@ -331,6 +417,13 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
                 className="h-7 text-xs"
                 onClick={applySelected}
                 disabled={applying || selectedPaths.size === 0}
+                title={
+                  applying
+                    ? "Applying…"
+                    : selectedPaths.size === 0
+                      ? "Select at least one edit to apply"
+                      : undefined
+                }
               >
                 {applying ? (
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -343,16 +436,12 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
               </Button>
             </div>
             <div className="space-y-1">
-              {stepsWithContent.map((step) => (
+              {stepsWithContent.map((step, index) => (
                 <div
-                  key={step.path}
+                  key={`${step.path}-${index}`}
                   className="rounded-lg border border-border bg-muted/20 overflow-hidden"
                 >
-                  <button
-                    type="button"
-                    className="w-full flex items-center gap-2 px-3 py-2 text-left text-sm font-medium hover:bg-muted/50"
-                    onClick={() => setExpandedPath((p) => (p === step.path ? null : step.path))}
-                  >
+                  <div className="w-full flex items-center gap-2 px-3 py-2 text-left text-sm font-medium">
                     <input
                       type="checkbox"
                       checked={selectedPaths.has(step.path)}
@@ -360,16 +449,34 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
                         e.stopPropagation();
                         togglePath(step.path);
                       }}
-                      onClick={(e) => e.stopPropagation()}
                       className="rounded border-border"
                     />
-                    {expandedPath === step.path ? (
-                      <ChevronDown className="h-4 w-4 text-muted-foreground" />
-                    ) : (
-                      <ChevronRight className="h-4 w-4 text-muted-foreground" />
-                    )}
-                    <span className="truncate">{step.path}</span>
-                  </button>
+                    <button
+                      type="button"
+                      className="flex flex-1 items-center gap-2 hover:bg-muted/50 rounded py-1 pr-1 min-w-0"
+                      onClick={() => setExpandedPath((p) => (p === step.path ? null : step.path))}
+                    >
+                      {expandedPath === step.path ? (
+                        <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
+                      ) : (
+                        <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+                      )}
+                      <span className="truncate">{step.path}</span>
+                    </button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 text-xs shrink-0"
+                      disabled={applying}
+                      title={applying ? "Applying…" : "Apply this edit"}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        applySingleStep(step);
+                      }}
+                    >
+                      {applying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Apply"}
+                    </Button>
+                  </div>
                   {expandedPath === step.path && (
                     <div className="border-t border-border h-48">
                       <MonacoDiffEditor
@@ -395,7 +502,7 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
         )}
         {!loading && stepsWithContent.length === 0 && (
           <p className="text-xs text-muted-foreground py-4">
-            Enter an instruction and click Generate edits. Scope limits which files can be changed.
+            Describe a change and click Generate edits. Use <kbd className="rounded border border-border bg-muted/50 px-1 py-0.5 font-mono text-[10px]">Cmd+K</kbd> for quick refactor on the current file.
           </p>
         )}
       </div>
@@ -437,6 +544,51 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Phase F: review in diff before apply */}
+      {reviewQueue.length > 0 && reviewQueue[reviewIndex] && workspaceId && (
+        <InlineEditDiffDialog
+          key={reviewQueue[reviewIndex].path}
+          open={true}
+          onOpenChange={(open) => {
+            if (!open) {
+              setReviewQueue([]);
+              setReviewIndex(0);
+            }
+          }}
+          path={reviewQueue[reviewIndex].path}
+          originalContent={reviewQueue[reviewIndex].originalContent}
+          newContent={reviewQueue[reviewIndex].newContent}
+          workspaceId={workspaceId}
+          onAccept={() => {
+            const step = reviewQueue[reviewIndex];
+            updateContent(step.path, step.newContent);
+            setStepsWithContent((prev) => prev.filter((s) => s.path !== step.path));
+            setSelectedPaths((prev) => {
+              const next = new Set(prev);
+              next.delete(step.path);
+              return next;
+            });
+            const nextIndex = reviewIndex + 1;
+            if (nextIndex >= reviewQueue.length) {
+              setReviewQueue([]);
+              setReviewIndex(0);
+              window.dispatchEvent(new CustomEvent("refresh-file-tree"));
+            } else {
+              setReviewIndex(nextIndex);
+            }
+          }}
+          onReject={() => {
+            const nextIndex = reviewIndex + 1;
+            if (nextIndex >= reviewQueue.length) {
+              setReviewQueue([]);
+              setReviewIndex(0);
+            } else {
+              setReviewIndex(nextIndex);
+            }
+          }}
+        />
+      )}
     </div>
   );
 }

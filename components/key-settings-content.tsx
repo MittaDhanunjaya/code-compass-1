@@ -10,10 +10,17 @@ import {
   PROVIDER_KEYS_URL,
   type ProviderId,
 } from "@/lib/llm/providers";
+import { ErrorWithAction } from "@/components/error-with-action";
 
 export function KeySettingsContent() {
   const [selectedProvider, setSelectedProvider] = useState<ProviderId>("openrouter");
   const [configured, setConfigured] = useState<Record<ProviderId, boolean>>({
+    openrouter: false,
+    openai: false,
+    gemini: false,
+    perplexity: false,
+  });
+  const [needsReentry, setNeedsReentry] = useState<Record<ProviderId, boolean>>({
     openrouter: false,
     openai: false,
     gemini: false,
@@ -33,20 +40,32 @@ export function KeySettingsContent() {
       PROVIDERS.map((p) =>
         fetch(`/api/provider-keys?provider=${p}`)
           .then((res) => res.json())
-          .then((data) => ({ provider: p, configured: !!data.configured }))
-          .catch(() => ({ provider: p, configured: false }))
+          .then((data) => ({ 
+            provider: p, 
+            configured: !!data.configured,
+            needsReentry: !!data.needsReentry 
+          }))
+          .catch(() => ({ provider: p, configured: false, needsReentry: false }))
       )
     ).then((results) => {
-      const map: Record<ProviderId, boolean> = {
+      const configuredMap: Record<ProviderId, boolean> = {
         openrouter: false,
         openai: false,
         gemini: false,
         perplexity: false,
       };
-      for (const { provider, configured } of results) {
-        map[provider as ProviderId] = configured;
+      const reentryMap: Record<ProviderId, boolean> = {
+        openrouter: false,
+        openai: false,
+        gemini: false,
+        perplexity: false,
+      };
+      for (const { provider, configured, needsReentry } of results) {
+        configuredMap[provider as ProviderId] = configured;
+        reentryMap[provider as ProviderId] = needsReentry;
       }
-      setConfigured(map);
+      setConfigured(configuredMap);
+      setNeedsReentry(reentryMap);
       setApiKey("");
     }).finally(() => setLoading(false));
   }, []);
@@ -67,6 +86,7 @@ export function KeySettingsContent() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to save");
       setConfigured((prev) => ({ ...prev, [selectedProvider]: true }));
+      setNeedsReentry((prev) => ({ ...prev, [selectedProvider]: false }));
       setApiKey("");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to save");
@@ -156,8 +176,11 @@ export function KeySettingsContent() {
             }`}
           >
             {PROVIDER_LABELS[p]}
-            {configured[p] && (
+            {configured[p] && !needsReentry[p] && (
               <span className="ml-1 text-xs text-green-600">✓</span>
+            )}
+            {needsReentry[p] && (
+              <span className="ml-1 text-xs text-amber-600" title="Key needs to be re-entered due to encryption key change">⚠</span>
             )}
           </button>
         ))}
@@ -166,6 +189,16 @@ export function KeySettingsContent() {
         <p className="text-sm text-muted-foreground">Loading…</p>
       ) : (
         <div className="space-y-3">
+          {needsReentry[selectedProvider] && (
+            <div className="rounded-lg border border-amber-500/50 bg-amber-500/10 p-3">
+              <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
+                ⚠️ Key needs to be re-entered
+              </p>
+              <p className="text-xs text-amber-600 dark:text-amber-500 mt-1">
+                The encryption key has changed. Please re-enter your API key below to re-encrypt it with the current key.
+              </p>
+            </div>
+          )}
           <div>
             <Label htmlFor="api-key">
               {PROVIDER_LABELS[selectedProvider]} API Key
@@ -261,7 +294,7 @@ export function KeySettingsContent() {
         </div>
       )}
       {error && (
-        <p className="text-sm text-destructive">{error}</p>
+        <ErrorWithAction message={error} />
       )}
     </div>
   );

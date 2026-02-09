@@ -9,6 +9,7 @@ import { classifyCommandKind, classifyCommandResult } from "@/lib/agent/command-
 import { proposeFixSteps, buildTails } from "@/lib/agent/self-debug";
 import { getProtectedPaths } from "@/lib/protected-paths";
 import { resolveWorkspaceId } from "@/lib/workspaces/active-workspace";
+import { beautifyCode } from "@/lib/utils/code-beautifier";
 
 function commandKindToActionLabel(kind: "setup" | "test" | "other"): LogActionLabel {
   if (kind === "setup") return "CMD-SETUP";
@@ -160,12 +161,15 @@ export async function POST(request: Request) {
         .single();
 
       if (!fileRow) {
+        // Beautify code before writing (convert \n to actual newlines, etc.)
+        const beautifiedContent = beautifyCode(step.newContent, path);
+        
         const { error: insertError } = await supabase
           .from("workspace_files")
           .insert({
             workspace_id: workspaceId,
             path,
-            content: step.newContent,
+            content: beautifiedContent,
           });
 
         if (insertError) {
@@ -194,10 +198,30 @@ export async function POST(request: Request) {
       }
 
       const currentContent = fileRow.content ?? "";
+      // Beautify new content before applying edit (convert \n to actual newlines, etc.)
+      const beautifiedNewContent = beautifyCode(step.newContent, path);
+      
+      // IMPORTANT: Don't beautify oldContent directly - it needs to match the actual file content
+      // The oldContent from the plan might have escaped newlines, but the actual file
+      // content in the database might already be beautified. We need to match what's actually there.
+      let oldContentToMatch = step.oldContent;
+      let contentToMatchAgainst = currentContent;
+      
+      // If oldContent is provided, beautify both for comparison
+      if (oldContentToMatch) {
+        const beautifiedOldContent = beautifyCode(oldContentToMatch, path);
+        const beautifiedCurrentContent = beautifyCode(currentContent, path);
+        // Try matching with beautified versions first
+        if (beautifiedCurrentContent.includes(beautifiedOldContent)) {
+          oldContentToMatch = beautifiedOldContent;
+          contentToMatchAgainst = beautifiedCurrentContent;
+        }
+      }
+      
       const result = applyEdit(
-        currentContent,
-        step.newContent,
-        step.oldContent
+        contentToMatchAgainst,
+        beautifiedNewContent,
+        oldContentToMatch
       );
 
       if (!result.ok) {

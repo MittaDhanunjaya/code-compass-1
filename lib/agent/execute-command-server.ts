@@ -199,11 +199,22 @@ async function syncWorkspaceToDisk(
   }
 }
 
+function doResolve(
+  resolve: (r: { exitCode: number | null; stdout: string; stderr: string; errorMessage?: string; durationMs: number }) => void,
+  result: { exitCode: number | null; stdout: string; stderr: string; errorMessage?: string; durationMs: number },
+  resolved: { current: boolean }
+) {
+  if (resolved.current) return;
+  resolved.current = true;
+  resolve(result);
+}
+
 async function executeCommand(
   command: string,
   cwd: string,
   timeoutMs: number,
-  activeVenv?: string
+  activeVenv?: string,
+  signal?: AbortSignal
 ): Promise<{
   exitCode: number | null;
   stdout: string;
@@ -212,19 +223,20 @@ async function executeCommand(
   durationMs: number;
 }> {
   const startTime = Date.now();
+  const resolved = { current: false };
   return new Promise((resolve) => {
     const trimmed = command.trim();
-    
+
     // Check if this is a safe pipe chain or command substitution that needs shell execution
     const safePipePattern = /^lsof\s+-ti:\d+\s*\|\s*xargs\s+kill\s+(-9|-TERM|-KILL)?(\s*\|\|\s*true)?$/i;
     const killPortPattern = /^kill\s+(-9|-TERM|-KILL)\s+\$\(lsof\s+-t\s+-i:\d+\)$/i;
     const needsShell = safePipePattern.test(trimmed) || killPortPattern.test(trimmed);
-    
+
     // For shell commands, execute directly with shell: true
     if (needsShell) {
       const child = spawn(trimmed, [], {
         cwd,
-        shell: true, // Use shell for pipe chains
+        shell: true,
         stdio: ["ignore", "pipe", "pipe"],
         env: {
           ...process.env,
@@ -239,14 +251,28 @@ async function executeCommand(
 
       const timeout = setTimeout(() => {
         child.kill("SIGTERM");
-        resolve({
+        doResolve(resolve, {
           exitCode: null,
           stdout,
           stderr,
           errorMessage: `Command timed out after ${timeoutMs}ms`,
           durationMs: Date.now() - startTime,
-        });
+        }, resolved);
       }, timeoutMs);
+
+      if (signal) {
+        signal.addEventListener("abort", () => {
+          clearTimeout(timeout);
+          child.kill("SIGTERM");
+          doResolve(resolve, {
+            exitCode: null,
+            stdout,
+            stderr,
+            errorMessage: "Command cancelled (Ctrl+C)",
+            durationMs: Date.now() - startTime,
+          }, resolved);
+        });
+      }
 
       child.on("error", (error: Error & { code?: string }) => {
         clearTimeout(timeout);
@@ -254,23 +280,23 @@ async function executeCommand(
         if (error.code === "ENOENT") {
           errorMessage = `Command not found. Make sure lsof, xargs, and kill are installed.`;
         }
-        resolve({
+        doResolve(resolve, {
           exitCode: null,
           stdout,
           stderr,
           errorMessage,
           durationMs: Date.now() - startTime,
-        });
+        }, resolved);
       });
 
       child.on("close", (code) => {
         clearTimeout(timeout);
-        resolve({
+        doResolve(resolve, {
           exitCode: code ?? null,
           stdout: stdout.trim(),
           stderr: stderr.trim(),
           durationMs: Date.now() - startTime,
-        });
+        }, resolved);
       });
       return;
     }
@@ -347,14 +373,28 @@ async function executeCommand(
 
     const timeout = setTimeout(() => {
       child.kill("SIGTERM");
-      resolve({
+      doResolve(resolve, {
         exitCode: null,
         stdout,
         stderr,
         errorMessage: `Command timed out after ${timeoutMs}ms`,
         durationMs: Date.now() - startTime,
-      });
+      }, resolved);
     }, timeoutMs);
+
+    if (signal) {
+      signal.addEventListener("abort", () => {
+        clearTimeout(timeout);
+        child.kill("SIGTERM");
+        doResolve(resolve, {
+          exitCode: null,
+          stdout,
+          stderr,
+          errorMessage: "Command cancelled (Ctrl+C)",
+          durationMs: Date.now() - startTime,
+        }, resolved);
+      });
+    }
 
     child.on("error", (error: Error & { code?: string }) => {
       clearTimeout(timeout);
@@ -362,13 +402,13 @@ async function executeCommand(
       if (error.code === "ENOENT") {
         errorMessage = `Command "${program}" not found. Make sure it's installed and in your PATH.`;
       }
-      resolve({
+      doResolve(resolve, {
         exitCode: null,
         stdout,
         stderr,
         errorMessage,
         durationMs: Date.now() - startTime,
-      });
+      }, resolved);
     });
 
     child.on("close", (code) => {
@@ -381,21 +421,21 @@ async function executeCommand(
           stderrLower.includes("pep 668") ||
           (stderrLower.includes("pip") && stderrLower.includes("system")))
       ) {
-        resolve({
+        doResolve(resolve, {
           exitCode: code ?? null,
           stdout: stdout.trim(),
           stderr: stderr.trim(),
           errorMessage: `Python environment is externally managed. Use a virtual environment instead:\n1. Create venv: python3 -m venv venv\n2. Use venv's pip: venv/bin/pip install -r requirements.txt`,
           durationMs,
-        });
+        }, resolved);
         return;
       }
-      resolve({
+      doResolve(resolve, {
         exitCode: code ?? null,
         stdout: stdout.trim(),
         stderr: stderr.trim(),
         durationMs,
-      });
+      }, resolved);
     });
   });
 }
@@ -407,7 +447,8 @@ async function executeCommand(
 export async function executeCommandInWorkspace(
   supabase: ReturnType<typeof createClient>,
   workspaceId: string,
-  command: string
+  command: string,
+  abortSignal?: AbortSignal
 ): Promise<RunCommandResult> {
   const trimmed = command.trim();
   const parts = trimmed.split(/\s+/);
@@ -491,9 +532,8 @@ export async function executeCommandInWorkspace(
     await syncWorkspaceToDisk(supabase, workspaceId);
     const workspaceDir = getWorkspaceDir(workspaceId);
     const activeVenv = activeVenvs.get(workspaceId);
-    // Use longer timeout for server-like commands
     const timeout = isServerCommand(command) ? SERVER_COMMAND_TIMEOUT_MS : COMMAND_TIMEOUT_MS;
-    const result = await executeCommand(command, workspaceDir, timeout, activeVenv);
+    const result = await executeCommand(command, workspaceDir, timeout, activeVenv, abortSignal);
     return {
       ok: result.exitCode === 0 && !result.errorMessage,
       command,

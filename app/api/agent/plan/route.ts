@@ -112,6 +112,12 @@ Example for Node.js project: If user asks for "a weather app in Node", create:
 Do NOT create only the main file - always include supporting files for a complete, production-ready project.
 Do NOT use system pip/python for Python projects - ALWAYS create venv first and use venv/bin/pip and venv/bin/python.
 
+When fixing errors or bugs (CRITICAL - minimal edits):
+- Make MINIMAL, surgical edits only. Never replace or delete large sections of a file unless the user explicitly asked to remove or rewrite them.
+- Prefer oldContent/newContent for targeted replacements of the specific lines that cause the bug.
+- If the user says "fix the error" or "fix the 500", identify the single root cause and change only what is necessary. Do not simplify, refactor, or remove unrelated code.
+- Never delete code the user did not ask to remove. Preserve existing logic; only fix the faulty part.
+
 RUN INSTRUCTIONS (MANDATORY): Every plan MUST include at least one file that documents how to run the app or complete the task: README.md (with "How to run" / "Usage" section) or HOW_TO_RUN.txt. The content must be concrete steps (e.g. "1. Create venv: python3 -m venv venv 2. Install: venv/bin/pip install -r requirements.txt 3. Run: venv/bin/python main.py").`;
 
 export async function POST(request: Request) {
@@ -158,36 +164,51 @@ export async function POST(request: Request) {
   }
 
   const requestedProvider = (body.provider ?? "openrouter") as ProviderId;
+  // Prioritize requested provider, then try others
   const providersToTry = PROVIDERS.includes(requestedProvider)
     ? [requestedProvider, ...PROVIDERS.filter((p) => p !== requestedProvider)]
     : [...PROVIDERS];
 
   let apiKey: string | null = null;
   let providerId: ProviderId | null = null;
+  const triedProviders: ProviderId[] = [];
+  
   for (const p of providersToTry) {
-    const { data: keyRow } = await supabase
+    triedProviders.push(p);
+    const { data: keyRow, error: keyError } = await supabase
       .from("provider_keys")
       .select("key_encrypted")
       .eq("user_id", user.id)
       .eq("provider", p)
-      .single();
+      .maybeSingle(); // Use maybeSingle() instead of single() to avoid throwing on no rows
+    
+    if (keyError) {
+      console.error(`Error fetching key for ${p}:`, keyError);
+      continue;
+    }
+    
     if (keyRow?.key_encrypted) {
       try {
         apiKey = decrypt(keyRow.key_encrypted);
         providerId = p;
         break;
-      } catch {
+      } catch (decryptError) {
+        console.error(`Error decrypting key for ${p}:`, decryptError);
         continue;
       }
     }
   }
 
   if (!apiKey || !providerId) {
-    const requestedLabel = requestedProvider ? PROVIDER_LABELS[requestedProvider] : "Selected provider";
+    // Better error message: show which providers were tried and suggest free options
+    const triedLabels = triedProviders.map(p => PROVIDER_LABELS[p]).join(", ");
+    const freeOptions = "OpenRouter (free models available) or Gemini (free tier)";
     return NextResponse.json(
       {
         error:
-          `No API key configured for ${requestedLabel}. Add one in API Key settings.`,
+          `No API key configured for any provider. Tried: ${triedLabels}. ` +
+          `Add an API key in Settings → API Keys. Recommended: ${freeOptions}. ` +
+          `Get free keys at: OpenRouter (https://openrouter.ai/keys) or Gemini (https://aistudio.google.com/apikey)`,
       },
       { status: 400 }
     );
@@ -271,12 +292,17 @@ export async function POST(request: Request) {
     }
   }
 
+  // Load project rules
+  const rules = await loadRules(supabase, workspaceId);
+  const rulesPrompt = formatRulesForPrompt(rules);
+  const systemPromptWithRules = PLAN_SYSTEM + rulesPrompt;
+
   try {
     const provider = getProvider(providerId);
     const modelOpt = getModelForProvider(providerId, body.model);
     const { content: raw, usage } = await provider.chat(
       [
-        { role: "system", content: PLAN_SYSTEM },
+        { role: "system", content: systemPromptWithRules },
         { role: "user", content: userContent },
       ],
       apiKey,

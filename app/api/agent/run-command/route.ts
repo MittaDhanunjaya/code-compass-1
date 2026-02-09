@@ -43,6 +43,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
   }
 
-  const result = await executeCommandInWorkspace(supabase, workspaceId, command);
+  const result = await executeCommandInWorkspace(supabase, workspaceId, command, request.signal);
   return NextResponse.json(result);
 }

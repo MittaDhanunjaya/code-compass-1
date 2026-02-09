@@ -7,7 +7,10 @@ import { applyEdit } from "@/lib/agent/diff-engine";
 import { executeCommandInWorkspace } from "@/lib/agent/execute-command-server";
 import { classifyCommandKind, classifyCommandResult } from "@/lib/agent/command-classify";
 import { proposeFixSteps, buildTails } from "@/lib/agent/self-debug";
+import { extractPortFromError, findAvailablePort } from "@/lib/agent/port-utils";
+import { buildIntelligentContext } from "@/lib/indexing/intelligent-context";
 import { getProtectedPaths } from "@/lib/protected-paths";
+import { checkEditGuardrail, getGuardrailMode } from "@/lib/agent/guardrails";
 import { createAgentEvent, formatStreamEvent, type AgentEvent } from "@/lib/agent-events";
 import { resolveWorkspaceId } from "@/lib/workspaces/active-workspace";
 import {
@@ -19,6 +22,8 @@ import {
   getSandboxDir,
   type SandboxSource,
 } from "@/lib/sandbox";
+import { beautifyCode } from "@/lib/utils/code-beautifier";
+import { safeEnqueue, safeClose } from "@/lib/stream-utils";
 
 function commandKindToActionLabel(kind: "setup" | "test" | "other"): string {
   if (kind === "setup") return "CMD-SETUP";
@@ -60,7 +65,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  let body: { workspaceId?: string; plan?: AgentPlan; provider?: ProviderId; model?: string; confirmedProtectedPaths?: string[]; skipProtected?: boolean };
+  let body: { workspaceId?: string; plan?: AgentPlan; provider?: ProviderId; model?: string; modelId?: string; modelGroupId?: string; confirmedProtectedPaths?: string[]; skipProtected?: boolean };
   try {
     body = await request.json();
   } catch {
@@ -128,8 +133,8 @@ export async function POST(request: Request) {
             summary: `Error: ${errorMsg}`,
             filesEdited: [],
           };
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'result', result: errorResult })}\n\n`));
-          controller.close();
+          safeEnqueue(controller, encoder, `data: ${JSON.stringify({ type: 'result', result: errorResult })}\n\n`);
+          safeClose(controller);
           return;
         }
 
@@ -140,8 +145,8 @@ export async function POST(request: Request) {
             summary: "Error: Workspace not found or you don't have access to it",
             filesEdited: [],
           };
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'result', result: errorResult })}\n\n`));
-          controller.close();
+          safeEnqueue(controller, encoder, `data: ${JSON.stringify({ type: 'result', result: errorResult })}\n\n`);
+          safeClose(controller);
           return;
         }
 
@@ -155,8 +160,8 @@ export async function POST(request: Request) {
           const allConfirmed = protectedPaths.every((p) => confirmedProtectedPaths.has(p));
           if (!skipProtected && !allConfirmed) {
             safeEmit( createAgentEvent('status', 'Error: Protected files require confirmation'));
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'needProtectedConfirmation', protectedPaths })}\n\n`));
-            controller.close();
+            safeEnqueue(controller, encoder, `data: ${JSON.stringify({ type: 'needProtectedConfirmation', protectedPaths })}\n\n`);
+            safeClose(controller);
             return;
           }
         }
@@ -180,12 +185,47 @@ export async function POST(request: Request) {
         const fileEditSteps = plan.steps.filter((s): s is typeof s & { type: "file_edit" } => s.type === "file_edit");
         const commandSteps = plan.steps.filter((s): s is typeof s & { type: "command" } => s.type === "command");
 
+        // Guardrails: filter steps that exceed large-replace ratio or line-delta threshold
+        const guardrailMode = getGuardrailMode();
+        const skippedByGuardrail = new Set<string>();
+        let stepsToApply = fileEditSteps;
+        if (fileEditSteps.length > 0) {
+          const paths = [...new Set(fileEditSteps.map((s) => s.path.trim()))];
+          const { data: workspaceFiles } = await supabase
+            .from("workspace_files")
+            .select("path, content")
+            .eq("workspace_id", workspaceId)
+            .in("path", paths);
+          const contentByPath = new Map<string, string>();
+          for (const row of workspaceFiles ?? []) {
+            contentByPath.set(row.path, row.content ?? "");
+          }
+          const filtered: typeof fileEditSteps = [];
+          for (const step of fileEditSteps) {
+            const path = step.path.trim();
+            const originalContent = contentByPath.get(path) ?? "";
+            const check = checkEditGuardrail(originalContent, step);
+            if (check.overThreshold && check.reason) {
+              safeEmit(createAgentEvent("guardrail_warning", `Large edit on ${path}: ${check.reason === "large_replacement_ratio" ? `${Math.round((check.ratio ?? 0) * 100)}% of file` : `line delta ${check.lineDelta}`}`, {
+                guardrail: { path, reason: check.reason, ratio: check.ratio, lineDelta: check.lineDelta },
+              }));
+              if (guardrailMode === "strict") {
+                skippedByGuardrail.add(path);
+                continue;
+              }
+            }
+            filtered.push(step);
+          }
+          stepsToApply = filtered;
+        }
+
         let sandboxRunId: string | null = null;
         let sandboxChecksPassed = false;
         let sandboxCheckResults: { lint: { passed: boolean; logs: string }; tests: { passed: boolean; logs: string } } | null = null;
+        let pendingReview: { fileEdits: { path: string; originalContent: string; newContent: string }[] } | null = null;
 
         // Process file edits through sandbox if any exist
-        if (fileEditSteps.length > 0) {
+        if (stepsToApply.length > 0) {
           try {
             safeEmit( createAgentEvent('status', 'Creating sandbox for this run...'));
             
@@ -202,13 +242,31 @@ export async function POST(request: Request) {
 
             safeEmit( createAgentEvent('status', 'Applying edits in sandbox...'));
 
-            // Apply edits to sandbox
-            const sandboxResult = await applyEditsToSandbox(supabase, sandboxRunId, fileEditSteps);
+            // Apply edits to sandbox (only steps that passed guardrails)
+            const sandboxResult = await applyEditsToSandbox(supabase, sandboxRunId, stepsToApply);
 
-            // Log sandbox edit results
+            // Log sandbox edit results (iterate all file_edit steps so UI shows every step)
             for (let i = 0; i < fileEditSteps.length; i++) {
               const step = fileEditSteps[i];
               const path = step.path.trim();
+
+              if (skippedByGuardrail.has(path)) {
+                safeEmit(createAgentEvent("tool_result", `Skipped (large edit guardrail): ${path}`, {
+                  toolName: "edit_file",
+                  filePath: path,
+                  stepIndex: i,
+                }));
+                log.push({
+                  stepIndex: i,
+                  type: "file_edit",
+                  status: "skipped",
+                  message: `Skipped (large edit guardrail): ${path}`,
+                  path,
+                  actionLabel: "EDIT",
+                  statusLine: `Skipped (large edit guardrail): ${path}`,
+                });
+                continue;
+              }
               
               if (skipProtected && protectedSet.has(path)) {
                 safeEmit( createAgentEvent('tool_result', `Skipped protected file: ${path}`, {
@@ -352,28 +410,41 @@ export async function POST(request: Request) {
             if (sandboxChecksPassed) {
               const allPassed = lintStatus === "passed" && testStatus === "passed" && runStatus === "passed";
               if (allPassed) {
-                safeEmit( createAgentEvent('status', 'All sandbox checks passed. Application verified working. Applying changes to workspace...'));
+                safeEmit( createAgentEvent('status', 'All sandbox checks passed. Review changes below and apply accepted edits.'));
               } else if (runStatus === "passed") {
-                safeEmit( createAgentEvent('status', 'Application runs successfully. Applying changes to workspace...'));
+                safeEmit( createAgentEvent('status', 'Application runs successfully. Review changes below and apply accepted edits.'));
               } else {
-                safeEmit( createAgentEvent('status', 'Sandbox checks skipped/not configured. Applying changes to workspace...'));
+                safeEmit( createAgentEvent('status', 'Sandbox checks skipped/not configured. Review changes below and apply accepted edits.'));
               }
               
-              // Promote sandbox to workspace
-              const promoteResult = await promoteSandboxToWorkspace(supabase, sandboxRunId);
-              filesEdited.push(...promoteResult.filesEdited);
-              
-              // Log any conflicts during promotion
-              for (const conflict of promoteResult.conflicts) {
-                log.push({
-                  stepIndex: -1,
-                  type: "file_edit",
-                  status: "error",
-                  message: conflict.message,
-                  path: conflict.path,
-                  actionLabel: "EDIT",
-                  statusLine: `Promotion conflict: ${conflict.path}`,
-                });
+              // Phase F: do not promote; build pending_review for client to accept/reject per file
+              const editedPaths = sandboxResult.filesEdited;
+              if (editedPaths.length > 0) {
+                const { data: sandboxFileRows } = await supabase
+                  .from("sandbox_files")
+                  .select("path, content")
+                  .eq("sandbox_run_id", sandboxRunId)
+                  .in("path", editedPaths);
+                const { data: workspaceFileRows } = await supabase
+                  .from("workspace_files")
+                  .select("path, content")
+                  .eq("workspace_id", workspaceId)
+                  .in("path", editedPaths);
+                const newByPath = new Map<string, string>();
+                const originalByPath = new Map<string, string>();
+                for (const row of sandboxFileRows ?? []) {
+                  newByPath.set(row.path, row.content ?? "");
+                }
+                for (const row of workspaceFileRows ?? []) {
+                  originalByPath.set(row.path, row.content ?? "");
+                }
+                pendingReview = {
+                  fileEdits: editedPaths.map((path) => ({
+                    path,
+                    originalContent: originalByPath.get(path) ?? "",
+                    newContent: newByPath.get(path) ?? "",
+                  })),
+                };
               }
             } else {
               // Checks failed
@@ -415,12 +486,38 @@ export async function POST(request: Request) {
                 
                 // DO NOT promote - app doesn't work
               } else {
-                // Lint/test failures - still promote but warn (app runs, just has code quality issues)
-                safeEmit( createAgentEvent('status', 'Sandbox checks failed (lint/tests). Application runs, but changes will still be applied. Please review errors.'));
+                // Lint/test failures - still offer review (app runs, just has code quality issues)
+                safeEmit( createAgentEvent('status', 'Sandbox checks failed (lint/tests). Application runs. Review changes below and apply if desired.'));
                 
-                // Promote sandbox to workspace (app runs, just has quality issues)
-                const promoteResult = await promoteSandboxToWorkspace(supabase, sandboxRunId);
-                filesEdited.push(...promoteResult.filesEdited);
+                // Phase F: build pending_review instead of promoting
+                const editedPathsElse = sandboxResult.filesEdited;
+                if (editedPathsElse.length > 0) {
+                  const { data: sandboxFileRows } = await supabase
+                    .from("sandbox_files")
+                    .select("path, content")
+                    .eq("sandbox_run_id", sandboxRunId)
+                    .in("path", editedPathsElse);
+                  const { data: workspaceFileRows } = await supabase
+                    .from("workspace_files")
+                    .select("path, content")
+                    .eq("workspace_id", workspaceId)
+                    .in("path", editedPathsElse);
+                  const newByPath = new Map<string, string>();
+                  const originalByPath = new Map<string, string>();
+                  for (const row of sandboxFileRows ?? []) {
+                    newByPath.set(row.path, row.content ?? "");
+                  }
+                  for (const row of workspaceFileRows ?? []) {
+                    originalByPath.set(row.path, row.content ?? "");
+                  }
+                  pendingReview = {
+                    fileEdits: editedPathsElse.map((path) => ({
+                      path,
+                      originalContent: originalByPath.get(path) ?? "",
+                      newContent: newByPath.get(path) ?? "",
+                    })),
+                  };
+                }
                 
                 // Log check failures
                 if (lintStatus === "failed") {
@@ -475,29 +572,20 @@ export async function POST(request: Request) {
         /** Get API key for self-debug LLM (lazy). */
         let selfDebugApiKey: string | null = null;
         let selfDebugProviderId: ProviderId | null = null;
+        let resolvedModelSlug: string | undefined;
+        const { resolveInvocationConfig, getConfigByRole } = await import("@/lib/models/invocation-config");
+        const defaultConfigs = await resolveInvocationConfig(supabase, user.id, {
+          modelId: body.modelId,
+          modelGroupId: body.modelGroupId,
+        });
+        const coderConfig = defaultConfigs.length > 0 ? (getConfigByRole(defaultConfigs, "coder") ?? defaultConfigs[0]) : null;
+        if (coderConfig) {
+          selfDebugApiKey = coderConfig.apiKey || "";
+          selfDebugProviderId = coderConfig.providerId;
+          resolvedModelSlug = coderConfig.modelSlug;
+        }
         const getSelfDebugApiKey = async (): Promise<{ apiKey: string; providerId: ProviderId } | null> => {
-          if (selfDebugApiKey && selfDebugProviderId) return { apiKey: selfDebugApiKey, providerId: selfDebugProviderId };
-          const providersToTry = PROVIDERS.includes(requestedProvider)
-            ? [requestedProvider, ...PROVIDERS.filter((p) => p !== requestedProvider)]
-            : [...PROVIDERS];
-          for (const p of providersToTry) {
-            const { data: keyRow } = await supabase
-              .from("provider_keys")
-              .select("key_encrypted")
-              .eq("user_id", user.id)
-              .eq("provider", p)
-              .single();
-            if (keyRow?.key_encrypted) {
-              try {
-                const apiKey = decrypt(keyRow.key_encrypted);
-                selfDebugApiKey = apiKey;
-                selfDebugProviderId = p;
-                return { apiKey, providerId: p };
-              } catch {
-                continue;
-              }
-            }
-          }
+          if (selfDebugApiKey !== null && selfDebugProviderId) return { apiKey: selfDebugApiKey, providerId: selfDebugProviderId };
           return null;
         };
 
@@ -544,12 +632,15 @@ export async function POST(request: Request) {
               .single();
 
             if (!fileRow) {
+              // Beautify code before writing (convert \n to actual newlines, etc.)
+              const beautifiedContent = beautifyCode(step.newContent, path);
+              
               const { error: insertError } = await supabase
                 .from("workspace_files")
                 .insert({
                   workspace_id: workspaceId,
                   path,
-                  content: step.newContent,
+                  content: beautifiedContent,
                 });
 
               if (insertError) {
@@ -588,10 +679,30 @@ export async function POST(request: Request) {
             }
 
             const currentContent = fileRow.content ?? "";
+            // Beautify new content before applying edit (convert \n to actual newlines, etc.)
+            const beautifiedNewContent = beautifyCode(step.newContent, path);
+            
+            // IMPORTANT: Don't beautify oldContent directly - it needs to match the actual file content
+            // The oldContent from the plan might have escaped newlines, but the actual file
+            // content in the database might already be beautified. We need to match what's actually there.
+            let oldContentToMatch = step.oldContent;
+            let contentToMatchAgainst = currentContent;
+            
+            // If oldContent is provided, beautify both for comparison
+            if (oldContentToMatch) {
+              const beautifiedOldContent = beautifyCode(oldContentToMatch, path);
+              const beautifiedCurrentContent = beautifyCode(currentContent, path);
+              // Try matching with beautified versions first
+              if (beautifiedCurrentContent.includes(beautifiedOldContent)) {
+                oldContentToMatch = beautifiedOldContent;
+                contentToMatchAgainst = beautifiedCurrentContent;
+              }
+            }
+            
             const result = applyEdit(
-              currentContent,
-              step.newContent,
-              step.oldContent
+              contentToMatchAgainst,
+              beautifiedNewContent,
+              oldContentToMatch
             );
 
             if (!result.ok) {
@@ -703,56 +814,152 @@ export async function POST(request: Request) {
                 stepIndex: i,
               }));
 
-              // v1 self-debug: one auto-fix attempt for failed test commands only
+              // Enhanced self-debug: multiple retry attempts for failed commands
+              // Trigger for: test/setup failures, port conflicts, and other runtime errors
+              const MAX_DEBUG_ATTEMPTS = 5;
+              const isPortConflict = (cmdResult.stderr?.toLowerCase().includes("port") && cmdResult.stderr?.toLowerCase().includes("already in use")) ||
+                                     (cmdResult.stdout?.toLowerCase().includes("port") && cmdResult.stdout?.toLowerCase().includes("already in use")) ||
+                                     cmdResult.stderr?.toLowerCase().includes("eaddrinuse");
+              
               if (
-                commandKind === "test" &&
-                classification.status === "failed"
+                classification.status === "failed" &&
+                ((commandKind === "test" || commandKind === "setup") || isPortConflict)
               ) {
-                safeEmit( createAgentEvent('reasoning', 'Auto-fixing failed tests...'));
                 const creds = await getSelfDebugApiKey();
                 if (creds) {
-                  const { stdoutTail, stderrTail } = buildTails(cmdResult.stdout ?? "", cmdResult.stderr ?? "");
-                  const fixSteps = await proposeFixSteps(
-                    {
-                      command: step.command,
-                      stdoutTail,
-                      stderrTail,
-                      filesEdited: [...filesEdited],
-                    },
-                    {
-                      apiKey: creds.apiKey,
-                      providerId: creds.providerId,
-                      model: getModelForProvider(creds.providerId, body.model),
+                  const previousAttempts: Array<{
+                    attempt: number;
+                    steps: typeof fixSteps;
+                    result: { status: string; summary: string };
+                  }> = [];
+                  
+                  let lastResult = cmdResult;
+                  let lastClassification = classification;
+                  let totalFixSteps = 0;
+                  
+                  // Build intelligent context automatically (discovers relevant files based on codebase structure)
+                  let workspaceFileList: string[] = [];
+                  let relevantFileContents: Record<string, string> = {};
+                  
+                  if (classification.status === "failed" && workspaceId) {
+                    try {
+                      // Use intelligent context builder to discover relevant files
+                      const intelligentContext = await buildIntelligentContext(
+                        supabase,
+                        workspaceId,
+                        null,
+                        `${step.command}\n${lastResult.stdout}\n${lastResult.stderr}`
+                      );
+                      
+                      workspaceFileList = intelligentContext.relatedFiles.map(f => f.path);
+                      
+                      // Add current file if available
+                      if (intelligentContext.currentFile) {
+                        workspaceFileList.unshift(intelligentContext.currentFile.path);
+                        relevantFileContents[intelligentContext.currentFile.path] = intelligentContext.currentFile.content;
+                      }
+                      
+                      // Add related files
+                      for (const file of intelligentContext.relatedFiles.slice(0, 5)) {
+                        relevantFileContents[file.path] = file.content;
+                      }
+                      
+                      // Add config files
+                      for (const configPath of intelligentContext.codebaseStructure.configFiles.slice(0, 3)) {
+                        const { data: configFile } = await supabase
+                          .from("workspace_files")
+                          .select("content")
+                          .eq("workspace_id", workspaceId)
+                          .eq("path", configPath)
+                          .single();
+                        if (configFile?.content) {
+                          relevantFileContents[configPath] = configFile.content;
+                        }
+                      }
+                    } catch (e) {
+                      console.error("Error building intelligent context for self-debug:", e);
                     }
-                  );
-
-                  safeEmit( createAgentEvent('tool_result', `Auto-fix: applying ${fixSteps.length} edit(s)...`));
-
-                  for (const fixStep of fixSteps) {
-                    await applyFileEdit(
-                      fixStep.path.trim(),
-                      fixStep.newContent,
-                      fixStep.oldContent
+                  }
+                  
+                  for (let attempt = 1; attempt <= MAX_DEBUG_ATTEMPTS; attempt++) {
+                    safeEmit( createAgentEvent('reasoning', `Auto-fix attempt ${attempt}/${MAX_DEBUG_ATTEMPTS}...`));
+                    
+                    const { stdoutTail, stderrTail } = buildTails(lastResult.stdout ?? "", lastResult.stderr ?? "");
+                    const fixSteps = await proposeFixSteps(
+                      {
+                        command: step.command,
+                        stdoutTail,
+                        stderrTail,
+                        filesEdited: [...filesEdited],
+                        workspaceFiles: workspaceFileList.length > 0 ? workspaceFileList : undefined,
+                        fileContents: Object.keys(relevantFileContents).length > 0 ? relevantFileContents : undefined,
+                        previousAttempts: previousAttempts.length > 0 ? previousAttempts : undefined,
+                      },
+                      {
+                        apiKey: creds.apiKey,
+                        providerId: creds.providerId,
+                        model: resolvedModelSlug ?? getModelForProvider(creds.providerId, body.model),
+                      }
                     );
+
+                    if (fixSteps.length === 0) {
+                      safeEmit( createAgentEvent('reasoning', `No fix proposed in attempt ${attempt}, stopping.`));
+                      break;
+                    }
+
+                    safeEmit( createAgentEvent('tool_result', `Auto-fix attempt ${attempt}: applying ${fixSteps.length} edit(s)...`));
+
+                    // Apply fixes
+                    for (const fixStep of fixSteps) {
+                      await applyFileEdit(
+                        fixStep.path.trim(),
+                        fixStep.newContent,
+                        fixStep.oldContent
+                      );
+                      if (!filesEdited.includes(fixStep.path.trim())) {
+                        filesEdited.push(fixStep.path.trim());
+                      }
+                    }
+
+                    totalFixSteps += fixSteps.length;
+
+                    // Re-run command
+                    const retryResult = await executeCommandInWorkspace(supabase, workspaceId, step.command);
+                    const retryClassification = classifyCommandResult(retryResult);
+                    
+                    previousAttempts.push({
+                      attempt,
+                      steps: fixSteps,
+                      result: { status: retryClassification.status, summary: retryClassification.summary },
+                    });
+
+                    lastResult = retryResult;
+                    lastClassification = retryClassification;
+
+                    if (retryClassification.status === "success") {
+                      safeEmit( createAgentEvent('tool_result', `Auto-fix attempt ${attempt} succeeded! Applied ${totalFixSteps} total edit(s).`));
+                      commandEntry.autoFixAttempted = true;
+                      commandEntry.secondRunStatus = retryClassification.status;
+                      commandEntry.secondRunSummary = retryClassification.summary;
+                      commandEntry.statusLine = `${firstRunLine}; Auto-fix (attempt ${attempt}): applied ${totalFixSteps} edit(s), passed`;
+                      break;
+                    } else {
+                      safeEmit( createAgentEvent('tool_result', `Auto-fix attempt ${attempt} failed: ${retryClassification.summary}. ${attempt < MAX_DEBUG_ATTEMPTS ? 'Trying again...' : 'Max attempts reached.'}`));
+                    }
                   }
 
-                  const secondResult = await executeCommandInWorkspace(supabase, workspaceId, step.command);
-                  const secondClassification = classifyCommandResult(secondResult);
-
-                  commandEntry.autoFixAttempted = true;
-                  commandEntry.secondRunStatus = secondClassification.status;
-                  commandEntry.secondRunSummary = secondClassification.summary;
-                  const editCount = fixSteps.length;
-                  const secondLine = secondClassification.status === "success"
-                    ? `Auto-fix applied ${editCount} edit(s), second run passed`
-                    : `Auto-fix applied ${editCount} edit(s), second run: ${secondClassification.status} (${secondClassification.summary})`;
-                  commandEntry.statusLine = `${firstRunLine}; ${secondLine}`;
-                  
-                  safeEmit( createAgentEvent('tool_result', secondLine, {
-                    toolName: 'run_command',
-                    command: step.command,
-                    stepIndex: i,
-                  }));
+                  if (lastClassification.status !== "success") {
+                    commandEntry.autoFixAttempted = true;
+                    commandEntry.secondRunStatus = lastClassification.status;
+                    commandEntry.secondRunSummary = lastClassification.summary;
+                    commandEntry.statusLine = `${firstRunLine}; Auto-fix: ${totalFixSteps} edit(s) applied over ${previousAttempts.length} attempt(s), still ${lastClassification.status}`;
+                    
+                    safeEmit( createAgentEvent('tool_result', `Auto-fix exhausted ${previousAttempts.length} attempt(s), final status: ${lastClassification.status}`, {
+                      toolName: 'run_command',
+                      command: step.command,
+                      stepIndex: i,
+                    }));
+                  }
                 }
               }
             } catch (error) {
@@ -822,55 +1029,36 @@ export async function POST(request: Request) {
 
         safeEmit( createAgentEvent('status', 'Execution complete'));
 
-        const result: AgentExecuteResult & { sandboxRunId?: string; sandboxChecks?: typeof sandboxCheckResults } = {
+        const result: AgentExecuteResult & {
+          sandboxRunId?: string;
+          sandboxChecks?: typeof sandboxCheckResults;
+          pendingReview?: { fileEdits: { path: string; originalContent: string; newContent: string }[] };
+        } = {
           log,
           summary,
           filesEdited,
           ...(filesSkippedDueToConflict.length > 0 ? { filesSkippedDueToConflict } : {}),
           ...(sandboxRunId ? { sandboxRunId } : {}),
           ...(sandboxCheckResults ? { sandboxChecks: sandboxCheckResults } : {}),
+          ...(pendingReview ? { pendingReview } : {}),
         };
 
         if (!closed.current) {
-          try {
-            const resultData = `data: ${JSON.stringify({ type: 'result', result })}\n\n`;
-            controller.enqueue(encoder.encode(resultData));
-          } catch (enqueueError) {
-            if (isStreamClosed(enqueueError)) closed.current = true;
-            else console.error("Failed to enqueue result:", enqueueError);
-          }
+          safeEnqueue(controller, encoder, `data: ${JSON.stringify({ type: 'result', result })}\n\n`);
         }
-        if (!closed.current) {
-          try {
-            controller.close();
-          } catch (_) {
-            closed.current = true;
-          }
-        }
+        safeClose(controller);
       } catch (e) {
         const errorMsg = e instanceof Error ? e.message : "Execution failed";
         safeEmit(createAgentEvent('status', `Error: ${errorMsg}`));
-
         if (!closed.current) {
-          try {
-            const errorResult: AgentExecuteResult = {
-              log: [],
-              summary: `Execution failed: ${errorMsg}`,
-              filesEdited: [],
-            };
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'result', result: errorResult })}\n\n`));
-          } catch (enqueueError) {
-            if (isStreamClosed(enqueueError)) closed.current = true;
-            else console.error("Failed to enqueue error result:", enqueueError);
-          }
+          const errorResult: AgentExecuteResult = {
+            log: [],
+            summary: `Execution failed: ${errorMsg}`,
+            filesEdited: [],
+          };
+          safeEnqueue(controller, encoder, `data: ${JSON.stringify({ type: 'result', result: errorResult })}\n\n`);
         }
-        if (!closed.current) {
-          try {
-            controller.close();
-          } catch (_) {
-            closed.current = true;
-          }
-        }
+        safeClose(controller);
       }
     },
   });

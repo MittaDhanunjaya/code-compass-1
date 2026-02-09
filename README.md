@@ -9,3 +9,5 @@ My app can log into your GitHub, work directly on your repo on a separate branch
 ## Getting started
 
 See `.env.local.example` for required environment variables. Run `npm install` and `npm run dev`.
+
+**Hosted deployment:** To run Code Compass as a single URL where users sign up and add API keys (no self-hosting), see [docs/HOSTED_DEPLOYMENT.md](docs/HOSTED_DEPLOYMENT.md).

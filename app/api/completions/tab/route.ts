@@ -2,16 +2,21 @@ import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { decrypt } from "@/lib/encrypt";
 import { getModelForProvider } from "@/lib/llm/providers";
+import { getBestDefaultModel, getCompletionModel } from "@/lib/models/invocation-config";
 import OpenAI from "openai";
+import { tabCompletionCache, getTabCompletionKey, searchCache, getSearchKey } from "@/lib/cache";
 
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
+const OLLAMA_BASE = process.env.OLLAMA_BASE_URL ?? "http://localhost:11434";
 
-/** Tab completion uses OpenRouter; default to free router. */
-const TAB_COMPLETION_MODEL = "openrouter/free";
+/** Tab completion uses OpenRouter; fallback when best-default is not OpenRouter. */
+const TAB_COMPLETION_FALLBACK = "openrouter/free";
+/** Timeout (ms) when trying Ollama first so we don't block on an unavailable local server. */
+const OLLAMA_TRY_TIMEOUT_MS = 2500;
 
-/** Max characters of prefix/suffix to send to the model. */
-const PREFIX_MAX = 1200;
-const SUFFIX_MAX = 400;
+/** Max characters of prefix/suffix (shorter = faster, more instant feel). */
+const PREFIX_MAX = 320;
+const SUFFIX_MAX = 120;
 
 export async function POST(request: Request) {
   const supabase = await createClient();
@@ -44,7 +49,26 @@ export async function POST(request: Request) {
   const prefix = (body.prefix ?? "").slice(-PREFIX_MAX);
   const suffix = (body.suffix ?? "").slice(0, SUFFIX_MAX);
   const language = body.language ?? "plaintext";
-  const model = getModelForProvider("openrouter", body.model?.trim() || null) ?? TAB_COMPLETION_MODEL;
+
+  // Prefer Ollama first when available (local, low latency), then completion model, then best default
+  let model = body.model?.trim() ? getModelForProvider("openrouter", body.model) : null;
+  let useOllamaFirst = false;
+  let ollamaModel = "qwen:latest";
+  if (!model) {
+    const completionModel = await getCompletionModel(supabase, user.id);
+    const best = await getBestDefaultModel(supabase, user.id);
+    if (completionModel?.providerId === "ollama" || best?.providerId === "ollama") {
+      useOllamaFirst = true;
+      ollamaModel = (completionModel?.providerId === "ollama" ? completionModel?.modelSlug : best?.modelSlug) ?? "qwen:latest";
+    }
+    if (!model && completionModel?.providerId === "openrouter") {
+      model = completionModel.modelSlug;
+    }
+    if (!model && best?.providerId === "openrouter") {
+      model = best.modelSlug;
+    }
+    if (!model) model = TAB_COMPLETION_FALLBACK;
+  }
 
   if (!workspaceId || !prefix) {
     return NextResponse.json(
@@ -63,6 +87,92 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
   }
 
+  // Check cache first
+  const cacheKey = getTabCompletionKey(workspaceId, filePath, prefix, suffix || "");
+  const cached = tabCompletionCache.get(cacheKey);
+  if (cached) {
+    return NextResponse.json({ completion: cached, cached: true });
+  }
+
+  // Get codebase context only when prefix is substantial (reduces latency); skip or use short timeout for instant feel
+  let codebaseContext = "";
+  if (workspaceId && filePath && prefix.length > 180) {
+    try {
+      const searchQuery = prefix.slice(-120);
+      const searchCacheKey = getSearchKey(workspaceId, searchQuery, 2, true);
+      let searchData: any = null;
+      const cachedSearch = searchCache.get(searchCacheKey);
+      if (cachedSearch) {
+        searchData = cachedSearch;
+      } else {
+        const searchPromise = fetch(
+          `${request.headers.get("origin") || "http://localhost:3000"}/api/search?query=${encodeURIComponent(searchQuery)}&workspaceId=${workspaceId}&limit=2&semantic=true`
+        );
+        const timeoutPromise = new Promise((resolve) =>
+          setTimeout(() => resolve(null), 120)
+        );
+        
+        const result = await Promise.race([searchPromise, timeoutPromise]);
+        if (result && result instanceof Response && result.ok) {
+          searchData = await result.json();
+          if (searchData?.results) {
+            searchCache.set(searchCacheKey, searchData, 300000); // 5min cache
+          }
+        }
+      }
+      
+      if (searchData?.results && searchData.results.length > 0) {
+        const contextFiles = searchData.results
+          .filter((r: any) => r.path !== filePath)
+          .slice(0, 1) // Only 1 file for speed
+          .map((r: any) => `${r.path}: ${r.preview.slice(0, 150)}`) // Shorter preview
+          .join("\n");
+        if (contextFiles) {
+          codebaseContext = `\nSimilar: ${contextFiles}`;
+        }
+      }
+    } catch (error) {
+      // Silently fail - codebase context is optional
+    }
+  }
+
+  const systemPrompt = `You are a code completion assistant. Given the code before the cursor (and optionally after), return ONLY the next few lines or expression that would complete the code. Match the style and patterns from the codebase when provided. No explanation, no markdown, no backticks. Output nothing else.`;
+  const userPrompt = filePath
+    ? `File: ${filePath} (${language})\n\nBefore cursor:\n\`\`\`\n${prefix}\n\`\`\`\n${suffix ? `After cursor:\n\`\`\`\n${suffix}\n\`\`\`\n` : ""}${codebaseContext}Completion:`
+    : `Language: ${language}\n\nBefore cursor:\n\`\`\`\n${prefix}\n\`\`\`\n${suffix ? `After cursor:\n\`\`\`\n${suffix}\n\`\`\`\n` : ""}${codebaseContext}Completion:`;
+
+  if (useOllamaFirst) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), OLLAMA_TRY_TIMEOUT_MS);
+      const res = await fetch(`${OLLAMA_BASE}/api/chat`, {
+        method: "POST",
+        signal: controller.signal,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: ollamaModel,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          stream: false,
+        }),
+      });
+      clearTimeout(timeoutId);
+      if (res.ok) {
+        const data = (await res.json()) as { message?: { content?: string } };
+        const raw = (data.message?.content ?? "").trim();
+        const completionText = raw.replace(/\n?```[\w]*\n?/g, "").trim();
+        if (completionText) {
+          tabCompletionCache.set(cacheKey, completionText, 30000);
+          return NextResponse.json({ completion: completionText });
+        }
+      }
+    } catch {
+      // Ollama unavailable or timeout; fall through to OpenRouter
+    }
+  }
+
   const { data: keyRow } = await supabase
     .from("provider_keys")
     .select("key_encrypted")
@@ -72,7 +182,7 @@ export async function POST(request: Request) {
 
   if (!keyRow?.key_encrypted) {
     return NextResponse.json(
-      { error: "No OpenRouter API key configured. Tab completion uses OpenRouter; add a key in API Keys." },
+      { error: "No OpenRouter API key configured. Tab completion uses OpenRouter when Ollama is not selected; add a key in API Keys." },
       { status: 400 }
     );
   }
@@ -86,11 +196,6 @@ export async function POST(request: Request) {
       { status: 500 }
     );
   }
-
-  const systemPrompt = `You are a code completion assistant. Given the code before the cursor (and optionally after), return ONLY the next few lines or expression that would complete the code. No explanation, no markdown, no backticks. Output nothing else.`;
-  const userPrompt = filePath
-    ? `File: ${filePath} (${language})\n\nBefore cursor:\n\`\`\`\n${prefix}\n\`\`\`\n${suffix ? `After cursor:\n\`\`\`\n${suffix}\n\`\`\`\n` : ""}Completion:`
-    : `Language: ${language}\n\nBefore cursor:\n\`\`\`\n${prefix}\n\`\`\`\n${suffix ? `After cursor:\n\`\`\`\n${suffix}\n\`\`\`\n` : ""}Completion:`;
 
   try {
     const client = new OpenAI({
@@ -108,12 +213,17 @@ export async function POST(request: Request) {
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
       ],
-      max_tokens: 150,
-      temperature: 0.2,
+      max_tokens: 200, // Increased for multi-line completions
+      temperature: 0.1, // Lower temperature for more deterministic completions
     });
 
     const raw = completion.choices[0]?.message?.content?.trim() ?? "";
     const completionText = raw.replace(/\n?```[\w]*\n?/g, "").trim();
+
+    // Cache the result (30s TTL for Tab completions)
+    if (completionText) {
+      tabCompletionCache.set(cacheKey, completionText, 30000);
+    }
 
     return NextResponse.json({ completion: completionText });
   } catch (e) {

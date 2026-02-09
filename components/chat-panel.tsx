@@ -5,6 +5,7 @@ import dynamic from "next/dynamic";
 import { Send, Loader2, Sparkles, Check, ChevronDown, ChevronRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Dialog,
   DialogContent,
@@ -25,6 +26,7 @@ import { AgentPanel } from "@/components/agent-panel";
 import { ComposerPanel } from "@/components/composer-panel";
 import type { FileEditStep } from "@/lib/agent/types";
 import { SAFE_EDIT_MAX_FILES } from "@/lib/protected-paths";
+import { ErrorWithAction } from "@/components/error-with-action";
 
 const MonacoDiffEditor = dynamic(
   () => import("@monaco-editor/react").then((mod) => mod.DiffEditor),
@@ -115,13 +117,75 @@ export function ChatPanel({
     return m;
   };
   
-  const [provider, setProviderState] = useState<ProviderId>(getStoredProvider());
-  const [model, setModelState] = useState<string>(getStoredModel());
+  // Use fixed initial state so server and client match (avoid hydration error from localStorage)
+  const [provider, setProviderState] = useState<ProviderId>("openrouter");
+  const [model, setModelState] = useState<string>("openrouter/free");
   const [loading, setLoading] = useState(false);
+  const [rulesFile, setRulesFile] = useState<string | null>(null);
   const [usageText, setUsageText] = useState<string | null>(null);
+  const [lastContextUsed, setLastContextUsed] = useState<{ filePaths: string[]; rulesIncluded: boolean } | null>(null);
   const [errorLogConfirmOpen, setErrorLogConfirmOpen] = useState(false);
   const [pendingLogMessage, setPendingLogMessage] = useState<string | null>(null);
   const [workspaceIdWhenLogPasted, setWorkspaceIdWhenLogPasted] = useState<string | null>(null);
+
+  // Handle CMD+K actions
+  useEffect(() => {
+    const handleCmdKAction = (e: CustomEvent<{ action: string; selection: string; filePath: string }>) => {
+      const { action, selection, filePath } = e.detail;
+      let prompt = "";
+      
+      switch (action) {
+        case "explain":
+          prompt = `Explain this code:\n\`\`\`\n${selection}\n\`\`\``;
+          break;
+        case "refactor":
+          prompt = `Refactor and improve this code:\n\`\`\`\n${selection}\n\`\`\``;
+          break;
+        case "test":
+          prompt = `Write comprehensive tests for this code:\n\`\`\`\n${selection}\n\`\`\``;
+          break;
+        case "docs":
+          prompt = `Add documentation comments to this code:\n\`\`\`\n${selection}\n\`\`\``;
+          break;
+        default:
+          return;
+      }
+      
+      setInput(prompt);
+      // Auto-send after a brief delay
+      setTimeout(() => {
+        sendMessage(prompt);
+      }, 100);
+    };
+
+    window.addEventListener("cmd-k-action", handleCmdKAction as EventListener);
+    return () => window.removeEventListener("cmd-k-action", handleCmdKAction as EventListener);
+  }, []);
+
+  // Handle slash commands
+  const handleSlashCommand = useCallback((inputText: string): string | null => {
+    const trimmed = inputText.trim();
+    if (!trimmed.startsWith("/")) return null;
+
+    const [command, ...rest] = trimmed.slice(1).split(/\s+/);
+    const args = rest.join(" ");
+
+    const activeTab = getTab(activeFilePath || "");
+    const selectedText = selection || activeTab?.content || "";
+
+    switch (command.toLowerCase()) {
+      case "test":
+        return `Write tests for ${args || "this code"}:\n\`\`\`\n${selectedText || "the current file"}\n\`\`\``;
+      case "fix":
+        return `Fix this error or issue:\n${args || selectedText || "the current problem"}`;
+      case "docs":
+        return `Add documentation to ${args || "this code"}:\n\`\`\`\n${selectedText || "the current file"}\n\`\`\``;
+      case "explain":
+        return `Explain ${args || "this code"}:\n\`\`\`\n${selectedText || "the current file"}\n\`\`\``;
+      default:
+        return null;
+    }
+  }, [activeFilePath, selection, getTab]);
   const [debugRunWorkspaceId, setDebugRunWorkspaceId] = useState<string | null>(null);
   const [noWorkspaceErrorLogNote, setNoWorkspaceErrorLogNote] = useState(false);
   const [mounted, setMounted] = useState(false);
@@ -132,7 +196,7 @@ export function ChatPanel({
   }, []);
   const [errorLogConfirmAlreadyHasUserMessage, setErrorLogConfirmAlreadyHasUserMessage] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   // Persist provider selection
   const setProvider = useCallback((newProvider: ProviderId) => {
@@ -160,11 +224,33 @@ export function ChatPanel({
     }
   }, [workspaceId]);
 
-  // Update provider/model when workspace changes
+  // Client-only: sync provider/model from localStorage when workspace or mount changes; fetch best-default if no stored preference.
+  // Single effect with stable deps [workspaceId, mounted] to avoid "useEffect changed size" between renders.
   useEffect(() => {
+    if (!mounted || typeof window === "undefined") return;
     setProviderState(getStoredProvider());
     setModelState(getStoredModel());
-  }, [workspaceId]);
+    if (!workspaceId) return;
+    const providerKey = workspaceId ? `chat-provider-${workspaceId}` : "chat-provider-default";
+    const modelKey = workspaceId ? `chat-model-${workspaceId}` : "chat-model-default";
+    if (localStorage.getItem(providerKey) != null && localStorage.getItem(modelKey) != null) return;
+    let cancelled = false;
+    fetch("/api/models/best-default")
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => {
+        if (cancelled || !data?.provider) return;
+        const p = PROVIDERS.includes(data.provider) ? data.provider : "openrouter";
+        const m = (typeof data.modelSlug === "string" ? data.modelSlug : "openrouter/free") || "openrouter/free";
+        localStorage.setItem(providerKey, p);
+        localStorage.setItem(modelKey, p === "openrouter" ? m : "");
+        setProviderState(p);
+        setModelState(p === "openrouter" ? m : "");
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId, mounted]);
 
   const tab = activeFilePath ? getTab(activeFilePath) : null;
 
@@ -378,6 +464,22 @@ export function ChatPanel({
     scrollToBottom();
   }, [messages, scrollToBottom]);
 
+  useEffect(() => {
+    if (!workspaceId) {
+      setRulesFile(null);
+      return;
+    }
+    let cancelled = false;
+    fetch(`/api/workspaces/${workspaceId}/rules-info`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (!cancelled && data?.rulesFile != null) setRulesFile(data.rulesFile);
+        else if (!cancelled) setRulesFile(null);
+      })
+      .catch(() => { if (!cancelled) setRulesFile(null); });
+    return () => { cancelled = true; };
+  }, [workspaceId]);
+
   const NO_WORKSPACE_NOTE =
     "I don't know which project this error belongs to; select a workspace and paste the logs again if you want me to modify code.\n\n";
 
@@ -395,6 +497,7 @@ export function ChatPanel({
     setInput("");
     setLoading(true);
     setUsageText(null);
+    setLastContextUsed(null);
     setError(null);
     setNoWorkspaceErrorLogNote(false);
 
@@ -424,12 +527,12 @@ export function ChatPanel({
         }),
       });
 
-      let data;
+      const rawText = await res.text();
+      let data: Record<string, unknown>;
       try {
-        data = await res.json();
+        data = JSON.parse(rawText) as Record<string, unknown>;
       } catch (jsonError) {
-        const text = await res.text();
-        throw new Error(`Invalid JSON response: ${jsonError instanceof Error ? jsonError.message : "Unknown error"}. Status: ${res.status}. Response: ${text.slice(0, 200)}`);
+        throw new Error(`Invalid JSON response: ${jsonError instanceof Error ? jsonError.message : "Unknown error"}. Status: ${res.status}. Response: ${rawText.slice(0, 200)}`);
       }
 
       if (data.requireConfirmation === true && data.kind === "error_log" && data.workspaceId) {
@@ -484,6 +587,12 @@ export function ChatPanel({
         if (parts.length > 0) {
           setUsageText(parts.join(" • "));
         }
+      }
+      if (data.contextUsed && Array.isArray(data.contextUsed.filePaths)) {
+        setLastContextUsed({
+          filePaths: data.contextUsed.filePaths,
+          rulesIncluded: !!data.contextUsed.rulesIncluded,
+        });
       }
       let assistantContent = data.content as string;
       if (options?.prependNoWorkspaceNote && assistantContent) {
@@ -548,6 +657,19 @@ export function ChatPanel({
       <div className="flex shrink-0 flex-col gap-1 border-b border-border px-2 py-1.5">
         <p className="text-xs font-medium text-muted-foreground truncate" title={workspaceLabelText}>
           {workspaceLabelText}
+        </p>
+        <p className="text-[11px] text-muted-foreground/90 flex items-center gap-1.5 flex-wrap">
+          <span>Rules: {rulesFile ?? "No rules file"}</span>
+          {lastContextUsed?.rulesIncluded !== undefined && (
+            <span className="text-muted-foreground/70">• Used in last request: {lastContextUsed.rulesIncluded ? "Yes" : "No"}</span>
+          )}
+          <button
+            type="button"
+            onClick={() => window.dispatchEvent(new CustomEvent("open-rules-editor"))}
+            className="text-primary hover:underline text-[11px]"
+          >
+            Edit rules
+          </button>
         </p>
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-2">
@@ -616,6 +738,28 @@ export function ChatPanel({
             </div>
           </div>
         )}
+        {lastContextUsed && (lastContextUsed.filePaths.length > 0 || lastContextUsed.rulesIncluded) && (
+          <div className="rounded-md bg-muted/60 px-2.5 py-1.5 text-xs text-muted-foreground border border-border/50">
+            <div className="font-medium text-foreground/80 mb-1">Context used</div>
+            <div className="flex flex-wrap gap-x-2 gap-y-0.5">
+              {lastContextUsed.filePaths.slice(0, 10).map((p) => (
+                <span key={p} className="font-mono truncate max-w-[200px]" title={p}>{p}</span>
+              ))}
+              {lastContextUsed.filePaths.length > 10 && (
+                <span className="text-muted-foreground/80">+{lastContextUsed.filePaths.length - 10} more</span>
+              )}
+              {lastContextUsed.rulesIncluded && (
+                <span className="text-muted-foreground/80">• Project rules</span>
+              )}
+            </div>
+          </div>
+        )}
+        {!loading && messages.length === 0 && (
+          <div className="text-xs text-muted-foreground py-4 px-1 space-y-1">
+            <p>Try <kbd className="rounded border border-border bg-muted/50 px-1.5 py-0.5 font-mono text-[10px]">Cmd+K</kbd> on a selection for quick actions, or ask about your code below.</p>
+            <p>Index runs when you open a workspace; use the database icon in the file tree to rebuild for cross-file go-to-def (F12).</p>
+          </div>
+        )}
         {messages.map((m) => (
           <div
             key={m.id}
@@ -635,9 +779,7 @@ export function ChatPanel({
           </div>
         )}
         {error && (
-          <div className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">
-            {error}
-          </div>
+          <ErrorWithAction message={error} />
         )}
         {debugLoading && (
           <div className="mr-4 flex items-center gap-2 rounded-lg bg-muted px-3 py-2 text-sm text-muted-foreground">
@@ -925,6 +1067,20 @@ export function ChatPanel({
         )}
         <form
           className="flex gap-2"
+          onKeyDown={(e) => {
+            // Handle slash commands on Enter
+            if (e.key === "Enter" && !e.shiftKey && input.trim().startsWith("/")) {
+              e.preventDefault();
+              const expanded = handleSlashCommand(input);
+              if (expanded) {
+                setInput(expanded);
+                sendMessage(expanded);
+              } else {
+                // Unknown slash command, send as-is
+                sendMessage(input);
+              }
+            }
+          }}
           onSubmit={(e) => {
             e.preventDefault();
             const content = input.trim();
@@ -937,15 +1093,47 @@ export function ChatPanel({
             sendMessage(content);
           }}
         >
-          <Input
+          <Textarea
             ref={inputRef}
-            placeholder='Ask anything… or use @codebase "query" to search'
+            placeholder='Ask anything… or use @codebase "query" to search. Paste terminal logs to format with line numbers.'
             value={input}
             onChange={(e) => setInput(e.target.value)}
+            onPaste={(e) => {
+              const pasted = e.clipboardData?.getData("text");
+              const fromTerminal = e.clipboardData?.types?.includes("application/x-aiforge-terminal");
+              if (fromTerminal && pasted && pasted.includes("\n")) {
+                e.preventDefault();
+                const lines = pasted.trim().split(/\r?\n/);
+                const formatted =
+                  `Terminal (lines 1-${lines.length}):\n` +
+                  lines.map((l, i) => `[${i + 1}] ${l}`).join("\n");
+                const ta = e.target as HTMLTextAreaElement;
+                if (ta && typeof ta.selectionStart === "number") {
+                  const start = ta.selectionStart;
+                  const end = ta.selectionEnd ?? input.length;
+                  setInput(input.slice(0, start) + formatted + input.slice(end));
+                } else {
+                  setInput(formatted);
+                }
+              }
+            }}
             disabled={loading}
-            className="flex-1"
+            title={loading ? "Wait for the response to finish" : undefined}
+            className="flex-1 min-h-[2.25rem] resize-y max-h-32"
+            rows={1}
           />
-          <Button type="submit" size="icon" disabled={loading || !input.trim()}>
+          <Button
+            type="submit"
+            size="icon"
+            disabled={loading || !input.trim()}
+            title={
+              loading
+                ? "Sending…"
+                : !input.trim()
+                  ? "Enter a message"
+                  : "Send message"
+            }
+          >
             {loading ? (
               <Loader2 className="h-4 w-4 animate-spin" />
             ) : (

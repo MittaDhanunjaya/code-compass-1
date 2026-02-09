@@ -219,9 +219,40 @@ export function TerminalPanel({
     [history, historyIndex, isExecuting, activeTerminalId, addLog, setTerminalExecuting]
   );
 
+  const logsContainerRef = useRef<HTMLDivElement>(null);
+
   const copyTerminalOutput = useCallback(() => {
+    const sel = window.getSelection();
+    const hasSelection = sel && sel.rangeCount > 0 && !sel.isCollapsed;
+    const selectionInPanel =
+      hasSelection &&
+      logsContainerRef.current &&
+      sel.anchorNode &&
+      logsContainerRef.current.contains(sel.anchorNode);
+
+    const CLIPBOARD_TERMINAL_TYPE = "application/x-aiforge-terminal";
+
+    if (selectionInPanel && sel && sel.toString()) {
+      const text = sel.toString();
+      const blob = new Blob([text], { type: "text/plain" });
+      const terminalBlob = new Blob(["1"], { type: CLIPBOARD_TERMINAL_TYPE });
+      navigator.clipboard.write([new ClipboardItem({ "text/plain": blob, [CLIPBOARD_TERMINAL_TYPE]: terminalBlob })]).then(
+        () => {
+          setCopied(true);
+          setTimeout(() => setCopied(false), 2000);
+        },
+        () => {
+          navigator.clipboard.writeText(text).then(() => {
+            setCopied(true);
+            setTimeout(() => setCopied(false), 2000);
+          });
+        }
+      );
+      return;
+    }
+
     if (logs.length === 0) return;
-    
+
     // Format logs similar to Cursor's terminal output format - clean and shareable
     const formatted = logs.map((log) => {
       const time = log.timestamp.toLocaleTimeString();
@@ -252,11 +283,21 @@ export function TerminalPanel({
       const prefix = log.type === "error" ? "✗" : log.type === "info" ? "ℹ" : "";
       return `[${time}] ${prefix} ${lines[0]}\n${lines.slice(1).map(l => `        ${l}`).join("\n")}`;
     }).join("\n\n");
-    
-    navigator.clipboard.writeText(formatted).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    });
+
+    const terminalBlob = new Blob(["1"], { type: "application/x-aiforge-terminal" });
+    const blob = new Blob([formatted], { type: "text/plain" });
+    navigator.clipboard.write([new ClipboardItem({ "text/plain": blob, "application/x-aiforge-terminal": terminalBlob })]).then(
+      () => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      },
+      () => {
+        navigator.clipboard.writeText(formatted).then(() => {
+          setCopied(true);
+          setTimeout(() => setCopied(false), 2000);
+        });
+      }
+    );
   }, [logs]);
 
   if (!visible) return null;
@@ -319,7 +360,7 @@ export function TerminalPanel({
               size="sm"
               className="h-6 px-2 text-xs"
               onClick={copyTerminalOutput}
-              title="Copy terminal output"
+              title="Copy selection (or all). Select text in the output area and press Ctrl+C to copy."
             >
               {copied ? (
                 <>
@@ -353,8 +394,17 @@ export function TerminalPanel({
         </div>
       </div>
       <div
-        className="flex-1 overflow-y-auto p-2 space-y-0.5 min-h-0"
-        onClick={() => inputRef.current?.focus()}
+        ref={logsContainerRef}
+        role="log"
+        tabIndex={0}
+        className="flex-1 overflow-y-auto p-2 space-y-0.5 min-h-0 select-text outline-none"
+        aria-label="Terminal output"
+        onKeyDown={(e) => {
+          if ((e.ctrlKey || e.metaKey) && e.key === "c") {
+            e.preventDefault();
+            copyTerminalOutput();
+          }
+        }}
       >
         {logs.length === 0 && !input && (
           <div className="text-muted-foreground text-xs px-2 py-2">

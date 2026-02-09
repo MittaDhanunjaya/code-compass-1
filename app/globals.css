@@ -68,3 +68,12 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* Cmd+K ghost text: inline suggestion in grey */
+.cmd-k-ghost {
+  color: #6b7280;
+  opacity: 0.9;
+}
+.dark .cmd-k-ghost {
+  color: #9ca3af;
+}

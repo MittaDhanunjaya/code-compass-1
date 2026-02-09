@@ -2,7 +2,7 @@
  * Agent event types for real-time activity feed
  */
 
-export type AgentEventType = 'reasoning' | 'tool_call' | 'tool_result' | 'status';
+export type AgentEventType = 'reasoning' | 'tool_call' | 'tool_result' | 'status' | 'guardrail_warning';
 
 export interface AgentEvent {
   id: string;            // unique per event
@@ -16,6 +16,18 @@ export interface AgentEvent {
     conflict?: boolean;
     /** When present, indicates message classification from detectErrorLogKind. */
     kind?: "normal" | "error_log";
+    /** Multi-model: which model produced this event */
+    modelId?: string;
+    modelLabel?: string;
+    modelGroupId?: string;
+    modelRole?: "planner" | "coder" | "reviewer";
+    /** Guardrail: large edit warning */
+    guardrail?: {
+      path: string;
+      reason: "large_replacement_ratio" | "large_line_delta";
+      ratio?: number;
+      lineDelta?: number;
+    };
   };
   createdAt: string;     // ISO timestamp
 }

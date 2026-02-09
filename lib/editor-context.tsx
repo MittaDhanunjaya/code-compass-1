@@ -18,10 +18,17 @@ export type Tab = {
 
 export type EditorSelection = { path: string; text: string } | null;
 
+/** Monaco-style range (1-based). Used for Cmd+K inline apply (Tab to apply). */
+export type EditorRange = { startLineNumber: number; startColumn: number; endLineNumber: number; endColumn: number };
+
+export type PendingCmdKSuggestion = { path: string; newContent: string; range: EditorRange } | null;
+
 type EditorContextValue = {
   tabs: Tab[];
   activeTab: string | null;
   selection: EditorSelection;
+  pendingCmdKSuggestion: PendingCmdKSuggestion;
+  setPendingCmdKSuggestion: (s: PendingCmdKSuggestion) => void;
   openFile: (path: string, content: string) => void;
   closeTab: (path: string) => void;
   setActiveTab: (path: string | null) => void;
@@ -45,6 +52,7 @@ export function EditorProvider({
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeTab, setActiveTabState] = useState<string | null>(null);
   const [selection, setSelectionState] = useState<EditorSelection>(null);
+  const [pendingCmdKSuggestion, setPendingCmdKSuggestion] = useState<PendingCmdKSuggestion>(null);
   const [wsId, setWsId] = useState<string | null>(workspaceId);
 
   useEffect(() => {
@@ -139,6 +147,8 @@ export function EditorProvider({
     tabs,
     activeTab,
     selection,
+    pendingCmdKSuggestion,
+    setPendingCmdKSuggestion,
     openFile,
     closeTab,
     setActiveTab,
