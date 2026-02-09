@@ -71,6 +71,8 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
   /** When apply-edits returns 400 (large edit blocked), offer "Apply anyway" with confirmLargeEdit. */
   const [agentLargeEditConfirmOpen, setAgentLargeEditConfirmOpen] = useState(false);
   const [pendingLargeEditEdits, setPendingLargeEditEdits] = useState<{ path: string; content: string }[]>([]);
+  const [agentFullFileReplaceConfirmOpen, setAgentFullFileReplaceConfirmOpen] = useState(false);
+  const [pendingFullFileReplaceEdits, setPendingFullFileReplaceEdits] = useState<{ path: string; content: string }[]>([]);
   const [error, setError] = useState<string | null>(null);
   
   // Load provider and model from localStorage, default to openrouter + deepseek-coder:free
@@ -1694,8 +1696,8 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                   </div>
                   <p className="text-[11px] text-muted-foreground">Or accept/reject per file below, then Apply accepted.</p>
                   <ul className="space-y-1.5 max-h-48 overflow-y-auto">
-                    {((executeResult as any).pendingReview.fileEdits as { path: string; originalContent: string; newContent: string }[]).map((edit) => (
-                      <li key={edit.path} className="flex items-center gap-2 text-xs">
+                    {((executeResult as any).pendingReview.fileEdits as { path: string; originalContent: string; newContent: string }[]).map((edit, idx) => (
+                      <li key={`${edit.path}-${idx}`} className="flex items-center gap-2 text-xs">
                         <input
                           type="checkbox"
                           checked={agentReviewAccepted.has(edit.path)}
@@ -1739,6 +1741,11 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                         });
                         const data = await res.json().catch(() => ({}));
                         if (!res.ok) {
+                          if (res.status === 400 && Array.isArray(data.fullFileReplacePaths) && data.fullFileReplacePaths.length > 0) {
+                            setPendingFullFileReplaceEdits(edits);
+                            setAgentFullFileReplaceConfirmOpen(true);
+                            return;
+                          }
                           if (res.status === 400 && Array.isArray(data.largeEditPaths) && data.largeEditPaths.length > 0) {
                             setPendingLargeEditEdits(edits);
                             setAgentLargeEditConfirmOpen(true);
@@ -1772,8 +1779,8 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                     Files created/modified ({executeResult.filesEdited.length}):
                   </p>
                   <ul className="list-disc list-inside space-y-0.5 text-muted-foreground">
-                    {executeResult.filesEdited.map((path) => (
-                      <li key={path} className="font-mono text-xs">
+                    {executeResult.filesEdited.map((path, idx) => (
+                      <li key={`${path}-${idx}`} className="font-mono text-xs">
                         {path}
                       </li>
                     ))}
@@ -1812,6 +1819,50 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
             </Button>
             <Button onClick={confirmLargeFileExecute}>
               Continue
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={agentFullFileReplaceConfirmOpen} onOpenChange={(open) => { if (!open) { setAgentFullFileReplaceConfirmOpen(false); setPendingFullFileReplaceEdits([]); } }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Full file replace</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground py-2">
+            This replaces almost the entire file. If you didn&apos;t ask for a full rewrite, cancel and re-run with a clearer request. Apply anyway?
+          </p>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => { setAgentFullFileReplaceConfirmOpen(false); setPendingFullFileReplaceEdits([]); }}>
+              Cancel
+            </Button>
+            <Button onClick={async () => {
+              if (!workspaceId || pendingFullFileReplaceEdits.length === 0) return;
+              setAgentFullFileReplaceConfirmOpen(false);
+              setAgentReviewApplying(true);
+              try {
+                const res = await fetch(`/api/workspaces/${workspaceId}/agent/apply-edits`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ edits: pendingFullFileReplaceEdits, confirmFullFileReplace: true }),
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.error || "Failed to apply");
+                for (const e of pendingFullFileReplaceEdits) updateContent(e.path, e.content);
+                setExecuteResult((prev) => {
+                  if (!prev) return prev;
+                  const next = { ...prev, filesEdited: [...(prev.filesEdited ?? []), ...pendingFullFileReplaceEdits.map((x) => x.path)] };
+                  delete (next as any).pendingReview;
+                  return next;
+                });
+              } catch (e) {
+                setError(e instanceof Error ? e.message : "Failed to apply");
+              } finally {
+                setAgentReviewApplying(false);
+                setPendingFullFileReplaceEdits([]);
+              }
+            }}>
+              Apply anyway
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -1920,6 +1971,11 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                     });
                     const data = await res.json().catch(() => ({}));
                     if (!res.ok) {
+                      if (res.status === 400 && Array.isArray(data.fullFileReplacePaths) && data.fullFileReplacePaths.length > 0) {
+                        setPendingFullFileReplaceEdits(edits);
+                        setAgentFullFileReplaceConfirmOpen(true);
+                        return;
+                      }
                       if (res.status === 400 && Array.isArray(data.largeEditPaths) && data.largeEditPaths.length > 0) {
                         setPendingLargeEditEdits(edits);
                         setAgentLargeEditConfirmOpen(true);
@@ -1965,6 +2021,11 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                         });
                         const data = await res.json().catch(() => ({}));
                         if (!res.ok) {
+                          if (res.status === 400 && Array.isArray(data.fullFileReplacePaths) && data.fullFileReplacePaths.length > 0) {
+                            setPendingFullFileReplaceEdits(edits);
+                            setAgentFullFileReplaceConfirmOpen(true);
+                            return;
+                          }
                           if (res.status === 400 && Array.isArray(data.largeEditPaths) && data.largeEditPaths.length > 0) {
                             setPendingLargeEditEdits(edits);
                             setAgentLargeEditConfirmOpen(true);

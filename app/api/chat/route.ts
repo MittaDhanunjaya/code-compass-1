@@ -154,8 +154,8 @@ export async function POST(request: Request) {
           `${request.headers.get("origin") || "http://localhost:3000"}/api/search?query=${encodeURIComponent(searchQuery)}&workspaceId=${workspaceId}&limit=10&semantic=true`
         );
         if (searchRes.ok) {
-          const searchData = await searchRes.json();
-          searchResults = searchData.results ?? [];
+          const searchData = await searchRes.json().catch(() => ({}));
+          searchResults = Array.isArray((searchData as any)?.results) ? (searchData as any).results : [];
         } else {
           const { data: chunks } = await supabase
             .from("code_chunks")
@@ -228,11 +228,19 @@ export async function POST(request: Request) {
     }
 
     const provider = getProvider(providerId);
-    const modelOpt = getModelForProvider(providerId, body.model);
+    let modelOpt = getModelForProvider(providerId, body.model);
+    // Fallback so we never pass undefined and risk provider throwing (reliability)
+    if (modelOpt == null || modelOpt === "") {
+      if (providerId === "openrouter") modelOpt = "openrouter/free";
+      else if (providerId === "gemini") modelOpt = "gemini-2.0-flash";
+      else if (providerId === "openai") modelOpt = "gpt-4o-mini";
+      else if (providerId === "perplexity") modelOpt = "sonar";
+      else if (providerId === "ollama") modelOpt = "llama3.2";
+    }
     const { content, usage } = await provider.chat(
       enhancedMessages,
       apiKey,
-      { context: body.context, model: modelOpt }
+      { context: body.context, model: modelOpt ?? undefined }
     );
 
     // Save messages to persistent storage

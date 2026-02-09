@@ -748,6 +748,15 @@ export async function POST(request: Request) {
               parseResult = parseJSONRobust<AgentPlan>(trimmed.slice(jsonStart), ["steps"]);
             }
           }
+          // Repair common LLM mistakes (trailing commas) and retry once
+          if (!parseResult.success) {
+            const toRepair = extractJsonObject(trimmed) ?? trimmed.replace(/^[\s\S]*?(\{[\s\S]*\})\s*$/, "$1");
+            if (toRepair) {
+              const repaired = toRepair.replace(/,(\s*[}\]])/g, "$1");
+              const repairResult = parseJSONRobust<AgentPlan>(repaired, ["steps"]);
+              if (repairResult.success && repairResult.data) parseResult = repairResult;
+            }
+          }
           
           // If we successfully parsed JSON, use it
           if (parseResult.success && parseResult.data) {

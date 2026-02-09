@@ -11,3 +11,5 @@ My app can log into your GitHub, work directly on your repo on a separate branch
 See `.env.local.example` for required environment variables. Run `npm install` and `npm run dev`.
 
 **Hosted deployment:** To run Code Compass as a single URL where users sign up and add API keys (no self-hosting), see [docs/HOSTED_DEPLOYMENT.md](docs/HOSTED_DEPLOYMENT.md).
+
+**One-click deploy:** [Deploy with Vercel](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fyour-org%2Fcode-compass-1) — after cloning, add Supabase env vars (see [HOSTED_DEPLOYMENT](docs/HOSTED_DEPLOYMENT.md)); deploy is typically under 10 minutes.

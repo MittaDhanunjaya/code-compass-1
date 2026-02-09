@@ -43,7 +43,15 @@ export async function GET() {
     supabase.from("provider_keys").select("provider").eq("user_id", user.id),
   ]);
 
-  const defaultModelsData = defaultModelsRes.data ?? [];
+  let defaultModelsData = defaultModelsRes.data ?? [];
+  // Inline fallback when DB has no default models (migrations not run or seed failed) so UI never shows "No models"
+  if (defaultModelsData.length === 0) {
+    defaultModelsData = [
+      { id: "inline-ollama", label: "Ollama (local)", provider: "ollama", model_slug: "qwen:latest", is_default: true, is_free: true, capabilities: { chat: true, code: true } },
+      { id: "inline-openrouter", label: "OpenRouter Free", provider: "openrouter", model_slug: "openrouter/free", is_default: true, is_free: true, capabilities: { chat: true, code: true } },
+      { id: "inline-gemini", label: "Google Gemini", provider: "gemini", model_slug: "gemini-2.0-flash", is_default: true, is_free: true, capabilities: { chat: true, code: true } },
+    ];
+  }
 
   const providersWithKey = new Set((providerKeysRes.data ?? []).map((r) => r.provider));
 

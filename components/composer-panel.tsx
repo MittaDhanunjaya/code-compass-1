@@ -548,7 +548,7 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
       {/* Phase F: review in diff before apply */}
       {reviewQueue.length > 0 && reviewQueue[reviewIndex] && workspaceId && (
         <InlineEditDiffDialog
-          key={reviewQueue[reviewIndex].path}
+          key={`${reviewQueue[reviewIndex].path}-${reviewIndex}`}
           open={true}
           onOpenChange={(open) => {
             if (!open) {

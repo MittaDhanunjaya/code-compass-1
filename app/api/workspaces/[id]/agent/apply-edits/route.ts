@@ -34,7 +34,7 @@ export async function POST(request: Request, { params }: RouteParams) {
     return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
   }
 
-  let body: { edits?: { path: string; content: string }[]; confirmLargeEdit?: boolean };
+  let body: { edits?: { path: string; content: string }[]; confirmLargeEdit?: boolean; confirmFullFileReplace?: boolean };
   try {
     body = await request.json();
   } catch {
@@ -69,6 +69,10 @@ export async function POST(request: Request, { params }: RouteParams) {
       const newLines = (content ?? "").split("\n").length;
       const maxLines = Math.max(originalLines, 1);
       const changeRatio = Math.abs(originalLines - newLines) / maxLines;
+      if (changeRatio >= FULL_FILE_REPLACE_RATIO && !confirmFullFileReplace) {
+        fullFileReplacePaths.push(trimmedPath);
+        continue;
+      }
       if (changeRatio > LARGE_EDIT_RATIO && !confirmLargeEdit) {
         largeEditPaths.push(trimmedPath);
         continue;
@@ -89,6 +93,18 @@ export async function POST(request: Request, { params }: RouteParams) {
         });
       if (!error) applied.push(trimmedPath);
     }
+  }
+
+  if (fullFileReplacePaths.length > 0) {
+    return NextResponse.json(
+      {
+        applied,
+        error: "Full file replace",
+        details: "This replaces almost the entire file. If you didn't ask for a full rewrite, cancel and re-run with a clearer request. Add confirmFullFileReplace: true to apply anyway.",
+        fullFileReplacePaths,
+      },
+      { status: 400 }
+    );
   }
 
   if (largeEditPaths.length > 0) {
