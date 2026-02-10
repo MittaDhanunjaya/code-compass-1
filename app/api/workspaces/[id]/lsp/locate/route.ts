@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { getDefinitionAndReferences } from "@/lib/lsp/typescript-language-service";
+import { getDefinitionAndReferencesPython } from "@/lib/lsp/python-symbols";
 
 type RouteParams = { params: Promise<{ id: string }> };
 
@@ -10,6 +11,10 @@ const MAX_FILES_FOR_LSP = 200;
 function isTsJs(path: string): boolean {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
   return TS_JS_EXTENSIONS.has(ext);
+}
+
+function isPython(path: string): boolean {
+  return path.split(".").pop()?.toLowerCase() === "py";
 }
 
 /**
@@ -59,9 +64,9 @@ export async function POST(request: Request, { params }: RouteParams) {
   if (!filePath || typeof filePath !== "string") {
     return NextResponse.json({ error: "path is required" }, { status: 400 });
   }
-  if (!isTsJs(filePath)) {
+  if (!isTsJs(filePath) && !isPython(filePath)) {
     return NextResponse.json(
-      { error: "LSP locate is only supported for TypeScript/JavaScript files" },
+      { error: "LSP locate is supported for TypeScript/JavaScript and Python files" },
       { status: 400 }
     );
   }
@@ -73,6 +78,25 @@ export async function POST(request: Request, { params }: RouteParams) {
     .from("workspace_files")
     .select("path, content")
     .eq("workspace_id", id);
+
+  if (isPython(filePath)) {
+    const pyFiles = (files ?? []).filter((f) => {
+      const p = f.path as string;
+      return isPython(p) && !p.endsWith("/");
+    }).slice(0, MAX_FILES_FOR_LSP);
+    const currentContent = pyFiles.find((f) => (f.path as string) === filePath)?.content as string | undefined;
+    if (currentContent == null) {
+      return NextResponse.json({
+        symbol: null,
+        definitions: [],
+        references: [],
+        currentFileOnly: true,
+      });
+    }
+    const allFiles = pyFiles.map((f) => ({ path: f.path as string, content: (f.content as string) ?? "" }));
+    const result = getDefinitionAndReferencesPython(currentContent, filePath, line, character, allFiles);
+    return NextResponse.json(result);
+  }
 
   const codeFiles = (files ?? []).filter((f) => {
     const p = f.path as string;

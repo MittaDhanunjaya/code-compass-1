@@ -5,8 +5,8 @@
 
 import type { FileEditStep } from "./types";
 
-/** Default: flag when replaced portion is >= 60% of file (by lines). */
-export const LARGE_REPLACE_RATIO = 0.6;
+/** Default: flag when replaced portion is >= 40% of file (by lines). Matches OVER_EDIT_RATIO_THRESHOLD. */
+export const LARGE_REPLACE_RATIO = 0.4;
 
 /** Default: flag when a single edit adds or removes more than this many lines. */
 export const LARGE_REPLACE_ABSOLUTE_LINES = 200;

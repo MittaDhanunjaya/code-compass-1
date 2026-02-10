@@ -1,0 +1,194 @@
+/**
+ * Provider abstraction: standardized invokeChat and invokeToolUse with
+ * central retries, rate-limit handling, and logging.
+ */
+
+import type { ChatMessage, ChatContext, LLMUsage } from "./types";
+import { getProvider, getModelForProvider, type ProviderId } from "./providers";
+import { isRateLimitError, isFallbackableError } from "./rate-limit";
+
+const MAX_RETRIES = 3;
+const INITIAL_BACKOFF_MS = 1000;
+
+export type TaskType = "planning" | "qa" | "patch" | "review" | "chat" | "inline_edit" | "debug";
+
+export type InvokeChatInput = {
+  messages: ChatMessage[];
+  apiKey: string;
+  providerId: ProviderId;
+  model?: string | null;
+  context?: ChatContext | null;
+  /** For logging and task-based routing. */
+  task?: TaskType;
+  /** Optional temperature (e.g. 0.3 for debug to reduce same-output repetition). */
+  temperature?: number;
+};
+
+export type InvokeChatOutput = {
+  content: string;
+  usage?: LLMUsage;
+  providerId: ProviderId;
+  model: string | undefined;
+  latencyMs: number;
+  retries: number;
+};
+
+/** Tool call (for future use). Standardized shape. */
+export type ToolCallSpec = {
+  id: string;
+  name: string;
+  arguments: string;
+};
+
+export type InvokeToolUseInput = InvokeChatInput & {
+  tools?: Array<{ name: string; description?: string; parameters?: unknown }>;
+};
+
+export type InvokeToolUseOutput = InvokeChatOutput & {
+  toolCalls?: ToolCallSpec[];
+};
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Invoke chat with retries (on rate limit), logging, and standardized output.
+ */
+export async function invokeChat(input: InvokeChatInput): Promise<InvokeChatOutput> {
+  const { messages, apiKey, providerId, model, context, task = "chat", temperature } = input;
+  const provider = getProvider(providerId);
+  const modelOpt = getModelForProvider(providerId, model ?? undefined);
+  const start = Date.now();
+  let lastError: unknown;
+  let retries = 0;
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      const { content, usage } = await provider.chat(messages, apiKey, {
+        model: modelOpt,
+        context,
+        temperature,
+      });
+      const latencyMs = Date.now() - start;
+      if (process.env.NODE_ENV !== "test") {
+        console.log(
+          JSON.stringify({
+            event: "llm_invoke",
+            task,
+            providerId,
+            model: modelOpt ?? "default",
+            latencyMs,
+            retries,
+            ok: true,
+          })
+        );
+      }
+      return {
+        content,
+        usage,
+        providerId,
+        model: modelOpt,
+        latencyMs,
+        retries,
+      };
+    } catch (e) {
+      lastError = e;
+      if (attempt < MAX_RETRIES - 1 && isRateLimitError(e)) {
+        retries++;
+        const backoff = INITIAL_BACKOFF_MS * Math.pow(2, attempt);
+        if (process.env.NODE_ENV !== "test") {
+          console.warn(
+            JSON.stringify({
+              event: "llm_invoke_retry",
+              task,
+              providerId,
+              attempt: attempt + 1,
+              backoffMs: backoff,
+            })
+          );
+        }
+        await sleep(backoff);
+      } else {
+        const latencyMs = Date.now() - start;
+        if (process.env.NODE_ENV !== "test") {
+          console.error(
+            JSON.stringify({
+              event: "llm_invoke_error",
+              task,
+              providerId,
+              latencyMs,
+              retries,
+              error: e instanceof Error ? e.message : String(e),
+            })
+          );
+        }
+        throw e;
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+/**
+ * Invoke with optional tool use. Providers that support tools can use them;
+ * others fall back to chat. Currently all providers use chat only.
+ */
+export async function invokeToolUse(input: InvokeToolUseInput): Promise<InvokeToolUseOutput> {
+  const base: InvokeChatInput = {
+    messages: input.messages,
+    apiKey: input.apiKey,
+    providerId: input.providerId,
+    model: input.model,
+    context: input.context,
+    task: input.task,
+  };
+  const result = await invokeChat(base);
+  return {
+    ...result,
+    toolCalls: undefined,
+  };
+}
+
+/** One candidate for fallback: provider, model slug, and API key (empty for local). */
+export type InvokeChatCandidate = {
+  providerId: ProviderId;
+  model?: string | null;
+  apiKey: string;
+};
+
+/**
+ * Try invokeChat with each candidate in order; return first success.
+ * On rate limit / 404 / timeout, try next candidate. Throw last error if all fail.
+ */
+export async function invokeChatWithFallback(
+  input: Omit<InvokeChatInput, "apiKey" | "providerId" | "model">,
+  candidates: InvokeChatCandidate[]
+): Promise<InvokeChatOutput> {
+  let lastError: unknown;
+  for (const c of candidates) {
+    try {
+      return await invokeChat({
+        ...input,
+        apiKey: c.apiKey,
+        providerId: c.providerId,
+        model: c.model,
+      });
+    } catch (e) {
+      lastError = e;
+      if (!isFallbackableError(e) || candidates.indexOf(c) === candidates.length - 1) throw e;
+      if (process.env.NODE_ENV !== "test") {
+        console.warn(
+          JSON.stringify({
+            event: "llm_invoke_fallback",
+            task: input.task,
+            from: c.providerId,
+            error: e instanceof Error ? e.message : String(e),
+          })
+        );
+      }
+    }
+  }
+  throw lastError;
+}

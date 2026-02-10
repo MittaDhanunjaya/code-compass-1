@@ -38,6 +38,20 @@ function offsetToLine1Based(content: string, offset: number): number {
   return line;
 }
 
+/**
+ * Convert 0-based file offset to 1-based line and column.
+ */
+function offsetToLineColumn1Based(
+  content: string,
+  offset: number
+): { line: number; character: number } {
+  const before = content.slice(0, offset);
+  const line = (before.match(/\n/g)?.length ?? 0) + 1;
+  const lastNewline = before.lastIndexOf("\n");
+  const character = lastNewline === -1 ? before.length + 1 : offset - lastNewline;
+  return { line, character };
+}
+
 export type DefinitionResult = { filePath: string; line: number };
 export type ReferenceResult = { filePath: string; line: number; context?: string };
 
@@ -175,4 +189,60 @@ export function getDefinitionAndReferences(
     references,
     currentFileOnly,
   };
+}
+
+export type RenameEdit = {
+  filePath: string;
+  startLine: number;
+  startColumn: number;
+  endLine: number;
+  endColumn: number;
+  newText: string;
+};
+
+/**
+ * Get all edits to rename the symbol at the given position to newName.
+ * Returns edits in Monaco-friendly 1-based line/column format.
+ */
+export function getRenameEdits(
+  files: Map<string, string>,
+  currentPath: string,
+  line: number,
+  character: number,
+  newName: string
+): RenameEdit[] | null {
+  if (!isTsJs(currentPath)) return null;
+  const content = files.get(currentPath);
+  if (!content) return null;
+
+  const rootFileNames = Array.from(files.keys()).filter(isTsJs).slice(0, MAX_FILES_FOR_PROGRAM);
+  if (rootFileNames.length === 0) return null;
+
+  const languageService = createLanguageService(files, rootFileNames);
+  const position = lineCharacterToOffset(content, line, character);
+
+  const locations = languageService.findRenameLocations(
+    currentPath,
+    position,
+    false, // findInStrings
+    false   // findInComments
+  );
+  if (!locations || locations.length === 0) return null;
+
+  const edits: RenameEdit[] = [];
+  for (const loc of locations) {
+    const fileContent = files.get(loc.fileName);
+    if (fileContent === undefined) continue;
+    const start = offsetToLineColumn1Based(fileContent, loc.textSpan.start);
+    const end = offsetToLineColumn1Based(fileContent, loc.textSpan.start + loc.textSpan.length);
+    edits.push({
+      filePath: loc.fileName,
+      startLine: start.line,
+      startColumn: start.character,
+      endLine: end.line,
+      endColumn: end.character,
+      newText: newName,
+    });
+  }
+  return edits;
 }

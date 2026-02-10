@@ -13,8 +13,9 @@ import { Button } from "@/components/ui/button";
 import { useEditor } from "@/lib/editor-context";
 import { InlineEditDiffDialog } from "@/components/inline-edit-diff-dialog";
 import { PROVIDERS, type ProviderId } from "@/lib/llm/providers";
+import { formatDiagnosticsForPrompt } from "@/lib/sandbox/stack-profiles";
 
-type CmdKAction = "explain" | "refactor" | "test" | "docs";
+type CmdKAction = "explain" | "refactor" | "test" | "docs" | "fix" | "fix_diagnostics";
 
 interface CmdKOverlayProps {
   workspaceId: string | null;
@@ -36,6 +37,8 @@ function getStoredModel(workspaceId: string | null): string {
 
 export function CmdKOverlay({ workspaceId, onAction }: CmdKOverlayProps) {
   const [open, setOpen] = useState(false);
+  const [initialAction, setInitialAction] = useState<CmdKAction | null>(null);
+  const [initialDiagnostics, setInitialDiagnostics] = useState<Array<{ line: number; column?: number; message: string; severity?: string }> | null>(null);
   const [inlineLoading, setInlineLoading] = useState(false);
   const [loadingLabel, setLoadingLabel] = useState<"edit" | "explain" | "test">("edit");
   const [inlineEdit, setInlineEdit] = useState<{ path: string; originalContent: string; newContent: string } | null>(null);
@@ -50,6 +53,8 @@ export function CmdKOverlay({ workspaceId, onAction }: CmdKOverlayProps) {
     { id: "refactor", label: "Refactor this", icon: <Wand2 className="w-4 h-4" />, description: "Refactor and improve this code", useInlineEdit: true },
     { id: "test", label: "Write tests", icon: <TestTube className="w-4 h-4" />, description: "Generate tests for this code" },
     { id: "docs", label: "Add documentation", icon: <FileText className="w-4 h-4" />, description: "Add documentation comments", useInlineEdit: true },
+    { id: "fix", label: "Fix error", icon: <Wand2 className="w-4 h-4" />, description: "Fix the error at cursor or selection", useInlineEdit: true },
+    { id: "fix_diagnostics", label: "Fix diagnostics", icon: <Wand2 className="w-4 h-4" />, description: "Fix lint/diagnostics in this file", useInlineEdit: true },
   ];
 
   useEffect(() => {
@@ -58,6 +63,7 @@ export function CmdKOverlay({ workspaceId, onAction }: CmdKOverlayProps) {
         e.preventDefault();
         if (activeTabPath && workspaceId) {
           setOpen(true);
+          setInitialAction(null);
         }
       }
       if (e.key === "Escape" && open) {
@@ -65,9 +71,28 @@ export function CmdKOverlay({ workspaceId, onAction }: CmdKOverlayProps) {
       }
     };
 
+    const onOpenCmdK = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ action?: CmdKAction; diagnostics?: Array<{ line: number; column?: number; message: string; severity?: string }> }>).detail;
+      if (activeTabPath && workspaceId) {
+        setInitialAction(detail?.action ?? null);
+        setInitialDiagnostics(detail?.diagnostics ?? null);
+        setOpen(true);
+      }
+    };
+
     window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    window.addEventListener("open-cmd-k", onOpenCmdK);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("open-cmd-k", onOpenCmdK);
+    };
   }, [open, workspaceId, activeTabPath]);
+
+  useEffect(() => {
+    if (!open || !initialAction || inlineLoading) return;
+    handleActionClick(initialAction);
+    setInitialAction(null);
+  }, [open, initialAction]); // eslint-disable-line react-hooks/exhaustive-deps -- run once when opening with initialAction
 
   const fallbackToChat = useCallback((action: CmdKAction, selectedText: string, filePath: string) => {
     onAction(action, selectedText, filePath);
@@ -80,9 +105,34 @@ export function CmdKOverlay({ workspaceId, onAction }: CmdKOverlayProps) {
     if (!activeTab) return;
 
     const selectedText = selection?.text ?? activeTab.content;
+    const isFixDiagnostics = action === "fix_diagnostics";
+    let diagnosticsToUse = initialDiagnostics;
+    if (isFixDiagnostics && (!diagnosticsToUse || diagnosticsToUse.length === 0) && workspaceId) {
+      try {
+        const lintRes = await fetch(`/api/workspaces/${workspaceId}/lint`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: activeTab.path, content: activeTab.content }),
+        });
+        const lintData = await lintRes.json().catch(() => ({}));
+        if (Array.isArray(lintData.diagnostics) && lintData.diagnostics.length > 0) {
+          diagnosticsToUse = lintData.diagnostics;
+        }
+      } catch {
+        // ignore
+      }
+    }
+    const effectiveAction = isFixDiagnostics ? "fix" : action;
+    const errorMessageForFix =
+      isFixDiagnostics && diagnosticsToUse?.length
+        ? formatDiagnosticsForPrompt(diagnosticsToUse)
+        : undefined;
 
     const actionConfig = actions.find((a) => a.id === action);
-    if (actionConfig?.useInlineEdit && (action === "refactor" || action === "docs")) {
+    const useInlineEditPath =
+      (actionConfig?.useInlineEdit && (action === "refactor" || action === "docs" || action === "fix")) ||
+      isFixDiagnostics;
+    if (useInlineEditPath && (effectiveAction === "fix" || action === "refactor" || action === "docs")) {
       setLoadingLabel("edit");
       setInlineLoading(true);
       setOpen(false);
@@ -97,7 +147,8 @@ export function CmdKOverlay({ workspaceId, onAction }: CmdKOverlayProps) {
             filePath: activeTab.path,
             currentContent: activeTab.content,
             selection: selectedText || undefined,
-            action,
+            action: effectiveAction,
+            errorMessage: errorMessageForFix,
             provider: getStoredProvider(workspaceId),
             model: getStoredModel(workspaceId),
           }),
@@ -106,23 +157,28 @@ export function CmdKOverlay({ workspaceId, onAction }: CmdKOverlayProps) {
         clearTimeout(timeoutId);
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
+          const errMsg = typeof data.error === "string" ? data.error : "Request failed. Try again or use Chat.";
+          window.dispatchEvent(new CustomEvent("cmd-k-error", { detail: { message: errMsg } }));
+          fallbackToChat(action, selectedText, activeTab.path);
+          return;
+        }
+        if (data.error && typeof data.error === "string") {
+          window.dispatchEvent(new CustomEvent("cmd-k-error", { detail: { message: data.error } }));
           fallbackToChat(action, selectedText, activeTab.path);
           return;
         }
         const newContent = typeof data.newContent === "string" ? data.newContent : "";
-        if (data.path && newContent !== undefined) {
-          // Inline-first: show suggestion as ghost text in editor; user presses Tab to accept. No diff dialog by default.
-          window.dispatchEvent(new CustomEvent("cmd-k-inline-suggestion", { detail: { path: data.path, newContent: newContent || activeTab.content } }));
+        if (data.path && newContent.length >= 2) {
+          window.dispatchEvent(new CustomEvent("cmd-k-inline-suggestion", { detail: { path: data.path, newContent } }));
         } else {
+          window.dispatchEvent(new CustomEvent("cmd-k-error", { detail: { message: "No edit generated. Try again or use Chat." } }));
           fallbackToChat(action, selectedText, activeTab.path);
         }
       } catch (err) {
         clearTimeout(timeoutId);
-        if (err instanceof Error && err.name === "AbortError") {
-          fallbackToChat(action, selectedText, activeTab.path);
-        } else {
-          fallbackToChat(action, selectedText, activeTab.path);
-        }
+        const msg = err instanceof Error ? err.message : "Request failed";
+        window.dispatchEvent(new CustomEvent("cmd-k-error", { detail: { message: err.name === "AbortError" ? "Request timed out. Try again or use Chat." : msg } }));
+        fallbackToChat(action, selectedText, activeTab.path);
       } finally {
         setInlineLoading(false);
       }
@@ -182,7 +238,7 @@ export function CmdKOverlay({ workspaceId, onAction }: CmdKOverlayProps) {
     }
 
     fallbackToChat(action, selectedText, activeTab.path);
-  }, [activeTabPath, workspaceId, getTab, selection, fallbackToChat]);
+  }, [activeTabPath, workspaceId, getTab, selection, initialDiagnostics, fallbackToChat]);
 
   const handleCopyResult = useCallback(() => {
     if (resultDialogContent) {

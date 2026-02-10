@@ -1,0 +1,93 @@
+# Code Compass CI – run tests and optionally request fix suggestions from Code Compass.
+# Copy or adapt this workflow to your repo. Add secrets in GitHub: Settings → Secrets and variables → Actions.
+#
+# Optional integration with Code Compass:
+#   - CODE_COMPASS_URL: your Code Compass instance (e.g. https://your-app.vercel.app)
+#   - CODE_COMPASS_WORKSPACE_ID: workspace ID in Code Compass
+#   - CODE_COMPASS_CI_TOKEN: (optional) CI token for authenticated propose-fixes API
+# If CODE_COMPASS_* are set, on test/lint failure the workflow can POST the log to Code Compass
+# and receive suggested fixes (see step "Request fix suggestions from Code Compass").
+
+name: Code Compass CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        id: lint
+        run: |
+          if npm run lint 2>/dev/null; then
+            echo "lint_status=passed" >> $GITHUB_OUTPUT
+          else
+            echo "lint_status=failed" >> $GITHUB_OUTPUT
+            npm run lint 2>&1 | tee lint.log || true
+          fi
+        continue-on-error: true
+
+      - name: Test
+        id: test
+        run: |
+          npm test 2>&1 | tee test.log
+        continue-on-error: true
+
+      - name: Upload test log on failure
+        if: failure() || steps.test.outputs.lint_status == 'failed'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-and-lint-logs
+          path: |
+            test.log
+            lint.log
+          if-no-files-found: ignore
+
+      - name: Request fix suggestions from Code Compass (optional)
+        if: failure() || steps.lint.outputs.lint_status == 'failed'
+        env:
+          CODE_COMPASS_URL: ${{ secrets.CODE_COMPASS_URL }}
+          CODE_COMPASS_WORKSPACE_ID: ${{ secrets.CODE_COMPASS_WORKSPACE_ID }}
+          CODE_COMPASS_CI_TOKEN: ${{ secrets.CODE_COMPASS_CI_TOKEN }}
+        run: |
+          LOG_FILE="test.log"
+          [ -f "lint.log" ] && LOG_FILE="lint.log"
+          [ -f "test.log" ] && LOG_FILE="test.log"
+          if [ ! -f "$LOG_FILE" ]; then
+            echo "No log file found. Upload the artifact and paste it into Code Compass → Debug from log."
+            exit 0
+          fi
+          if [ -z "$CODE_COMPASS_URL" ] || [ -z "$CODE_COMPASS_WORKSPACE_ID" ]; then
+            echo "To get fix suggestions in CI, add secrets: CODE_COMPASS_URL, CODE_COMPASS_WORKSPACE_ID (and optionally CODE_COMPASS_CI_TOKEN)."
+            echo "Otherwise paste the contents of $LOG_FILE into Code Compass → Debug from log."
+            exit 0
+          fi
+          LOG_BODY=$(jq -Rs '{ logText: . }' "$LOG_FILE")
+          if [ -n "$CODE_COMPASS_CI_TOKEN" ]; then
+            curl -s -S -X POST \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $CODE_COMPASS_CI_TOKEN" \
+              "$CODE_COMPASS_URL/api/ci/propose-fixes?workspaceId=$CODE_COMPASS_WORKSPACE_ID" \
+              -d "$LOG_BODY" || true
+          else
+            echo "Add CODE_COMPASS_CI_TOKEN secret for authenticated fix suggestions."
+          fi
+          echo "Code Compass step finished."
+          # Optional: apply suggested edits to a branch and push. Requires jq.
+          # RESPONSE=$(curl -s ... -d "$LOG_BODY"); echo "$RESPONSE" | ./scripts/apply-code-compass-edits.sh --push --branch code-compass-fix

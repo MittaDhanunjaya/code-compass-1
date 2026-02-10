@@ -20,7 +20,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { useEditor } from "@/lib/editor-context";
 import { useTerminal } from "@/lib/terminal-context";
 import { PROVIDERS, PROVIDER_LABELS, OPENROUTER_FREE_MODELS, type ProviderId } from "@/lib/llm/providers";
-import type { AgentPlan, PlanStep, AgentLogEntry, AgentExecuteResult } from "@/lib/agent/types";
+import type { AgentPlan, PlanStep, AgentLogEntry, AgentExecuteResult, ScopeMode } from "@/lib/agent/types";
 import { SAFE_EDIT_MAX_FILES } from "@/lib/protected-paths";
 import type { AgentEvent } from "@/lib/agent-events";
 import { openFileInWorkspace } from "@/lib/open-file-in-workspace";
@@ -28,6 +28,9 @@ import { useWorkspaceLabel } from "@/lib/use-workspace-label";
 import { ModelsManagerDialog } from "@/components/models-manager-dialog";
 import { ErrorWithAction } from "@/components/error-with-action";
 import { InlineEditDiffDialog } from "@/components/inline-edit-diff-dialog";
+import { getPlaybook, PLAYBOOKS } from "@/lib/playbooks";
+import { COPY } from "@/lib/copy";
+import { FeedbackPrompt } from "@/components/feedback-prompt";
 
 type AgentPhase = "idle" | "loading_plan" | "plan_ready" | "executing" | "done";
 
@@ -95,6 +98,15 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
   const [provider, setProviderState] = useState<ProviderId>(getStoredProvider());
   const [model, setModelState] = useState<string>(getStoredModel());
   const [planUsage, setPlanUsage] = useState<string | null>(null);
+  const [runScope, setRunScope] = useState<{ fileCount: number; approxLinesChanged: number } | null>(null);
+  const getStoredScopeMode = (): ScopeMode => {
+    if (typeof window === "undefined") return "normal";
+    const key = workspaceId ? `agent-scope-mode-${workspaceId}` : "agent-scope-mode-default";
+    const stored = localStorage.getItem(key);
+    return stored === "conservative" || stored === "aggressive" ? stored : "normal";
+  };
+  const [scopeMode, setScopeModeState] = useState<ScopeMode>(getStoredScopeMode());
+  const [aggressiveConfirmOpen, setAggressiveConfirmOpen] = useState(false);
   const [planContextUsed, setPlanContextUsed] = useState<string[] | null>(null);
   const [largeFileConfirmOpen, setLargeFileConfirmOpen] = useState(false);
   const [largeFileCount, setLargeFileCount] = useState(0);
@@ -111,6 +123,12 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
     statusCount: number;
     isComplete: boolean;
     wasCancelled: boolean;
+    scope?: { fileCount: number; approxLinesChanged: number };
+    scopeMode?: ScopeMode;
+    retried?: boolean;
+    retryReason?: string;
+    attempt1?: { testsPassed?: boolean };
+    attempt2?: { testsPassed?: boolean };
   } | null>(null);
   const [modelFallbackBanner, setModelFallbackBanner] = useState<{
     from: string;
@@ -134,6 +152,12 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
   const [rulesFile, setRulesFile] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const eventsEndRef = useRef<HTMLDivElement | null>(null);
+  const [showAgentFeedback, setShowAgentFeedback] = useState(false);
+
+  useEffect(() => {
+    if (phase !== "done") setShowAgentFeedback(false);
+    else if (runSummary?.editedFiles?.size) setShowAgentFeedback(true);
+  }, [phase, runSummary?.editedFiles?.size]);
 
   const modelSelectionStorageKey = workspaceId ? `agent-model-selection-${workspaceId}` : "agent-model-selection-default";
   const setModelSelection = useCallback(
@@ -235,10 +259,31 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
     }
   }, [workspaceId]);
 
-  // Update provider/model when workspace changes
+  // Update provider/model/scopeMode when workspace changes
   useEffect(() => {
     setProviderState(getStoredProvider());
     setModelState(getStoredModel());
+    setScopeModeState(getStoredScopeMode());
+  }, [workspaceId]);
+
+  const setScopeMode = useCallback((mode: ScopeMode) => {
+    setScopeModeState(mode);
+    if (typeof window !== "undefined") {
+      const key = workspaceId ? `agent-scope-mode-${workspaceId}` : "agent-scope-mode-default";
+      localStorage.setItem(key, mode);
+    }
+  }, [workspaceId]);
+
+  // First-run / playbook: apply pending playbook instruction when Agent mounts with a workspace
+  useEffect(() => {
+    if (!workspaceId || typeof sessionStorage === "undefined") return;
+    try {
+      const pending = sessionStorage.getItem("pendingPlaybookId");
+      if (!pending) return;
+      const playbook = getPlaybook(pending);
+      sessionStorage.removeItem("pendingPlaybookId");
+      if (playbook?.instruction) setInstruction(playbook.instruction);
+    } catch {}
   }, [workspaceId]);
 
   const fetchFileList = useCallback(async (): Promise<string[]> => {
@@ -254,6 +299,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
     setError(null);
     setPlanUsage(null);
     setPlanContextUsed(null);
+    setRunScope(null);
     setAgentEvents([]);
     setRunSummary(null);
     setModelFallbackBanner(null);
@@ -277,6 +323,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
               : { provider, model: provider === "openrouter" ? model : undefined }),
           fileList,
           useIndex: true,
+          scopeMode: scopeMode ?? "normal",
         }),
         signal: abortController.signal,
       });
@@ -321,6 +368,9 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                 if (data.contextUsed && Array.isArray(data.contextUsed.filePaths)) {
                   setPlanContextUsed(data.contextUsed.filePaths);
                 }
+                if (data.scope && typeof data.scope.fileCount === "number") {
+                  setRunScope({ fileCount: data.scope.fileCount, approxLinesChanged: data.scope.approxLinesChanged ?? 0 });
+                }
               } else if (data.type === "error") {
                 // Handle error events from the stream
                 lastStatusMessage = data.error || data.message || "Unknown error";
@@ -341,6 +391,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                 setRunSummary((prev) => {
                   const summary = prev || {
                     editedFiles: new Set<string>(),
+                    filesSkippedDueToConflict: new Set<string>(),
                     commandsRun: [],
                     reasoningCount: 0,
                     toolCallCount: 0,
@@ -355,6 +406,16 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                   else if (event.type === "tool_call") summary.toolCallCount++;
                   else if (event.type === "tool_result") summary.toolResultCount++;
                   else if (event.type === "status") summary.statusCount++;
+                  
+                  // Scope/scopeMode from status events
+                  if (event.type === "status" && event.meta?.scope && typeof event.meta.scope.fileCount === "number") {
+                    summary.scope = { fileCount: event.meta.scope.fileCount, approxLinesChanged: event.meta.scope.approxLinesChanged ?? 0 };
+                  }
+                  if (event.type === "status" && event.meta?.scopeMode) summary.scopeMode = event.meta.scopeMode as ScopeMode;
+                  if (event.type === "status" && event.meta?.retried !== undefined) summary.retried = event.meta.retried;
+                  if (event.type === "status" && event.meta?.retryReason) summary.retryReason = event.meta.retryReason;
+                  if (event.type === "status" && event.meta?.attempt1) summary.attempt1 = event.meta.attempt1;
+                  if (event.type === "status" && event.meta?.attempt2) summary.attempt2 = event.meta.attempt2;
                   
                   // Track edited files (from tool_result events with filePath)
                   if (event.type === "tool_result" && event.meta?.filePath) {
@@ -501,7 +562,9 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
         return;
       }
       const errorMsg = e instanceof Error ? e.message : "Plan failed";
-      if (errorMsg.includes("No API key configured")) {
+      if (/failed to fetch|network error|load failed|network request failed/i.test(errorMsg)) {
+        setError("Connection lost. Check your network and try again.");
+      } else if (errorMsg.includes("No API key configured")) {
         // Enhanced error message with helpful links
         if (errorMsg.includes("OpenRouter") || errorMsg.includes("openrouter")) {
           setError(`No API key configured. Get a free OpenRouter key at https://openrouter.ai/keys and add it in Settings → API Keys.`);
@@ -532,7 +595,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
   }, []);
 
   const doExecute = useCallback(
-    async (confirmedProtectedPaths?: string[], skipProtected?: boolean) => {
+    async (confirmedProtectedPaths?: string[], skipProtected?: boolean, confirmedAggressive?: boolean) => {
       if (!plan || !workspaceId) return;
       setError(null);
       setAgentEvents([]);
@@ -556,6 +619,8 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                 : { provider, model: provider === "openrouter" ? model : undefined }),
             confirmedProtectedPaths: confirmedProtectedPaths ?? undefined,
             skipProtected: skipProtected === true,
+            scopeMode: scopeMode ?? "normal",
+            confirmedAggressive: confirmedAggressive === true,
           }),
           signal: abortController.signal,
         });
@@ -599,6 +664,11 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                   setPhase("plan_ready");
                   abortControllerRef.current = null;
                   return;
+                } else if (data.type === "needAggressiveConfirm") {
+                  setAggressiveConfirmOpen(true);
+                  setPhase("plan_ready");
+                  abortControllerRef.current = null;
+                  return;
                 } else if (data.id && data.type && data.message) {
                   // AgentEvent - track for summary
                   const event = data as AgentEvent;
@@ -639,6 +709,16 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                         summary.commandsRun.push(event.meta.command);
                       }
                     }
+                    
+                    // Scope/scopeMode/retry from status events
+                    if (event.type === "status" && event.meta?.scope && typeof event.meta.scope.fileCount === "number") {
+                      summary.scope = { fileCount: event.meta.scope.fileCount, approxLinesChanged: event.meta.scope.approxLinesChanged ?? 0 };
+                    }
+                    if (event.type === "status" && event.meta?.scopeMode) summary.scopeMode = event.meta.scopeMode as ScopeMode;
+                    if (event.type === "status" && event.meta?.retried !== undefined) summary.retried = event.meta.retried;
+                    if (event.type === "status" && event.meta?.retryReason) summary.retryReason = event.meta.retryReason;
+                    if (event.type === "status" && event.meta?.attempt1) summary.attempt1 = event.meta.attempt1;
+                    if (event.type === "status" && event.meta?.attempt2) summary.attempt2 = event.meta.attempt2;
                     
                     // Check for completion status
                     if (event.type === "status" && (
@@ -723,7 +803,8 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
         });
 
         // Log to terminal
-        for (const entry of finalResult.log ?? []) {
+        const logEntries = finalResult.log ?? [];
+        for (const entry of logEntries) {
           if (entry.type === "info") {
             addLog({ type: "info", content: entry.message || "", command: undefined });
           } else if (entry.type === "command") {
@@ -773,6 +854,9 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
             }
           }
         }
+        if (logEntries.length > 0) {
+          window.dispatchEvent(new CustomEvent("aiforge-show-terminal"));
+        }
 
         // Update files
         for (const path of finalResult.filesEdited ?? []) {
@@ -811,7 +895,12 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
           setPhase("plan_ready");
           return;
         }
-        setError(e instanceof Error ? e.message : "Execute failed");
+        const errMsg = e instanceof Error ? e.message : "Execute failed";
+        if (/failed to fetch|network error|load failed|network request failed/i.test(errMsg)) {
+          setError("Connection lost during run. Check your network and try again.");
+        } else {
+          setError(errMsg);
+        }
         setPhase("plan_ready");
       } finally {
         abortControllerRef.current = null;
@@ -1156,9 +1245,53 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
         </p>
         {/* Instruction + Start */}
         <div className="space-y-2">
-          <label className="text-xs font-medium text-muted-foreground">
-            Instruction
-          </label>
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <label className="text-xs font-medium text-muted-foreground">
+              Instruction
+            </label>
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-muted-foreground">Scope:</span>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="outline" size="sm" className="h-7 text-xs min-w-[100px]">
+                    {scopeMode === "conservative" ? "Conservative" : scopeMode === "aggressive" ? "Aggressive" : "Normal"}
+                    {" ▼"}
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuItem onClick={() => setScopeMode("conservative")} className={scopeMode === "conservative" ? "bg-accent" : ""}>
+                    Conservative
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => setScopeMode("normal")} className={scopeMode === "normal" ? "bg-accent" : ""}>
+                    Normal
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => setScopeMode("aggressive")} className={scopeMode === "aggressive" ? "bg-accent" : ""}>
+                    Aggressive
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+              <span className="text-[10px] text-muted-foreground hidden sm:inline">(whole workspace)</span>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="ghost" size="sm" className="h-7 text-xs text-muted-foreground">
+                    Playbooks
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="max-w-xs">
+                  {PLAYBOOKS.map((p) => (
+                    <DropdownMenuItem
+                      key={p.id}
+                      onSelect={() => setInstruction(p.instruction)}
+                      className="flex flex-col items-start gap-0.5"
+                    >
+                      <span className="font-medium">{p.title}</span>
+                      <span className="text-xs text-muted-foreground line-clamp-2">{p.description}</span>
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          </div>
           <Textarea
             placeholder="e.g. Add a README with setup instructions. Paste terminal logs to format with line numbers."
             value={instruction}
@@ -1283,9 +1416,9 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
         {/* Plan review */}
         {phase === "plan_ready" && plan && (
           <div className="space-y-2 rounded-lg border border-border bg-muted/20 p-3">
-            <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+            <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground flex-wrap">
               <span className="font-medium">
-                Plan ({plan.steps.length} steps) • {PROVIDER_LABELS[provider]}
+                Plan ({plan.steps.length} steps){runScope ? ` • Planned: ${runScope.fileCount} file(s), ≈${runScope.approxLinesChanged} lines` : ""} • {PROVIDER_LABELS[provider]}
               </span>
               {planUsage && (
                 <span className="rounded bg-background/60 px-2 py-0.5">
@@ -1452,6 +1585,22 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                   )}
                 </div>
                 <div className="space-y-1.5 text-xs">
+                  {(runSummary.scope || runSummary.scopeMode) && (
+                    <div className="text-muted-foreground">
+                      {runSummary.scope && (
+                        <span>Planned: {runSummary.scope.fileCount} file(s), ≈{runSummary.scope.approxLinesChanged} lines</span>
+                      )}
+                      {runSummary.scopeMode && (
+                        <span>{runSummary.scope ? ` (mode: ${runSummary.scopeMode.charAt(0).toUpperCase() + runSummary.scopeMode.slice(1)})` : `Scope mode: ${runSummary.scopeMode}`}</span>
+                      )}
+                    </div>
+                  )}
+                  {runSummary.retried && (runSummary.attempt1 || runSummary.attempt2) && (
+                    <div className="text-muted-foreground">
+                      Attempt 1: {runSummary.attempt1?.testsPassed ? "tests passed" : "tests failed"}.
+                      Attempt 2: {runSummary.attempt2?.testsPassed ? "tests passed" : "tests failed"}.
+                    </div>
+                  )}
                   {runSummary.editedFiles.size > 0 && (
                     <div>
                       <div className="flex flex-wrap items-center gap-2">
@@ -1788,6 +1937,14 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                   <p className="mt-2 text-xs text-muted-foreground">
                     💡 Files are saved in your workspace. Check the file tree on the left (refresh if needed).
                   </p>
+                  {showAgentFeedback && (
+                    <FeedbackPrompt
+                      source="agent"
+                      workspaceId={workspaceId}
+                      onSubmitted={() => setShowAgentFeedback(false)}
+                      className="mt-2"
+                    />
+                  )}
                 </div>
               ) : (executeResult as any).sandboxChecks?.run?.status === 'failed' ? (
                 <div className="mt-2 space-y-1">
@@ -1914,20 +2071,38 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={aggressiveConfirmOpen} onOpenChange={(open) => { if (!open) setAggressiveConfirmOpen(false); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Aggressive scope with Safe Edit on</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground py-2">
+            Aggressive mode may change many files/lines. Safe Edit is on; some changes may be blocked. Continue?
+          </p>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setAggressiveConfirmOpen(false)}>
+              Cancel
+            </Button>
+            <Button onClick={() => { setAggressiveConfirmOpen(false); doExecute(undefined, undefined, true); }}>
+              Continue
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <Dialog open={protectedConfirmOpen} onOpenChange={(open) => { if (!open) { setProtectedConfirmOpen(false); setProtectedPathsList([]); } }}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Protected files</DialogTitle>
+            <DialogTitle>{COPY.safety.title}</DialogTitle>
           </DialogHeader>
           <p className="text-sm text-muted-foreground py-2">
-            You&apos;re about to change protected files: {protectedPathsList.join(", ")}. These often contain secrets or important configuration. Allow the AI to edit these files?
+            {COPY.safety.body(protectedPathsList)}
           </p>
           <DialogFooter>
             <Button variant="outline" onClick={cancelProtectedExecute}>
-              Cancel
+              {COPY.safety.cancel}
             </Button>
             <Button onClick={confirmProtectedExecute}>
-              Allow this time
+              {COPY.safety.allow}
             </Button>
           </DialogFooter>
         </DialogContent>

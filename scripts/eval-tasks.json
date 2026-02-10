@@ -1,0 +1,23 @@
+{
+  "description": "Synthetic eval tasks for Code Compass. Run with: node scripts/run-eval.js [baseUrl] [workspaceId]. Requires auth cookie or token.",
+  "tasks": [
+    {
+      "id": "plan-fix-failing-test",
+      "label": "Plan: fix failing test",
+      "instruction": "The test 'adds 1 and 2' is failing with AssertionError: expected 3 got undefined. Fix the add function in math.js so the test passes.",
+      "expectPlanSteps": true
+    },
+    {
+      "id": "plan-add-endpoint",
+      "label": "Plan: add GET /api/health endpoint",
+      "instruction": "Add a GET /api/health endpoint that returns { ok: true }. Use the existing API route pattern in this project.",
+      "expectPlanSteps": true
+    },
+    {
+      "id": "plan-refactor-function",
+      "label": "Plan: refactor long function",
+      "instruction": "Refactor the longest function in the current file into smaller functions. Preserve behavior.",
+      "expectPlanSteps": true
+    }
+  ]
+}

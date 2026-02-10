@@ -9,6 +9,26 @@ import { resolveWorkspaceId } from "@/lib/workspaces/active-workspace";
 import { loadRules, formatRulesForPrompt } from "@/lib/rules";
 import { loadChatHistory, saveChatMessage } from "@/lib/chat-memory";
 
+export async function GET(request: Request) {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  const { searchParams } = new URL(request.url);
+  const workspaceId = searchParams.get("workspaceId");
+  const runType = searchParams.get("runType") as "chat" | "debug" | "agent" | "refactor" | null;
+  if (!workspaceId) {
+    return NextResponse.json({ error: "workspaceId required" }, { status: 400 });
+  }
+  const validRunTypes = ["chat", "debug", "agent", "refactor"];
+  const filter = runType && validRunTypes.includes(runType) ? runType : undefined;
+  const history = await loadChatHistory(supabase, workspaceId, user.id, 50, filter);
+  return NextResponse.json({ messages: history });
+}
+
 export async function POST(request: Request) {
   const supabase = await createClient();
   const {
@@ -25,6 +45,7 @@ export async function POST(request: Request) {
     provider?: string;
     classifyOnly?: boolean;
     treatAsNormal?: boolean;
+    runType?: "chat" | "debug" | "agent" | "refactor";
   };
   try {
     body = await request.json();
@@ -101,22 +122,21 @@ export async function POST(request: Request) {
 
   let apiKey: string | null = null;
   let providerId: ProviderId | null = null;
-  const triedProviders: ProviderId[] = [];
-  
+  let decryptFailed = false;
+
   for (const p of providersToTry) {
-    triedProviders.push(p);
     const { data: keyRow, error: keyError } = await supabase
       .from("provider_keys")
       .select("key_encrypted")
       .eq("user_id", user.id)
       .eq("provider", p)
-      .maybeSingle(); // Use maybeSingle() instead of single() to avoid throwing on no rows
-    
+      .maybeSingle();
+
     if (keyError) {
       console.error(`Error fetching key for ${p}:`, keyError);
       continue;
     }
-    
+
     if (keyRow?.key_encrypted) {
       try {
         apiKey = decrypt(keyRow.key_encrypted);
@@ -124,12 +144,19 @@ export async function POST(request: Request) {
         break;
       } catch (decryptError) {
         console.error(`Error decrypting key for ${p}:`, decryptError);
+        decryptFailed = true;
         continue;
       }
     }
   }
 
   if (!apiKey || !providerId) {
+    if (decryptFailed) {
+      return NextResponse.json(
+        { error: "Stored API key could not be decrypted. Please re-enter your API key in Settings → API Keys." },
+        { status: 400 }
+      );
+    }
     const requestedLabel = requestedProvider ? PROVIDER_LABELS[requestedProvider] : "Selected provider";
     return NextResponse.json(
       {
@@ -199,11 +226,15 @@ export async function POST(request: Request) {
     // Build enhanced messages with search context and rules
     const enhancedMessages: ChatMessage[] = [...messages];
     
-    // Load and add project rules
+    // Load and add project rules (non-throwing)
     let rulesPrompt = "";
     if (workspaceId) {
-      const rules = await loadRules(supabase, workspaceId);
-      rulesPrompt = formatRulesForPrompt(rules);
+      try {
+        const rules = await loadRules(supabase, workspaceId);
+        rulesPrompt = formatRulesForPrompt(rules);
+      } catch {
+        rulesPrompt = "";
+      }
     }
     
     if (searchResults.length > 0) {
@@ -246,12 +277,9 @@ export async function POST(request: Request) {
     // Save messages to persistent storage
     if (workspaceId) {
       const lastUserMessage = typeof lastMessage.content === "string" ? lastMessage.content : "";
-      await saveChatMessage(supabase, workspaceId, user.id, "user", lastUserMessage).catch(() => {
-        // Silently fail if save fails
-      });
-      await saveChatMessage(supabase, workspaceId, user.id, "assistant", content).catch(() => {
-        // Silently fail if save fails
-      });
+      const runType = body.runType ?? "chat";
+      await saveChatMessage(supabase, workspaceId, user.id, "user", lastUserMessage, { runType }).catch(() => {});
+      await saveChatMessage(supabase, workspaceId, user.id, "assistant", content, { runType }).catch(() => {});
     }
 
     const kind = detectErrorLogKind(typeof lastMessage.content === "string" ? lastMessage.content : "");
@@ -271,6 +299,10 @@ export async function POST(request: Request) {
   } catch (e) {
     const msg = e instanceof Error ? e.message : "LLM request failed";
     console.error("[POST /api/chat]", e);
-    return NextResponse.json({ error: msg }, { status: 500 });
+    const userMessage = msg.length > 300 ? `${msg.slice(0, 200)}…` : msg;
+    return NextResponse.json(
+      { error: userMessage },
+      { status: 502 }
+    );
   }
 }

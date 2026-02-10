@@ -2,7 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
-import { Download, FolderOpen, Github, GitBranch, GitPullRequest, MoreHorizontal, Pencil, Plus, RefreshCw, Settings, Trash2 } from "lucide-react";
+import { Download, FolderOpen, Github, GitBranch, GitPullRequest, MoreHorizontal, Pencil, Plus, RefreshCw, Settings, Shield, Trash2 } from "lucide-react";
+import { KeyboardShortcutsPanel } from "@/components/keyboard-shortcuts-panel";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -68,6 +69,23 @@ export function WorkspaceSelector() {
   const [newBranchName, setNewBranchName] = useState("");
   const [createBranchLoading, setCreateBranchLoading] = useState(false);
   const [commitMessage, setCommitMessage] = useState("");
+  const [safetyStats, setSafetyStats] = useState<{
+    totalRuns: number;
+    totalPromoted: number;
+    totalChecksPassed: number;
+    totalRolledBack: number;
+    bySource: Record<string, { total: number; promoted: number; checksPassed: number; rolledBack: number }>;
+  } | null>(null);
+  const [feedbackAnalyze, setFeedbackAnalyze] = useState<{
+    bySource: Record<string, { yes: number; no: number }>;
+    total: number;
+  } | null>(null);
+  const [membersInfo, setMembersInfo] = useState<{
+    ownerId: string;
+    isOwner: boolean;
+    collaborators: { userId: string; role: string }[];
+    note: string;
+  } | null>(null);
   const [commitPushLoading, setCommitPushLoading] = useState(false);
   const [commitPushConfirmOpen, setCommitPushConfirmOpen] = useState(false);
   const [lastPrUrl, setLastPrUrl] = useState<string | null>(null);
@@ -389,6 +407,24 @@ export function WorkspaceSelector() {
     setSettingsWorkspace(ws);
     setSettingsOpen(true);
   }
+
+  useEffect(() => {
+    if (!settingsOpen || !settingsWorkspace) {
+      setSafetyStats(null);
+      setFeedbackAnalyze(null);
+      setMembersInfo(null);
+      return;
+    }
+    Promise.all([
+      fetch(`/api/workspaces/${settingsWorkspace.id}/safety-stats`).then((r) => (r.ok ? r.json() : null)),
+      fetch("/api/feedback/analyze").then((r) => (r.ok ? r.json() : null)),
+      fetch(`/api/workspaces/${settingsWorkspace.id}/members`).then((r) => (r.ok ? r.json() : null)),
+    ]).then(([stats, feedback, members]) => {
+      setSafetyStats(stats ?? null);
+      setFeedbackAnalyze(feedback ?? null);
+      setMembersInfo(members ?? null);
+    });
+  }, [settingsOpen, settingsWorkspace?.id]);
 
   async function handleReimport(ws: Workspace) {
     if (!ws.github_repo_url) return;
@@ -985,6 +1021,50 @@ export function WorkspaceSelector() {
                   />
                 </button>
               </div>
+              <KeyboardShortcutsPanel />
+              <div className="space-y-2">
+                <Label className="text-sm font-medium flex items-center gap-2">
+                  <Shield className="h-4 w-4" />
+                  Safety & feedback
+                </Label>
+                <div className="rounded-lg border border-border bg-muted/30 p-3 text-sm space-y-2">
+                  {safetyStats ? (
+                    <>
+                      <p className="text-muted-foreground">
+                        Runs: {safetyStats.totalRuns} · Promoted: {safetyStats.totalPromoted} · Tests passed: {safetyStats.totalChecksPassed}
+                        {safetyStats.totalRolledBack > 0 ? ` · Rolled back: ${safetyStats.totalRolledBack}` : ""}
+                      </p>
+                      {Object.keys(safetyStats.bySource).length > 0 && (
+                        <p className="text-xs text-muted-foreground">
+                          By source: {Object.entries(safetyStats.bySource).map(([s, v]) => `${s}: ${v.promoted}/${v.total}`).join(", ")}
+                        </p>
+                      )}
+                    </>
+                  ) : (
+                    <p className="text-muted-foreground">Loading…</p>
+                  )}
+                  {feedbackAnalyze && feedbackAnalyze.total > 0 && (
+                    <p className="text-xs text-muted-foreground border-t border-border pt-2 mt-2">
+                      Feedback: {Object.entries(feedbackAnalyze.bySource).map(([s, v]) => `${s}: ${v.yes} yes, ${v.no} no`).join(" · ")}
+                    </p>
+                  )}
+                </div>
+              </div>
+              {membersInfo && (
+                <div className="space-y-2">
+                  <Label className="text-sm font-medium">Workspace roles</Label>
+                  <div className="rounded-lg border border-border bg-muted/30 p-3 text-sm">
+                    <p className="text-muted-foreground">
+                      {membersInfo.isOwner ? "You are the owner." : "You have access as a collaborator."}
+                      {" "}
+                      {membersInfo.collaborators.length === 0
+                        ? "No other members."
+                        : `${membersInfo.collaborators.length} collaborator(s).`}
+                    </p>
+                    <p className="text-xs text-muted-foreground mt-1">{membersInfo.note}</p>
+                  </div>
+                </div>
+              )}
               {settingsWorkspace.github_repo_url ? (
                 <>
                   <div className="space-y-1">

@@ -4,8 +4,9 @@ import { geminiProvider } from "./gemini-provider";
 import { perplexityProvider } from "./perplexity-provider";
 import { openRouterProvider } from "./openrouter-provider";
 import { ollamaProvider } from "./ollama-provider";
+import { lmstudioProvider } from "./lmstudio-provider";
 
-export const PROVIDERS = ["openrouter", "openai", "gemini", "perplexity", "ollama"] as const;
+export const PROVIDERS = ["openrouter", "openai", "gemini", "perplexity", "ollama", "lmstudio"] as const;
 export type ProviderId = (typeof PROVIDERS)[number];
 
 export const PROVIDER_LABELS: Record<ProviderId, string> = {
@@ -14,6 +15,7 @@ export const PROVIDER_LABELS: Record<ProviderId, string> = {
   gemini: "Google Gemini – free tier, daily limits",
   perplexity: "Perplexity",
   ollama: "Ollama (local)",
+  lmstudio: "LM Studio (local)",
 };
 
 export const PROVIDER_KEYS_URL: Record<ProviderId, string> = {
@@ -22,6 +24,7 @@ export const PROVIDER_KEYS_URL: Record<ProviderId, string> = {
   gemini: "https://aistudio.google.com/apikey",
   perplexity: "https://www.perplexity.ai/settings/api",
   ollama: "",
+  lmstudio: "",
 };
 
 // Free models available through OpenRouter. openrouter/free is a router that picks an available free model (most reliable).
@@ -41,6 +44,7 @@ const providerMap: Record<ProviderId, LLMProvider> = {
   gemini: geminiProvider,
   perplexity: perplexityProvider,
   ollama: ollamaProvider,
+  lmstudio: lmstudioProvider,
 };
 
 export function getProvider(id: ProviderId): LLMProvider {
@@ -71,6 +75,10 @@ export function getModelForProvider(
   if (providerId === "ollama") {
     const m = bodyModel?.trim();
     return m || undefined;
+  }
+  if (providerId === "lmstudio") {
+    const m = bodyModel?.trim();
+    return m || "local";
   }
   return undefined;
 }

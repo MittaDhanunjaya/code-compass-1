@@ -7,6 +7,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import type { FileEditStep } from "@/lib/agent/types";
 import { applyEdit } from "@/lib/agent/diff-engine";
 import { beautifyCode } from "@/lib/utils/code-beautifier";
+import { getLintCommands, getTestCommands, getRunCommands, detectStack } from "./stack-commands";
 
 export type SandboxSource = "agent" | "composer" | "debug-from-log";
 
@@ -15,6 +16,19 @@ export type SandboxCheckStatus = "passed" | "failed" | "skipped" | "not_configur
 export type SandboxCheckResult = {
   lint: { status: SandboxCheckStatus; logs: string };
   tests: { status: SandboxCheckStatus; logs: string };
+  run: { status: SandboxCheckStatus; logs: string; port?: number };
+};
+
+/** Metadata stored on sandbox_runs for evaluation (e.g. debug-from-log). */
+export type SandboxRunMetadata = {
+  error_log?: string;
+  error_type?: string;
+  model_used?: string;
+  proposed_edit_paths?: string[];
+  /** When user pasted error (debug-from-log); used with promoted_at for time-to-green. */
+  first_error_at?: string;
+  /** Hash of error snippet for regression detection (same error reappearing). */
+  error_fingerprint?: string;
 };
 
 /**
@@ -28,9 +42,10 @@ export async function createSandboxFromWorkspace(
   options: {
     source?: SandboxSource;
     filePaths?: string[];
+    metadata?: SandboxRunMetadata;
   } = {}
 ): Promise<string> {
-  const { source, filePaths } = options;
+  const { source, filePaths, metadata } = options;
 
   // Create sandbox run record
   const { data: sandboxRun, error: runError } = await supabase
@@ -39,6 +54,7 @@ export async function createSandboxFromWorkspace(
       workspace_id: workspaceId,
       user_id: userId,
       source: source ?? null,
+      metadata: metadata ?? null,
     })
     .select("id")
     .single();
@@ -50,7 +66,7 @@ export async function createSandboxFromWorkspace(
   const sandboxRunId = sandboxRun.id;
 
   // Fetch workspace files (all or filtered)
-  let query = supabase
+  const query = supabase
     .from("workspace_files")
     .select("path, content")
     .eq("workspace_id", workspaceId);
@@ -357,15 +373,8 @@ export async function syncSandboxToDisk(
   }
 }
 
-export type SandboxCheckStatus = "passed" | "failed" | "skipped" | "not_configured";
-
-export type SandboxCheckResult = {
-  lint: { status: SandboxCheckStatus; logs: string };
-  tests: { status: SandboxCheckStatus; logs: string };
-};
-
 /**
- * Run sandbox checks (lint and tests).
+ * Run sandbox checks (lint, tests, run).
  * Returns results for each check with status: passed, failed, skipped, or not_configured.
  */
 export async function runSandboxChecks(
@@ -392,93 +401,66 @@ export async function runSandboxChecks(
     // Ignore - just for debugging
   }
 
-  // Check if package.json exists to determine if this is a Node.js project
-  const { existsSync } = require("fs");
   const { join } = require("path");
   const packageJsonPath = join(sandboxDir, "package.json");
   const hasPackageJson = existsSync(packageJsonPath);
+  const stack = detectStack(sandboxDir);
 
-  // Run lint check (try npm run lint, npm lint, or skip if not available)
+  // Lint: use package.json scripts (test:unit, lint, etc.) or stack heuristic (pytest, go test, mvn, cargo)
+  const lintCommands = getLintCommands(sandboxDir);
   let lintResult: { status: SandboxCheckStatus; logs: string } = { status: "not_configured", logs: "" };
-  if (hasPackageJson) {
-    const lintCommands = ["npm run lint", "npm lint", "yarn lint", "pnpm lint"];
-    let lintFound = false;
-    for (const cmd of lintCommands) {
-      try {
-        const result = await executeCommandFn(cmd, sandboxDir);
-        if (result.exitCode !== null) {
-          // Command exists (even if it failed)
-          lintFound = true;
-          if (result.ok && result.exitCode === 0) {
-            lintResult = {
-              status: "passed",
-              logs: result.stdout || result.stderr || "Lint passed",
-            };
-          } else {
-            lintResult = {
-              status: "failed",
-              logs: `${result.stdout}\n${result.stderr}`.trim() || "Lint failed",
-            };
-          }
-          break;
+  let lintFound = false;
+  for (const cmd of lintCommands) {
+    try {
+      const result = await executeCommandFn(cmd, sandboxDir);
+      if (result.exitCode !== null) {
+        lintFound = true;
+        if (result.ok && result.exitCode === 0) {
+          lintResult = { status: "passed", logs: result.stdout || result.stderr || "Lint passed" };
+        } else {
+          lintResult = { status: "failed", logs: `${result.stdout}\n${result.stderr}`.trim() || "Lint failed" };
         }
-      } catch {
-        // Command not available, try next
-        continue;
+        break;
       }
+    } catch {
+      continue;
     }
-    if (!lintFound) {
-      lintResult = {
-        status: "not_configured",
-        logs: "No lint script found in package.json",
-      };
-    }
-  } else {
+  }
+  if (!lintFound) {
     lintResult = {
-      status: "skipped",
-      logs: "Not a Node.js project (no package.json)",
+      status: stack === "unknown" ? "skipped" : "not_configured",
+      logs: lintCommands.length === 0
+        ? (stack === "unknown" ? "No recognized project (Node/Python/Go/Java/Rust)" : `No lint command found for ${stack}`)
+        : "Lint script not available or failed to run",
     };
   }
 
-  // Run tests (try npm test, npm run test, etc.)
+  // Tests: same approach
+  const testCommands = getTestCommands(sandboxDir);
   let testResult: { status: SandboxCheckStatus; logs: string } = { status: "not_configured", logs: "" };
-  if (hasPackageJson) {
-    const testCommands = ["npm test", "npm run test", "yarn test", "pnpm test"];
-    let testFound = false;
-    for (const cmd of testCommands) {
-      try {
-        const result = await executeCommandFn(cmd, sandboxDir);
-        if (result.exitCode !== null) {
-          // Command exists (even if it failed)
-          testFound = true;
-          if (result.ok && result.exitCode === 0) {
-            testResult = {
-              status: "passed",
-              logs: result.stdout || result.stderr || "Tests passed",
-            };
-          } else {
-            testResult = {
-              status: "failed",
-              logs: `${result.stdout}\n${result.stderr}`.trim() || "Tests failed",
-            };
-          }
-          break;
+  let testFound = false;
+  for (const cmd of testCommands) {
+    try {
+      const result = await executeCommandFn(cmd, sandboxDir);
+      if (result.exitCode !== null) {
+        testFound = true;
+        if (result.ok && result.exitCode === 0) {
+          testResult = { status: "passed", logs: result.stdout || result.stderr || "Tests passed" };
+        } else {
+          testResult = { status: "failed", logs: `${result.stdout}\n${result.stderr}`.trim() || "Tests failed" };
         }
-      } catch {
-        // Command not available, try next
-        continue;
+        break;
       }
+    } catch {
+      continue;
     }
-    if (!testFound) {
-      testResult = {
-        status: "not_configured",
-        logs: "No test script found in package.json",
-      };
-    }
-  } else {
+  }
+  if (!testFound) {
     testResult = {
-      status: "skipped",
-      logs: "Not a Node.js project (no package.json)",
+      status: stack === "unknown" ? "skipped" : "not_configured",
+      logs: testCommands.length === 0
+        ? (stack === "unknown" ? "No recognized project" : `No test command found for ${stack}`)
+        : "Test script not available or failed to run",
     };
   }
 
@@ -812,10 +794,67 @@ export async function runSandboxChecks(
         };
       }
     } else {
-      runResult = {
-        status: "skipped",
-        logs: "No recognized project type (Node.js/Docker/Python) detected",
-      };
+      // Go / Java / Rust: use stack profile run commands
+      const profileRunCommands = getRunCommands(sandboxDir);
+      if (profileRunCommands.length > 0) {
+        runResult = { status: "not_configured", logs: "" };
+        for (const { cmd, isServer } of profileRunCommands) {
+          try {
+            let result: Awaited<ReturnType<typeof executeCommandFn>>;
+            if (isServer) {
+              const timeoutPromise = new Promise<Awaited<ReturnType<typeof executeCommandFn>>>((resolve) => {
+                setTimeout(() => {
+                  resolve({
+                    ok: false,
+                    exitCode: null,
+                    stdout: "",
+                    stderr: "Command timed out after 15 seconds (server may still be starting)",
+                    durationMs: 15000,
+                  });
+                }, 15000);
+              });
+              result = await Promise.race([executeCommandFn(cmd, sandboxDir), timeoutPromise]);
+            } else {
+              result = await executeCommandFn(cmd, sandboxDir);
+            }
+            const combinedOutput = `${result.stdout}\n${result.stderr}`.toLowerCase();
+            const hasError =
+              result.stderr.toLowerCase().includes("error") ||
+              result.stderr.toLowerCase().includes("failed") ||
+              (result.exitCode !== null && result.exitCode !== 0 && !isServer);
+            const hasSuccess =
+              combinedOutput.includes("listening") ||
+              combinedOutput.includes("running") ||
+              combinedOutput.includes("started") ||
+              (result.exitCode === 0) ||
+              (isServer && result.exitCode === null && !result.stderr.includes("timeout"));
+            if (hasError) {
+              runResult = { status: "failed", logs: `${result.stdout}\n${result.stderr}`.trim() || "Application failed to start" };
+              break;
+            }
+            if (hasSuccess) {
+              const portMatch = combinedOutput.match(/(?:listening|running|port).*?[:\s](\d{4,5})/i);
+              runResult = {
+                status: "passed",
+                logs: result.stdout || result.stderr || "Application started successfully",
+                port: portMatch ? parseInt(portMatch[1], 10) : undefined,
+              };
+              break;
+            }
+            if (isServer && result.stderr.includes("timeout")) continue;
+          } catch {
+            continue;
+          }
+        }
+        if (runResult.status === "not_configured" && profileRunCommands.length > 0) {
+          runResult = { status: "skipped", logs: "Profile run commands tried but none succeeded" };
+        }
+      } else {
+        runResult = {
+          status: "skipped",
+          logs: "No recognized project type (Node.js/Docker/Python/Go/Java/Rust) detected",
+        };
+      }
     }
   }
 

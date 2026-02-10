@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
-import { GitCompare, Save, Terminal, ArrowRight, List } from "lucide-react";
+import { GitCompare, Save, Terminal, ArrowRight, List, Pencil } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -10,6 +10,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { TabBar } from "@/components/tab-bar";
 import { TerminalPanel } from "@/components/terminal-panel";
 import { useEditor } from "@/lib/editor-context";
@@ -42,9 +44,30 @@ function getLanguageFromPath(path: string): string {
   return map[ext] ?? "plaintext";
 }
 
-const LSP_EXTENSIONS = new Set(["ts", "tsx", "js", "jsx", "mjs", "cjs"]);
+const LSP_EXTENSIONS = new Set(["ts", "tsx", "js", "jsx", "mjs", "cjs", "py"]);
 function isLspSupportedPath(path: string): boolean {
   return LSP_EXTENSIONS.has((path.split(".").pop() ?? "").toLowerCase());
+}
+
+type RenameEdit = { filePath: string; startLine: number; startColumn: number; endLine: number; endColumn: number; newText: string };
+
+function lineColToOffset(content: string, line1: number, col1: number): number {
+  const lines = content.split("\n");
+  let offset = 0;
+  for (let i = 0; i < line1 - 1 && i < lines.length; i++) offset += lines[i].length + 1;
+  const colIndex = Math.min(col1 - 1, lines[line1 - 1]?.length ?? 0);
+  return offset + colIndex;
+}
+
+function applyRenameEditsToContent(content: string, edits: RenameEdit[]): string {
+  const sorted = [...edits].sort((a, b) => a.startLine !== b.startLine ? b.startLine - a.startLine : b.startColumn - a.startColumn);
+  let result = content;
+  for (const e of sorted) {
+    const start = lineColToOffset(result, e.startLine, e.startColumn);
+    const end = lineColToOffset(result, e.endLine, e.endColumn);
+    result = result.slice(0, start) + e.newText + result.slice(end);
+  }
+  return result;
 }
 
 export function EditorArea() {
@@ -59,16 +82,48 @@ export function EditorArea() {
     setActiveTab,
     pendingCmdKSuggestion,
     setPendingCmdKSuggestion,
+    applyExternalEdits,
   } = useEditor();
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [diffOpen, setDiffOpen] = useState(false);
-  const [terminalVisible, setTerminalVisible] = useState(false);
+  const TERMINAL_VISIBLE_KEY = "aiforge-terminal-visible";
+  const [terminalVisible, setTerminalVisibleState] = useState(() => {
+    if (typeof window === "undefined") return false;
+    try {
+      return window.sessionStorage.getItem(TERMINAL_VISIBLE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const setTerminalVisible = useCallback((value: boolean | ((prev: boolean) => boolean)) => {
+    setTerminalVisibleState((prev) => {
+      const next = typeof value === "function" ? value(prev) : value;
+      try {
+        window.sessionStorage.setItem(TERMINAL_VISIBLE_KEY, next ? "1" : "0");
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    const showTerminal = () => setTerminalVisible(true);
+    window.addEventListener("aiforge-show-terminal", showTerminal);
+    return () => window.removeEventListener("aiforge-show-terminal", showTerminal);
+  }, [setTerminalVisible]);
+
   const [tabCompletionPending, setTabCompletionPending] = useState(false);
   const [referencesDialogOpen, setReferencesDialogOpen] = useState(false);
   const [referencesList, setReferencesList] = useState<{ filePath: string; line: number; context?: string }[]>([]);
   const [referencesSymbol, setReferencesSymbol] = useState<string | null>(null);
   const [referencesCurrentFileOnly, setReferencesCurrentFileOnly] = useState(false);
+  const [renameDialogOpen, setRenameDialogOpen] = useState(false);
+  const [renameInitialName, setRenameInitialName] = useState("");
+  const [renameNewName, setRenameNewName] = useState("");
+  const [renameError, setRenameError] = useState<string | null>(null);
+  const [renameApplying, setRenameApplying] = useState(false);
   const selectionDisposable = useRef<{ dispose: () => void } | null>(null);
   const tabCompletionDisposable = useRef<{ dispose: () => void } | null>(null);
   const tabCompletionContextRef = useRef({ workspaceId: null as string | null, filePath: null as string | null, language: "plaintext" });
@@ -88,11 +143,14 @@ export function EditorArea() {
   pendingCmdKSuggestionRef.current = pendingCmdKSuggestion;
   const activeTabRef = useRef(activeTab);
   activeTabRef.current = activeTab;
+  const workspaceIdRef = useRef(workspaceId);
+  workspaceIdRef.current = workspaceId;
   const editorRef = useRef<import("monaco-editor").editor.IStandaloneCodeEditor | null>(null);
   const cmdKGhostDecorationIdsRef = useRef<string[]>([]);
   const pendingGoToLineRef = useRef<{ path: string; line: number } | null>(null);
   const goToDefinitionRef = useRef<() => void>(() => {});
   const findReferencesRef = useRef<() => void>(() => {});
+  const renameSymbolRef = useRef<() => void>(() => {});
 
   const tab = activeTab ? getTab(activeTab) : null;
 
@@ -345,10 +403,91 @@ export function EditorArea() {
     [activeTab, getTab, openFile, setActiveTab, workspaceId]
   );
 
+  const openRenameDialog = useCallback(() => {
+    if (!editorRef.current || !activeTab) return;
+    const pos = editorRef.current.getPosition();
+    const model = editorRef.current.getModel();
+    if (!pos || !model) return;
+    if (!isLspSupportedPath(activeTab)) return;
+    const word = model.getWordAtPosition(pos);
+    const name = word?.word ?? "";
+    if (!name) return;
+    setRenameInitialName(name);
+    setRenameNewName(name);
+    setRenameError(null);
+    setRenameDialogOpen(true);
+  }, [activeTab]);
+
+  const performRename = useCallback(async () => {
+    const newName = renameNewName.trim();
+    if (!workspaceId || !activeTab || !newName || renameApplying) return;
+    const pos = editorRef.current?.getPosition();
+    if (!pos) return;
+    setRenameError(null);
+    setRenameApplying(true);
+    try {
+      const res = await fetch(`/api/workspaces/${workspaceId}/lsp/rename`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: activeTab, line: pos.lineNumber, character: pos.column, newName }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setRenameError(data.error || "Rename failed");
+        return;
+      }
+      const edits: RenameEdit[] = Array.isArray(data.edits) ? data.edits : [];
+      if (edits.length === 0) {
+        setRenameDialogOpen(false);
+        return;
+      }
+      const byPath = new Map<string, RenameEdit[]>();
+      for (const e of edits) byPath.set(e.filePath, [...(byPath.get(e.filePath) ?? []), e]);
+      const fullEdits: { path: string; content: string }[] = [];
+      for (const [filePath, fileEdits] of byPath) {
+        const tab = getTab(filePath);
+        let content = tab?.content;
+        if (content === undefined) {
+          const fileRes = await fetch(`/api/workspaces/${workspaceId}/files?path=${encodeURIComponent(filePath)}`);
+          if (!fileRes.ok) continue;
+          const fileData = await fileRes.json();
+          content = fileData.content ?? "";
+        }
+        fullEdits.push({ path: filePath, content: applyRenameEditsToContent(content, fileEdits) });
+      }
+      const applyRes = await fetch(`/api/workspaces/${workspaceId}/agent/apply-edits`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ edits: fullEdits, confirmLargeEdit: true }),
+      });
+      const applyData = await applyRes.json().catch(() => ({}));
+      if (!applyRes.ok && applyData.applied?.length === 0) {
+        setRenameError(applyData.error || "Failed to apply rename");
+        return;
+      }
+      applyExternalEdits(fullEdits);
+      setRenameDialogOpen(false);
+    } finally {
+      setRenameApplying(false);
+    }
+  }, [workspaceId, activeTab, renameNewName, renameApplying, getTab, applyExternalEdits]);
+
   useEffect(() => {
     goToDefinitionRef.current = goToDefinition;
     findReferencesRef.current = findReferences;
-  }, [goToDefinition, findReferences]);
+    renameSymbolRef.current = openRenameDialog;
+  }, [goToDefinition, findReferences, openRenameDialog]);
+
+  useEffect(() => {
+    const onCommand = (ev: Event) => {
+      const { commandId } = (ev as CustomEvent<{ commandId: string }>).detail ?? {};
+      if (commandId === "goToDefinition") goToDefinitionRef.current?.();
+      else if (commandId === "findReferences") findReferencesRef.current?.();
+      else if (commandId === "renameSymbol") renameSymbolRef.current?.();
+    };
+    window.addEventListener("command-palette-run", onCommand);
+    return () => window.removeEventListener("command-palette-run", onCommand);
+  }, []);
 
   const getLanguage = (path: string) => {
     const ext = path.split(".").pop() ?? "";
@@ -426,6 +565,17 @@ export function EditorArea() {
             >
               <List className="h-3.5 w-3.5" />
               References
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 gap-1"
+              onClick={openRenameDialog}
+              disabled={!isLspSupportedPath(tab.path)}
+              title="Rename symbol (F2)"
+            >
+              <Pencil className="h-3.5 w-3.5" />
+              Rename
             </Button>
             <Button
               variant={terminalVisible ? "default" : "outline"}
@@ -511,6 +661,40 @@ export function EditorArea() {
               </div>
             </DialogContent>
           </Dialog>
+          <Dialog open={renameDialogOpen} onOpenChange={setRenameDialogOpen}>
+            <DialogContent className="sm:max-w-md">
+              <DialogHeader>
+                <DialogTitle>Rename symbol</DialogTitle>
+              </DialogHeader>
+              <div className="grid gap-2 py-2">
+                <Label htmlFor="rename-new-name">New name</Label>
+                <Input
+                  id="rename-new-name"
+                  value={renameNewName}
+                  onChange={(e) => setRenameNewName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") performRename();
+                    if (e.key === "Escape") setRenameDialogOpen(false);
+                  }}
+                  placeholder={renameInitialName}
+                  disabled={renameApplying}
+                  autoFocus
+                  className="font-mono"
+                />
+                {renameError && (
+                  <p className="text-xs text-destructive">{renameError}</p>
+                )}
+                <div className="flex justify-end gap-2 pt-2">
+                  <Button variant="outline" size="sm" onClick={() => setRenameDialogOpen(false)} disabled={renameApplying}>
+                    Cancel
+                  </Button>
+                  <Button size="sm" onClick={performRename} disabled={renameApplying || !renameNewName.trim()}>
+                    {renameApplying ? "Renaming…" : "Rename"}
+                  </Button>
+                </div>
+              </div>
+            </DialogContent>
+          </Dialog>
           <div className={`flex-1 overflow-hidden ${terminalVisible ? "flex flex-col" : ""}`}>
             <div className={terminalVisible ? "flex-1 overflow-hidden" : "h-full"}>
               <MonacoEditor
@@ -531,6 +715,62 @@ export function EditorArea() {
                     label: "Find References",
                     keybindings: [monaco.KeyMod.Shift | monaco.KeyCode.F12],
                     run: () => findReferencesRef.current?.(),
+                  });
+                  editor.addAction({
+                    id: "rename-symbol",
+                    label: "Rename Symbol",
+                    keybindings: [monaco.KeyCode.F2],
+                    contextMenuGroupId: "1_modification",
+                    run: () => renameSymbolRef.current?.(),
+                  });
+                  editor.addAction({
+                    id: "editor-action-explain",
+                    label: "Explain",
+                    contextMenuGroupId: "ai",
+                    run: () => window.dispatchEvent(new CustomEvent("open-cmd-k", { detail: { action: "explain" } })),
+                  });
+                  editor.addAction({
+                    id: "editor-action-refactor",
+                    label: "Refactor",
+                    contextMenuGroupId: "ai",
+                    run: () => window.dispatchEvent(new CustomEvent("open-cmd-k", { detail: { action: "refactor" } })),
+                  });
+                  editor.addAction({
+                    id: "editor-action-add-tests",
+                    label: "Add tests",
+                    contextMenuGroupId: "ai",
+                    run: () => window.dispatchEvent(new CustomEvent("open-cmd-k", { detail: { action: "test" } })),
+                  });
+                  editor.addAction({
+                    id: "editor-action-fix-error",
+                    label: "Fix error",
+                    contextMenuGroupId: "ai",
+                    run: () => window.dispatchEvent(new CustomEvent("open-cmd-k", { detail: { action: "fix" } })),
+                  });
+                  editor.addAction({
+                    id: "editor-action-fix-diagnostics",
+                    label: "Fix diagnostics in this file",
+                    contextMenuGroupId: "ai",
+                    run: async () => {
+                      const wid = workspaceIdRef.current;
+                      const path = activeTabRef.current;
+                      const model = editor.getModel();
+                      if (!wid || !path || !model) return;
+                      try {
+                        const res = await fetch(`/api/workspaces/${wid}/lint`, {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ path, content: model.getValue() }),
+                        });
+                        const data = await res.json().catch(() => ({}));
+                        const diagnostics = Array.isArray(data.diagnostics) ? data.diagnostics : [];
+                        window.dispatchEvent(new CustomEvent("open-cmd-k", {
+                          detail: { action: "fix_diagnostics", diagnostics },
+                        }));
+                      } catch {
+                        window.dispatchEvent(new CustomEvent("open-cmd-k", { detail: { action: "fix_diagnostics" } }));
+                      }
+                    },
                   });
                   const applyCmdKSuggestion = () => {
                     const p = pendingCmdKSuggestionRef.current;

@@ -44,6 +44,7 @@ export const openAIProvider: LLMProvider = {
     const completion = await client.chat.completions.create({
       model: options?.model ?? "gpt-4o-mini",
       messages: built,
+      ...(options?.temperature != null && { temperature: options.temperature }),
     });
     const content = completion.choices[0]?.message?.content ?? "";
     const usage: LLMUsage | undefined = completion.usage

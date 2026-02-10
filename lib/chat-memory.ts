@@ -24,7 +24,7 @@ export async function saveChatMessage(
     user_id: userId,
     role,
     content,
-    metadata: metadata || {},
+    metadata: metadata ?? {},
   });
 
   // Clean up old messages (keep only last MAX_MESSAGES_PER_WORKSPACE)
@@ -45,22 +45,31 @@ export async function saveChatMessage(
   }
 }
 
+export type ChatMessageWithMeta = ChatMessage & { runType?: "chat" | "debug" | "agent" | "refactor" };
+
 /**
- * Load recent chat messages for a workspace.
+ * Load recent chat messages for a workspace, optionally filtered by run type.
  */
 export async function loadChatHistory(
   supabase: SupabaseClient,
   workspaceId: string,
   userId: string,
-  limit: number = 50
-): Promise<ChatMessage[]> {
-  const { data: messages, error } = await supabase
+  limit: number = 50,
+  runType?: "chat" | "debug" | "agent" | "refactor"
+): Promise<ChatMessageWithMeta[]> {
+  let query = supabase
     .from("chat_messages")
-    .select("role, content")
+    .select("role, content, metadata")
     .eq("workspace_id", workspaceId)
     .eq("user_id", userId)
     .order("created_at", { ascending: true })
     .limit(limit);
+
+  if (runType) {
+    query = query.eq("metadata->>runType", runType);
+  }
+
+  const { data: messages, error } = await query;
 
   if (error || !messages) {
     return [];
@@ -69,6 +78,7 @@ export async function loadChatHistory(
   return messages.map((m) => ({
     role: m.role as "user" | "assistant" | "system",
     content: m.content,
+    runType: (m.metadata as Record<string, string> | null)?.runType as ChatMessageWithMeta["runType"],
   }));
 }
 

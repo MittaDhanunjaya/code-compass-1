@@ -22,6 +22,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
   const isSettings = pathname === "/app/settings" || pathname.startsWith("/app/settings/");
+  const isWorkspaceSettings = /^\/app\/[^/]+\/settings\/?$/.test(pathname);
   const workspaceId =
     !isSettings && pathname.startsWith("/app/")
       ? pathname.replace("/app/", "").split("/")[0]
@@ -50,6 +51,26 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     return () => window.removeEventListener("open-rules-editor", openRules);
   }, []);
 
+  useEffect(() => {
+    const onCommand = (ev: Event) => {
+      const { commandId } = (ev as CustomEvent<{ commandId: string }>).detail ?? {};
+      if (commandId === "runAgentOnCurrentFile") setAiPanelTab("agent");
+      else if (commandId === "debugFromLog") setAiPanelTab("chat");
+      else if (commandId === "reviewAllChanges") setAiPanelTab("agent");
+    };
+    window.addEventListener("command-palette-run", onCommand);
+    return () => window.removeEventListener("command-palette-run", onCommand);
+  }, []);
+
+  // First-run wizard: when navigating with a pending playbook, switch to Agent tab
+  useEffect(() => {
+    if (!workspaceId) return;
+    try {
+      const pending = sessionStorage.getItem("pendingPlaybookId");
+      if (pending) setAiPanelTab("agent");
+    } catch {}
+  }, [workspaceId]);
+
   return (
     <div className="flex h-screen w-full overflow-hidden bg-background">
       {/* Left sidebar */}
@@ -60,14 +81,23 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
         <div className="flex-1 overflow-y-auto p-2">
           <WorkspaceSelector />
           {workspaceId && (
-            <button
-              type="button"
-              onClick={() => setRulesDialogOpen(true)}
-              className="mt-2 flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-              title="Edit project rules (.aiforge-rules) used by Agent and Composer"
-            >
-              Project rules
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={() => setRulesDialogOpen(true)}
+                className="mt-2 flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                title="Edit project rules (.aiforge-rules) used by Agent and Composer"
+              >
+                Project rules
+              </button>
+              <Link
+                href={`/app/${workspaceId}/settings`}
+                className="mt-1 flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                title="Stack & commands (.code-compass/config.json)"
+              >
+                Stack & Commands
+              </Link>
+            </>
           )}
           <div className="mt-4">
             <FileTree workspaceId={workspaceId} />
@@ -91,9 +121,9 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
         </div>
       </aside>
 
-      {/* Center: editor area */}
+      {/* Center: editor area or workspace settings */}
       <main className="flex flex-1 flex-col overflow-hidden">
-        {workspaceId ? <EditorArea /> : children}
+        {workspaceId && !isWorkspaceSettings ? <EditorArea /> : children}
       </main>
 
       {/* Right: AI panel */}

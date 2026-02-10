@@ -67,6 +67,7 @@ export const openRouterProvider: LLMProvider = {
     const completion = await client.chat.completions.create({
       model: normalizeModel(options?.model),
       messages: built,
+      ...(options?.temperature != null && { temperature: options.temperature }),
     });
     const content = completion.choices[0]?.message?.content ?? "";
     const usage: LLMUsage | undefined = completion.usage

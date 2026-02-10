@@ -14,10 +14,13 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { useEditor } from "@/lib/editor-context";
 import { PROVIDERS, type ProviderId } from "@/lib/llm/providers";
-import type { FileEditStep } from "@/lib/agent/types";
+import type { FileEditStep, ScopeMode } from "@/lib/agent/types";
+import { computeRunScope } from "@/lib/agent/scope";
 import type { ComposerScope } from "@/lib/composer/types";
 import { SAFE_EDIT_MAX_FILES } from "@/lib/protected-paths";
+import { COPY } from "@/lib/copy";
 import { ErrorWithAction } from "@/components/error-with-action";
+import { FeedbackPrompt } from "@/components/feedback-prompt";
 import { InlineEditDiffDialog } from "@/components/inline-edit-diff-dialog";
 
 const MonacoDiffEditor = dynamic(
@@ -76,6 +79,28 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
   const [reviewQueue, setReviewQueue] = useState<StepWithContent[]>([]);
   const [reviewIndex, setReviewIndex] = useState(0);
   const [rulesFile, setRulesFile] = useState<string | null>(null);
+  const [showComposerFeedback, setShowComposerFeedback] = useState(false);
+  const getStoredScopeMode = (): ScopeMode => {
+    if (typeof window === "undefined") return "normal";
+    const key = workspaceId ? `composer-scope-mode-${workspaceId}` : "composer-scope-mode-default";
+    const stored = localStorage.getItem(key);
+    return stored === "conservative" || stored === "aggressive" ? stored : "normal";
+  };
+  const [scopeMode, setScopeMode] = useState<ScopeMode>(getStoredScopeMode());
+  useEffect(() => {
+    setScopeMode(getStoredScopeMode());
+  }, [workspaceId]);
+  const composerRunScope = stepsWithContent.length > 0
+    ? computeRunScope(
+        stepsWithContent.map((s) => ({
+          type: "file_edit" as const,
+          path: s.path,
+          oldContent: s.oldContent ?? s.originalContent,
+          newContent: s.newContent,
+          description: s.description,
+        }))
+      )
+    : null;
 
   useEffect(() => {
     if (!workspaceId) return;
@@ -141,6 +166,7 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
           provider,
           model: provider === "openrouter" ? model : undefined,
           fileContents: Object.keys(fileContents).length ? fileContents : undefined,
+          scopeMode: scopeMode ?? "normal",
         }),
       });
       const rawText = await res.text();
@@ -172,7 +198,7 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
     } finally {
       setLoading(false);
     }
-  }, [workspaceId, instruction, scope, currentFilePath, provider, model, getTab]);
+  }, [workspaceId, instruction, scope, scopeMode, currentFilePath, provider, model, getTab]);
 
   const executeApply = useCallback(
     async (steps: FileEditStep[], confirmedProtectedPaths?: string[], clearPlanOnSuccess = true) => {
@@ -187,10 +213,11 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
             workspaceId,
             steps,
             confirmedProtectedPaths: confirmedProtectedPaths ?? undefined,
+            scopeMode: scopeMode ?? "normal",
           }),
         });
         const data = await res.json();
-        if (!res.ok) throw new Error(data.error || "Apply failed");
+        if (!res.ok) throw new Error(data.message || data.error || "Apply failed");
         if (data.needProtectedConfirmation && Array.isArray(data.protectedPaths)) {
           setProtectedPathsList(data.protectedPaths);
           setPendingStepsForProtected(steps);
@@ -221,6 +248,7 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
             return next;
           });
         }
+        setShowComposerFeedback(true);
         window.dispatchEvent(new CustomEvent("refresh-file-tree"));
       } catch (e) {
         setError(e instanceof Error ? e.message : "Apply failed");
@@ -228,7 +256,7 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
         setApplying(false);
       }
     },
-    [workspaceId, getTab, updateContent, openFile]
+    [workspaceId, scopeMode, getTab, updateContent, openFile]
   );
 
   const stepToFileEditStep = useCallback((s: StepWithContent): FileEditStep => ({
@@ -367,6 +395,25 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
               Workspace (≤{WORKSPACE_FILE_CAP} files)
             </button>
           </div>
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] text-muted-foreground">Scope mode:</span>
+            <select
+              value={scopeMode}
+              onChange={(e) => {
+                const v = e.target.value as ScopeMode;
+                setScopeMode(v);
+                if (typeof window !== "undefined") {
+                  const key = workspaceId ? `composer-scope-mode-${workspaceId}` : "composer-scope-mode-default";
+                  localStorage.setItem(key, v);
+                }
+              }}
+              className="flex h-7 rounded-md border border-input bg-background px-2 text-xs"
+            >
+              <option value="conservative">Conservative</option>
+              <option value="normal">Normal</option>
+              <option value="aggressive">Aggressive</option>
+            </select>
+          </div>
         </div>
         <Button
           className="w-full gap-2"
@@ -408,6 +455,11 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
         )}
         {stepsWithContent.length > 0 && (
           <>
+            {composerRunScope && (
+              <p className="text-xs text-muted-foreground">
+                Planned: {composerRunScope.fileCount} file(s), ≈{composerRunScope.approxLinesChanged} lines.
+              </p>
+            )}
             <div className="flex items-center gap-2">
               <Button variant="outline" size="sm" className="h-7 text-xs" onClick={selectAll}>
                 {selectedPaths.size === stepsWithContent.length ? "Deselect all" : "Select all"}
@@ -438,7 +490,7 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
             <div className="space-y-1">
               {stepsWithContent.map((step, index) => (
                 <div
-                  key={`${step.path}-${index}`}
+                  key={step.path}
                   className="rounded-lg border border-border bg-muted/20 overflow-hidden"
                 >
                   <div className="w-full flex items-center gap-2 px-3 py-2 text-left text-sm font-medium">
@@ -505,6 +557,14 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
             Describe a change and click Generate edits. Use <kbd className="rounded border border-border bg-muted/50 px-1 py-0.5 font-mono text-[10px]">Cmd+K</kbd> for quick refactor on the current file.
           </p>
         )}
+        {showComposerFeedback && (
+          <FeedbackPrompt
+            source="composer"
+            workspaceId={workspaceId}
+            onSubmitted={() => setShowComposerFeedback(false)}
+            className="py-2"
+          />
+        )}
       </div>
 
       <Dialog open={largeFileConfirmOpen} onOpenChange={(open) => { if (!open) { setLargeFileConfirmOpen(false); setPendingStepsForApply(null); } }}>
@@ -526,20 +586,20 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={protectedConfirmOpen} onOpenChange={(open) => { if (!open) { setProtectedConfirmOpen(false); setPendingStepsForProtected(null); setProtectedPathsList([]); } }}>
+      <Dialog open={protectedConfirmOpen} onOpenChange={(open) => { if (!open) { setProtectedConfirmOpen(false); setPendingStepsForProtected(null); setProtectedPathsList([]); setError("Protected file changes were skipped."); } }}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Protected files</DialogTitle>
+            <DialogTitle>{COPY.safety.title}</DialogTitle>
           </DialogHeader>
           <p className="text-sm text-muted-foreground py-2">
-            You&apos;re about to change protected files: {protectedPathsList.join(", ")}. These often contain secrets or important configuration. Are you sure you want the AI to edit them?
+            {COPY.safety.body(protectedPathsList)}
           </p>
           <DialogFooter>
-            <Button variant="outline" onClick={() => { setProtectedConfirmOpen(false); setPendingStepsForProtected(null); setProtectedPathsList([]); setError("Protected file changes were skipped."); }}>
-              Cancel
+            <Button variant="outline" onClick={() => { setProtectedConfirmOpen(false); setPendingStepsForProtected(null); setProtectedPathsList([]); setError("Skipped."); }}>
+              {COPY.safety.cancel}
             </Button>
             <Button onClick={confirmProtectedApply} disabled={applying}>
-              {applying ? "Applying…" : "Allow this time"}
+              {applying ? "Applying…" : COPY.safety.allow}
             </Button>
           </DialogFooter>
         </DialogContent>

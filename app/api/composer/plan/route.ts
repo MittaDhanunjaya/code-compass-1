@@ -2,7 +2,8 @@ import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { decrypt } from "@/lib/encrypt";
 import { getProvider, getModelForProvider, PROVIDERS, PROVIDER_LABELS, type ProviderId } from "@/lib/llm/providers";
-import type { FileEditStep } from "@/lib/agent/types";
+import type { FileEditStep, ScopeMode } from "@/lib/agent/types";
+import { applyScopeCaps } from "@/lib/agent/scope";
 import type { ComposerPlan, ComposerScope } from "@/lib/composer/types";
 import type { SearchResult } from "@/lib/indexing/types";
 import { resolveWorkspaceId } from "@/lib/workspaces/active-workspace";
@@ -65,6 +66,7 @@ export async function POST(request: Request) {
   const instruction = (body.instruction ?? "").trim();
   const scope = (body.scope ?? "current_file") as ComposerScope;
   const currentFilePath = body.currentFilePath?.trim() ?? null;
+  const scopeMode = (body.scopeMode === "conservative" || body.scopeMode === "aggressive") ? body.scopeMode : "normal";
 
   const workspaceId = await resolveWorkspaceId(supabase, user.id, body.workspaceId);
   if (!workspaceId || !instruction) {
@@ -279,42 +281,66 @@ export async function POST(request: Request) {
     );
 
     const trimmed = raw.trim();
-    const parseResult = parseJSONRobust<ComposerPlan>(trimmed, ["steps"]);
+    let parseResult = parseJSONRobust<ComposerPlan>(trimmed, ["steps"]);
+    if (!parseResult.success || !parseResult.data) {
+      const normalized = trimmed.replace(/^[\s\S]*?(\{[\s\S]*)$/, "$1");
+      if (normalized !== trimmed) {
+        parseResult = parseJSONRobust<ComposerPlan>(normalized, ["steps"]);
+      }
+    }
     if (!parseResult.success || !parseResult.data) {
       return NextResponse.json(
         {
-          error: `Failed to parse JSON: ${parseResult.error ?? "Unknown"}. Raw preview: ${(parseResult.raw ?? trimmed).slice(0, 500)}`,
+          error: `Failed to parse plan JSON. ${parseResult.error ?? "Unknown"}. Raw preview: ${(parseResult.raw ?? trimmed).slice(0, 300)}`,
         },
-        { status: 500 }
+        { status: 502 }
       );
     }
     const plan = parseResult.data;
 
     if (!plan || !Array.isArray(plan.steps)) {
       return NextResponse.json(
-        { error: "LLM did not return a valid plan (missing steps array)" },
-        { status: 500 }
+        { error: "LLM did not return a valid plan (missing steps array)." },
+        { status: 502 }
       );
     }
 
-    // Filter to file_edit only and ensure path is in candidate set; attach originalContent for diff UI
-    const fileEditSteps: FileEditStep[] = [];
-    const stepsWithContent: { path: string; originalContent: string; newContent: string; oldContent?: string; description?: string }[] = [];
+    // Dedupe by path: keep one step per path (last occurrence wins for newContent)
+    const stepsByPath = new Map<string, FileEditStep>();
     for (const step of plan.steps) {
-      if (step.type === "file_edit" && step.path && typeof step.newContent === "string") {
-        if (candidatePaths.includes(step.path)) {
-          fileEditSteps.push(step);
-          const original = fileContents[step.path] ?? "";
-          stepsWithContent.push({
-            path: step.path,
-            originalContent: original,
-            newContent: step.newContent,
-            oldContent: step.oldContent,
-            description: step.description,
-          });
-        }
-      }
+      if (step.type !== "file_edit" || typeof step.path !== "string" || typeof step.newContent !== "string") continue;
+      const path = step.path.trim();
+      if (!path || !candidatePaths.includes(path)) continue;
+      stepsByPath.set(path, {
+        type: "file_edit",
+        path,
+        newContent: step.newContent,
+        oldContent: step.oldContent,
+        description: step.description,
+      });
     }
+    let fileEditSteps = Array.from(stepsByPath.values());
+
+    if (fileEditSteps.length === 0) {
+      return NextResponse.json(
+        { error: "No valid file edit steps in plan. Ensure paths are in the candidate file list." },
+        { status: 502 }
+      );
+    }
+
+    if (scopeMode === "conservative" && fileEditSteps.length > 0) {
+      fileEditSteps = applyScopeCaps(fileEditSteps, "conservative", []);
+    }
+
+    const stepsWithContentBase = fileEditSteps.map((step) => ({
+      path: step.path,
+      originalContent: fileContents[step.path] ?? "",
+      newContent: step.newContent,
+      oldContent: step.oldContent,
+      description: step.description,
+    }));
+
+    const stepsWithContent = stepsWithContentBase;
 
     return NextResponse.json({
       plan: { steps: fileEditSteps, summary: plan.summary },

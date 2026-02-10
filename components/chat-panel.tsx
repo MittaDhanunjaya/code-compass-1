@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
-import { Send, Loader2, Sparkles, Check, ChevronDown, ChevronRight } from "lucide-react";
+import { Send, Loader2, Sparkles, Check, ChevronDown, ChevronRight, GitPullRequest } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -26,7 +26,9 @@ import { AgentPanel } from "@/components/agent-panel";
 import { ComposerPanel } from "@/components/composer-panel";
 import type { FileEditStep } from "@/lib/agent/types";
 import { SAFE_EDIT_MAX_FILES } from "@/lib/protected-paths";
+import { COPY } from "@/lib/copy";
 import { ErrorWithAction } from "@/components/error-with-action";
+import { FeedbackPrompt } from "@/components/feedback-prompt";
 
 const MonacoDiffEditor = dynamic(
   () => import("@monaco-editor/react").then((mod) => mod.DiffEditor),
@@ -127,6 +129,30 @@ export function ChatPanel({
   const [errorLogConfirmOpen, setErrorLogConfirmOpen] = useState(false);
   const [pendingLogMessage, setPendingLogMessage] = useState<string | null>(null);
   const [workspaceIdWhenLogPasted, setWorkspaceIdWhenLogPasted] = useState<string | null>(null);
+  const [historyFilter, setHistoryFilter] = useState<"all" | "chat" | "debug">("all");
+  const [showDebugFeedback, setShowDebugFeedback] = useState(false);
+  const [debugRetrySummary, setDebugRetrySummary] = useState<{ attempt1: boolean; attempt2: boolean } | null>(null);
+
+  // Restore chat history on mount and when filter changes
+  useEffect(() => {
+    if (!workspaceId) return;
+    const runType = historyFilter === "all" ? undefined : historyFilter;
+    const q = new URLSearchParams({ workspaceId });
+    if (runType) q.set("runType", runType);
+    fetch(`/api/chat/history?${q}`)
+      .then((r) => (r.ok ? r.json() : { messages: [] }))
+      .then((data: { messages?: { role: string; content: string }[] }) => {
+        const list = Array.isArray(data.messages) ? data.messages : [];
+        setMessages(
+          list.map((m) => ({
+            id: crypto.randomUUID(),
+            role: m.role === "user" ? "user" : "assistant",
+            content: m.content,
+          }))
+        );
+      })
+      .catch(() => {});
+  }, [workspaceId, historyFilter]);
 
   // Handle CMD+K actions
   useEffect(() => {
@@ -187,6 +213,7 @@ export function ChatPanel({
     }
   }, [activeFilePath, selection, getTab]);
   const [debugRunWorkspaceId, setDebugRunWorkspaceId] = useState<string | null>(null);
+  const [debugFromLogMeta, setDebugFromLogMeta] = useState<{ errorLog: string; errorType: string | null; modelUsed?: string; providerId?: string } | null>(null);
   const [noWorkspaceErrorLogNote, setNoWorkspaceErrorLogNote] = useState(false);
   const [mounted, setMounted] = useState(false);
 
@@ -195,6 +222,10 @@ export function ChatPanel({
     setMounted(true);
   }, []);
   const [errorLogConfirmAlreadyHasUserMessage, setErrorLogConfirmAlreadyHasUserMessage] = useState(false);
+  const [prAnalyzeOpen, setPrAnalyzeOpen] = useState(false);
+  const [prAnalyzeDiff, setPrAnalyzeDiff] = useState("");
+  const [prAnalyzeLoading, setPrAnalyzeLoading] = useState(false);
+  const [prAnalyzeResult, setPrAnalyzeResult] = useState<{ summary: string; risks: string[]; suggestions: string[] } | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -269,6 +300,9 @@ export function ChatPanel({
       setDebugLoading(true);
       setError(null);
       try {
+        const scopeMode = (typeof window !== "undefined" && wsId)
+          ? (localStorage.getItem(`composer-scope-mode-${wsId}`) || localStorage.getItem(`agent-scope-mode-${wsId}`) || "normal")
+          : "normal";
         const res = await fetch(`/api/workspaces/${wsId}/debug-from-log`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -276,6 +310,7 @@ export function ChatPanel({
             logText,
             provider,
             model: provider === "openrouter" ? model : undefined,
+            scopeMode: scopeMode === "conservative" || scopeMode === "aggressive" ? scopeMode : "normal",
           }),
         });
         const data = await res.json();
@@ -315,6 +350,12 @@ export function ChatPanel({
         setDebugReviewSteps(steps);
         setDebugSelectedPaths(new Set(steps.map((s) => s.path)));
         setDebugExpandedPath(null);
+        setDebugFromLogMeta({
+          errorLog: logText,
+          errorType: suspectedRootCause || null,
+          modelUsed: provider === "openrouter" ? model : undefined,
+          providerId: provider,
+        });
         let workspaceName = "this workspace";
         try {
           const nameRes = await fetch(`/api/workspaces/${wsId}`);
@@ -332,29 +373,33 @@ export function ChatPanel({
         const sandboxNote = steps.length > 0
           ? `\n\n**Note:** When you apply these changes, they will be tested in a sandbox (lint + tests) before being applied to your workspace. Only passing changes will be applied.`
           : "";
+        const assistantContent = `**Debugged from runtime logs — ${workspaceName}**\n\n${body}${
+          steps.length > 0
+            ? `\n\nProposed changes in ${steps.length} file(s). Review and apply below.${sandboxNote}`
+            : ""
+        }`;
         setMessages((prev) => [
           ...prev,
-          {
-            id: crypto.randomUUID(),
-            role: "assistant",
-            content: `**Debugged from runtime logs — ${workspaceName}**\n\n${body}${
-              steps.length > 0
-                ? `\n\nProposed changes in ${steps.length} file(s). Review and apply below.${sandboxNote}`
-                : ""
-            }`,
-          },
+          { id: crypto.randomUUID(), role: "assistant", content: assistantContent },
         ]);
+        fetch("/api/chat/save-message", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workspaceId: wsId, role: "assistant", content: assistantContent, runType: "debug" }),
+        }).catch(() => {});
       } catch (e) {
         const errMsg = e instanceof Error ? e.message : "Debug failed";
         setError(errMsg);
+        const failContent = `Debug failed: ${errMsg}`;
         setMessages((prev) => [
           ...prev,
-          {
-            id: crypto.randomUUID(),
-            role: "assistant",
-            content: `Debug failed: ${errMsg}`,
-          },
+          { id: crypto.randomUUID(), role: "assistant", content: failContent },
         ]);
+        fetch("/api/chat/save-message", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workspaceId: wsId, role: "assistant", content: failContent, runType: "debug" }),
+        }).catch(() => {});
       } finally {
         setDebugLoading(false);
       }
@@ -369,6 +414,9 @@ export function ChatPanel({
       setDebugApplying(true);
       setError(null);
       try {
+        const scopeMode = (typeof window !== "undefined" && effectiveWorkspaceId)
+          ? (localStorage.getItem(`composer-scope-mode-${effectiveWorkspaceId}`) || localStorage.getItem(`agent-scope-mode-${effectiveWorkspaceId}`) || "normal")
+          : "normal";
         const res = await fetch("/api/composer/execute", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -376,10 +424,28 @@ export function ChatPanel({
             workspaceId: effectiveWorkspaceId,
             steps,
             confirmedProtectedPaths: confirmedProtectedPaths ?? undefined,
+            source: "debug-from-log",
+            scopeMode: scopeMode === "conservative" || scopeMode === "aggressive" ? scopeMode : "normal",
+            debugFromLogMeta: debugFromLogMeta
+              ? {
+                  errorLog: debugFromLogMeta.errorLog,
+                  errorType: debugFromLogMeta.errorType ?? undefined,
+                  modelUsed: debugFromLogMeta.modelUsed,
+                  providerId: debugFromLogMeta.providerId,
+                }
+              : undefined,
           }),
         });
         const data = await res.json();
-        if (!res.ok) throw new Error(data.error || "Apply failed");
+        if (!res.ok) {
+          if (data.retried && data.attempt1 && data.attempt2) {
+            setDebugRetrySummary({
+              attempt1: data.attempt1.testsPassed === true,
+              attempt2: data.attempt2.testsPassed === true,
+            });
+          }
+          throw new Error(data.message || data.error || "Apply failed");
+        }
         if (data.needProtectedConfirmation && Array.isArray(data.protectedPaths)) {
           setDebugProtectedPathsList(data.protectedPaths);
           setDebugPendingStepsForProtected(steps);
@@ -389,14 +455,22 @@ export function ChatPanel({
         }
         const conflicts = (data.conflicts as { path: string; message: string }[]) ?? [];
         if (conflicts.length > 0) {
-          const msg = conflicts[0]?.message?.includes("debug-from-log")
-            ? conflicts.map((c) => c.message).join(" ")
-            : `Edit conflict(s): ${conflicts.map((c) => c.path).join(", ")} — file(s) changed since planning. Review manually or re-run with updated context.`;
+          const msg = conflicts.length === 1
+            ? COPY.conflict.single(conflicts[0].path)
+            : COPY.conflict.multiple(conflicts.map((c) => c.path));
           setError(msg);
         }
         // Store sandbox check results if available
         if (data.sandboxChecks) {
           setDebugSandboxChecks(data.sandboxChecks);
+        }
+        if (data.retried && data.attempt1 && data.attempt2) {
+          setDebugRetrySummary({
+            attempt1: data.attempt1.testsPassed === true,
+            attempt2: data.attempt2.testsPassed === true,
+          });
+        } else {
+          setDebugRetrySummary(null);
         }
         for (const path of data.filesEdited ?? []) {
           const fileRes = await fetch(
@@ -416,14 +490,17 @@ export function ChatPanel({
         setDebugSelectedPaths(new Set());
         setDebugRunWorkspaceId(null);
         setDebugSandboxChecks(null);
+        setDebugFromLogMeta(null);
+        setShowDebugFeedback(true);
         window.dispatchEvent(new CustomEvent("refresh-file-tree"));
       } catch (e) {
+        setDebugRetrySummary(null);
         setError(e instanceof Error ? e.message : "Apply failed");
       } finally {
         setDebugApplying(false);
       }
     },
-    [workspaceId, debugRunWorkspaceId, getTab, updateContent, openFile]
+    [workspaceId, debugRunWorkspaceId, debugFromLogMeta, getTab, updateContent, openFile]
   );
 
   const applyDebugSelected = useCallback(() => {
@@ -524,6 +601,7 @@ export function ChatPanel({
           provider,
           model: provider === "openrouter" ? model : undefined,
           treatAsNormal: options?.treatAsNormal,
+          runType: "chat",
         }),
       });
 
@@ -727,6 +805,35 @@ export function ChatPanel({
             </Button>
           )
         )}
+          {mounted && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm" className="h-7 text-xs font-medium">
+                  History: {historyFilter === "all" ? "All" : historyFilter === "chat" ? "Chat" : "Debug runs"} ▼
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={() => setHistoryFilter("all")} className={historyFilter === "all" ? "bg-accent" : ""}>
+                  All
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setHistoryFilter("chat")} className={historyFilter === "chat" ? "bg-accent" : ""}>
+                  Chat
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setHistoryFilter("debug")} className={historyFilter === "debug" ? "bg-accent" : ""}>
+                  Debug runs
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 text-xs font-medium"
+            onClick={() => { setPrAnalyzeOpen(true); setPrAnalyzeResult(null); setPrAnalyzeDiff(""); }}
+          >
+            <GitPullRequest className="h-3.5 w-3.5 mr-1" />
+            Analyze PR
+          </Button>
         </div>
       </div>
       <div className="flex-1 overflow-y-auto p-3 space-y-3">
@@ -779,7 +886,20 @@ export function ChatPanel({
           </div>
         )}
         {error && (
-          <ErrorWithAction message={error} />
+          <ErrorWithAction
+            message={error}
+            onRetry={
+              messages.length > 0 && messages[messages.length - 1]?.role === "user"
+                ? () => {
+                    setError(null);
+                    const last = messages[messages.length - 1];
+                    if (last?.role === "user" && last.content) {
+                      sendMessage(last.content, { skipAddingUserMessage: true });
+                    }
+                  }
+                : undefined
+            }
+          />
         )}
         {debugLoading && (
           <div className="mr-4 flex items-center gap-2 rounded-lg bg-muted px-3 py-2 text-sm text-muted-foreground">
@@ -939,6 +1059,7 @@ export function ChatPanel({
                   setDebugSummary(null);
                   setDebugRootCause(null);
                   setDebugSelectedPaths(new Set());
+                  setDebugFromLogMeta(null);
                 }}
               >
                 Discard
@@ -1065,6 +1186,19 @@ export function ChatPanel({
             </div>
           </div>
         )}
+        {debugRetrySummary && (
+          <p className="text-xs text-muted-foreground py-1">
+            Attempt 1: {debugRetrySummary.attempt1 ? "tests passed" : "tests failed"}. Attempt 2: {debugRetrySummary.attempt2 ? "tests passed" : "tests failed"}.
+          </p>
+        )}
+        {showDebugFeedback && (
+          <FeedbackPrompt
+            source="debug"
+            workspaceId={workspaceId}
+            onSubmitted={() => { setShowDebugFeedback(false); setDebugRetrySummary(null); }}
+            className="py-1"
+          />
+        )}
         <form
           className="flex gap-2"
           onKeyDown={(e) => {
@@ -1155,10 +1289,10 @@ export function ChatPanel({
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Protected files</DialogTitle>
+            <DialogTitle>{COPY.safety.title}</DialogTitle>
           </DialogHeader>
           <p className="text-sm text-muted-foreground py-2">
-            You&apos;re about to change protected files: {debugProtectedPathsList.join(", ")}. Are you sure?
+            {COPY.safety.body(debugProtectedPathsList)}
           </p>
           <DialogFooter>
             <Button
@@ -1167,10 +1301,10 @@ export function ChatPanel({
                 setDebugProtectedConfirmOpen(false);
                 setDebugPendingStepsForProtected(null);
                 setDebugProtectedPathsList([]);
-                setError("Protected file changes were skipped.");
+                setError("Skipped.");
               }}
             >
-              Cancel
+              {COPY.safety.cancel}
             </Button>
             <Button
               onClick={() => {
@@ -1183,7 +1317,7 @@ export function ChatPanel({
               }}
               disabled={debugApplying}
             >
-              {debugApplying ? "Applying…" : "Allow this time"}
+              {debugApplying ? COPY.debug.applying : COPY.safety.allow}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -1225,9 +1359,81 @@ export function ChatPanel({
               }}
               disabled={debugApplying}
             >
-              {debugApplying ? "Applying…" : "Continue"}
+              {debugApplying ? COPY.debug.applying : "Continue"}
             </Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={prAnalyzeOpen} onOpenChange={(o) => { setPrAnalyzeOpen(o); if (!o) setPrAnalyzeResult(null); }}>
+        <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Analyze PR diff</DialogTitle>
+          </DialogHeader>
+          {!prAnalyzeResult ? (
+            <>
+              <p className="text-sm text-muted-foreground">Paste a pull request diff (patch) to get a summary, risks, and suggested fixes or tests.</p>
+              <Textarea
+                placeholder="Paste diff here (e.g. from git diff or GitHub PR Files)..."
+                value={prAnalyzeDiff}
+                onChange={(e) => setPrAnalyzeDiff(e.target.value)}
+                className="min-h-[200px] font-mono text-xs"
+                disabled={prAnalyzeLoading}
+              />
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setPrAnalyzeOpen(false)}>Cancel</Button>
+                <Button
+                  disabled={!prAnalyzeDiff.trim() || prAnalyzeLoading}
+                  onClick={async () => {
+                    setPrAnalyzeLoading(true);
+                    setPrAnalyzeResult(null);
+                    try {
+                      const res = await fetch("/api/pr/analyze", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ diffText: prAnalyzeDiff.trim(), workspaceId: workspaceId ?? undefined }),
+                      });
+                      const data = await res.json();
+                      if (!res.ok) throw new Error(data.error ?? "Analysis failed");
+                      setPrAnalyzeResult({ summary: data.summary ?? "", risks: data.risks ?? [], suggestions: data.suggestions ?? [] });
+                    } catch (e) {
+                      setPrAnalyzeResult({
+                        summary: "",
+                        risks: [e instanceof Error ? e.message : "Analysis failed"],
+                        suggestions: [],
+                      });
+                    } finally {
+                      setPrAnalyzeLoading(false);
+                    }
+                  }}
+                >
+                  {prAnalyzeLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : "Analyze"}
+                </Button>
+              </DialogFooter>
+            </>
+          ) : (
+            <>
+              <div className="space-y-3 text-sm">
+                {prAnalyzeResult.summary && <p><span className="font-medium">Summary:</span> {prAnalyzeResult.summary}</p>}
+                {prAnalyzeResult.risks.length > 0 && (
+                  <div>
+                    <p className="font-medium mb-1">Risks</p>
+                    <ul className="list-disc list-inside space-y-0.5 text-muted-foreground">{prAnalyzeResult.risks.map((r, i) => <li key={i}>{r}</li>)}</ul>
+                  </div>
+                )}
+                {prAnalyzeResult.suggestions.length > 0 && (
+                  <div>
+                    <p className="font-medium mb-1">Suggestions</p>
+                    <ul className="list-disc list-inside space-y-0.5 text-muted-foreground">{prAnalyzeResult.suggestions.map((s, i) => <li key={i}>{s}</li>)}</ul>
+                  </div>
+                )}
+              </div>
+              <DialogFooter>
+                <Button variant="outline" onClick={() => { setPrAnalyzeResult(null); setPrAnalyzeDiff(""); }}>New analysis</Button>
+                <Button onClick={() => setPrAnalyzeOpen(false)}>Close</Button>
+              </DialogFooter>
+            </>
+          )}
         </DialogContent>
       </Dialog>
     </div>

@@ -77,3 +77,6 @@ export type AgentExecuteResult = {
   /** File paths where edit was skipped due to conflict (file changed since planning). */
   filesSkippedDueToConflict?: string[];
 };
+
+/** Scope mode for planning: limits how many files/lines can be changed. */
+export type ScopeMode = "conservative" | "normal" | "aggressive";

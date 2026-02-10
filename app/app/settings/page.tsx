@@ -74,7 +74,7 @@ export default function SettingsPage() {
     if (tab === "keys") setActiveTab("keys");
     else if (tab === "safety") setActiveTab("safety");
     else if (tab === "shortcuts") setActiveTab("shortcuts");
-    else if (github) setActiveTab("github");
+    else if (tab === "github" || github) setActiveTab("github");
   }, [searchParams]);
 
   useEffect(() => {

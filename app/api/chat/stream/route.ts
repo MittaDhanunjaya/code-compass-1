@@ -120,6 +120,14 @@ export async function POST(request: Request) {
   }
 
   if (providersWithKeys.length === 0) {
+    const { data: anyKeyRow } = await supabase.from("provider_keys").select("id").eq("user_id", user.id).limit(1);
+    const hasStoredKey = (anyKeyRow ?? []).length > 0;
+    if (hasStoredKey) {
+      return new Response(
+        JSON.stringify({ error: "Stored API key could not be decrypted. Please re-enter your API key in Settings → API Keys." }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
     const triedLabels = providersToTry.map(p => PROVIDER_LABELS[p]).join(", ");
     const freeOptions = "OpenRouter (free models available) or Gemini (free tier)";
     return new Response(
@@ -136,33 +144,37 @@ export async function POST(request: Request) {
   const stream = new ReadableStream({
     async start(controller) {
       const encoder = new TextEncoder();
-      let lastError: unknown = null;
-      for (const { providerId, apiKey } of providersWithKeys) {
-        try {
-          const provider = getProvider(providerId);
-          const modelOpt = getModelForProvider(providerId, body.model);
-          for await (const chunk of provider.stream(messages, apiKey, {
-            context: body.context,
-            model: modelOpt,
-          })) {
-            safeEnqueue(controller, encoder, chunk);
-          }
-          lastError = null;
-          break;
-        } catch (e) {
-          lastError = e;
-          if (!isRateLimitError(e) && !isInvalidModelError(e)) {
-            safeEnqueue(controller, encoder, `[Error: ${getUserFacingError(e)}]`);
+      try {
+        let lastError: unknown = null;
+        for (const { providerId, apiKey } of providersWithKeys) {
+          try {
+            const provider = getProvider(providerId);
+            const modelOpt = getModelForProvider(providerId, body.model);
+            for await (const chunk of provider.stream(messages, apiKey, {
+              context: body.context,
+              model: modelOpt,
+            })) {
+              safeEnqueue(controller, encoder, chunk);
+            }
+            lastError = null;
             break;
+          } catch (e) {
+            lastError = e;
+            if (!isRateLimitError(e) && !isInvalidModelError(e)) {
+              safeEnqueue(controller, encoder, `[Error: ${getUserFacingError(e)}]`);
+              break;
+            }
           }
         }
-      }
-      if (lastError != null && (isRateLimitError(lastError) || isInvalidModelError(lastError))) {
-        safeEnqueue(
-          controller,
-          encoder,
-          `[Error: ${getUserFacingError(lastError)}. Try selecting a different provider (e.g. OpenAI) in the dropdown above if you have an API key.]`
-        );
+        if (lastError != null && (isRateLimitError(lastError) || isInvalidModelError(lastError))) {
+          safeEnqueue(
+            controller,
+            encoder,
+            `[Error: ${getUserFacingError(lastError)}. Try selecting a different provider (e.g. OpenAI) in the dropdown above if you have an API key.]`
+          );
+        }
+      } catch (e) {
+        safeEnqueue(controller, encoder, `[Error: ${getUserFacingError(e)}]`);
       }
       safeClose(controller);
     },

@@ -12,6 +12,8 @@ type ErrorWithActionProps = {
   className?: string;
   /** If not provided, derived from message (API key → Settings, rate limit → Settings / change model). */
   action?: ErrorAction | null;
+  /** Optional retry callback; when set, a "Retry" button is shown. */
+  onRetry?: () => void;
 };
 
 function deriveAction(message: string): ErrorAction | null {
@@ -62,6 +64,7 @@ export function ErrorWithAction({
   message,
   className = "",
   action: actionProp,
+  onRetry,
 }: ErrorWithActionProps) {
   const action = actionProp ?? deriveAction(message);
   return (
@@ -78,6 +81,18 @@ export function ErrorWithAction({
           >
             {action.label}
           </Link>
+        </>
+      )}
+      {onRetry && (
+        <>
+          {" "}
+          <button
+            type="button"
+            onClick={onRetry}
+            className="font-medium underline underline-offset-2 hover:no-underline"
+          >
+            Retry
+          </button>
         </>
       )}
     </div>

@@ -1,8 +1,13 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { decrypt } from "@/lib/encrypt";
-import { getProvider, getModelForProvider, PROVIDERS, type ProviderId } from "@/lib/llm/providers";
+import { getModelForProvider, PROVIDERS, type ProviderId } from "@/lib/llm/providers";
+import { applyEnvRouting } from "@/lib/llm/task-routing";
+import { getPatchModelCandidates } from "@/lib/llm/ab-stats";
+import { invokeChatWithFallback, type InvokeChatCandidate } from "@/lib/llm/invoke";
 import { createAgentEvent } from "@/lib/agent-events";
+import { detectStackFromPaths } from "@/lib/sandbox/stack-commands";
+import { getDebugPromptHintsForStack } from "@/lib/sandbox/stack-profiles";
 
 const MAX_FILES_FOR_DEBUG = 25;
 const SNIPPET_PADDING = 40;
@@ -265,12 +270,14 @@ export async function POST(request: Request, { params }: RouteParams) {
   }
 
   const logText = typeof body.logText === "string" ? body.logText.trim() : "";
+  const scopeMode = body.scopeMode === "conservative" || body.scopeMode === "aggressive" ? body.scopeMode : "normal";
   if (!logText) {
     return NextResponse.json(
       { error: "logText is required" },
       { status: 400 }
     );
   }
+  const fileLimit = scopeMode === "conservative" ? 5 : scopeMode === "aggressive" ? 40 : MAX_FILES_FOR_DEBUG;
 
   const { data: workspace } = await supabase
     .from("workspaces")
@@ -292,7 +299,7 @@ export async function POST(request: Request, { params }: RouteParams) {
     .select("path, content")
     .eq("workspace_id", workspaceId)
     .order("path", { ascending: true })
-    .limit(MAX_FILES_FOR_DEBUG);
+    .limit(fileLimit);
 
   const files = (fileRows ?? []).map((r) => ({
     path: r.path,
@@ -404,7 +411,11 @@ export async function POST(request: Request, { params }: RouteParams) {
     .filter(Boolean)
     .join(", ");
 
-  const userMessage = `**RUNTIME ERROR ANALYSIS REQUEST**
+  const workspacePaths = files.map((f) => f.path);
+  const stack = detectStackFromPaths(workspacePaths);
+  const stackHints = getDebugPromptHintsForStack(stack);
+
+  const userMessage = `${stackHints}**RUNTIME ERROR ANALYSIS REQUEST**
 
 **Error Metadata:**
 ${metaBlob}
@@ -444,31 +455,55 @@ ${fileContext}
 - Fix the root cause completely - don't leave related issues unfixed.
 - Output ONLY the JSON object, no markdown formatting.`;
 
-  const requestedProvider = (body.provider ?? "openrouter") as ProviderId;
-  const providersToTry = PROVIDERS.includes(requestedProvider)
-    ? [requestedProvider, ...PROVIDERS.filter((p) => p !== requestedProvider)]
-    : [...PROVIDERS];
+  applyEnvRouting();
 
-  let apiKey: string | null = null;
-  let providerId: ProviderId | null = null;
-  for (const p of providersToTry) {
-    const key = await getApiKey(supabase, user.id, p);
-    if (key) {
-      apiKey = key;
-      providerId = p;
-      break;
+  const requestedProvider = (body.provider ?? "openrouter") as ProviderId;
+  const useTaskRouting = !body.provider && !body.model;
+  let candidates: InvokeChatCandidate[];
+
+  if (useTaskRouting) {
+    const patchCandidates = await getPatchModelCandidates(supabase, user.id, "debug");
+    candidates = [];
+    for (const c of patchCandidates) {
+      const key = await getApiKey(supabase, user.id, c.providerId as ProviderId);
+      if (c.providerId === "ollama" || c.providerId === "lmstudio" || key) {
+        candidates.push({
+          providerId: c.providerId as ProviderId,
+          model: c.modelId,
+          apiKey: key ?? "",
+        });
+      }
     }
+  } else {
+    const providersToTry = PROVIDERS.includes(requestedProvider)
+      ? [requestedProvider, ...PROVIDERS.filter((p) => p !== requestedProvider)]
+      : [...PROVIDERS];
+    let apiKey: string | null = null;
+    let providerId: ProviderId | null = null;
+    for (const p of providersToTry) {
+      const key = await getApiKey(supabase, user.id, p);
+      if (key) {
+        apiKey = key;
+        providerId = p;
+        break;
+      }
+    }
+    if (!apiKey || !providerId) {
+      return NextResponse.json(
+        { error: "No API key configured. Add one in API Key settings." },
+        { status: 400 }
+      );
+    }
+    const modelOpt = getModelForProvider(providerId, body.model);
+    candidates = [{ providerId, model: modelOpt ?? undefined, apiKey }];
   }
 
-  if (!apiKey || !providerId) {
+  if (candidates.length === 0) {
     return NextResponse.json(
       { error: "No API key configured. Add one in API Key settings." },
       { status: 400 }
     );
   }
-
-  const provider = getProvider(providerId);
-  const modelOpt = getModelForProvider(providerId, body.model);
 
   const events: DebugFromLogResponse["events"] = [];
   events.push({
@@ -478,13 +513,15 @@ ${fileContext}
   });
 
   try {
-    const { content } = await provider.chat(
-      [
-        { role: "system", content: DEBUG_SYSTEM },
-        { role: "user", content: userMessage },
-      ],
-      apiKey,
-      { model: modelOpt }
+    const { content } = await invokeChatWithFallback(
+      {
+        messages: [
+          { role: "system", content: DEBUG_SYSTEM },
+          { role: "user", content: userMessage },
+        ],
+        task: "debug",
+      },
+      candidates
     );
 
     const trimmed = (content ?? "").trim();

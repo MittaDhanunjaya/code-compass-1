@@ -28,6 +28,15 @@ export interface AgentEvent {
       ratio?: number;
       lineDelta?: number;
     };
+    /** Planned run scope (file count, approx lines). */
+    scope?: { fileCount: number; approxLinesChanged: number };
+    /** Scope mode used for this run. */
+    scopeMode?: "conservative" | "normal" | "aggressive";
+    /** Debug-from-log retry. */
+    retried?: boolean;
+    retryReason?: string;
+    attempt1?: { testsPassed: boolean; logs?: string };
+    attempt2?: { testsPassed: boolean; logs?: string };
   };
   createdAt: string;     // ISO timestamp
 }

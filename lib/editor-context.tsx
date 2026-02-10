@@ -5,6 +5,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -36,6 +37,8 @@ type EditorContextValue = {
   updateContent: (path: string, content: string) => void;
   saveFile: (path: string) => Promise<void>;
   getTab: (path: string) => Tab | undefined;
+  /** Apply edits from an external source (e.g. rename symbol); updates tabs and marks not dirty. */
+  applyExternalEdits: (edits: { path: string; content: string }[]) => void;
   workspaceId: string | null;
   setWorkspaceId: (id: string | null) => void;
 };
@@ -54,15 +57,72 @@ export function EditorProvider({
   const [selection, setSelectionState] = useState<EditorSelection>(null);
   const [pendingCmdKSuggestion, setPendingCmdKSuggestion] = useState<PendingCmdKSuggestion>(null);
   const [wsId, setWsId] = useState<string | null>(workspaceId);
+  const restoredForWorkspaceRef = useRef<string | null>(null);
 
   useEffect(() => {
     setWsId(workspaceId);
-    if (!workspaceId) {
-      setTabs([]);
-      setActiveTabState(null);
-      setSelectionState(null);
-    }
+    setTabs([]);
+    setActiveTabState(null);
+    if (!workspaceId) setSelectionState(null);
+    restoredForWorkspaceRef.current = null;
   }, [workspaceId]);
+
+  const SESSION_KEY = (id: string) => `editor-session-${id}`;
+
+  // Persist open tabs and active tab per workspace
+  useEffect(() => {
+    if (!wsId || tabs.length === 0) return;
+    try {
+      localStorage.setItem(
+        SESSION_KEY(wsId),
+        JSON.stringify({
+          paths: tabs.map((t) => t.path),
+          activePath: activeTab,
+        })
+      );
+    } catch (_) {}
+  }, [wsId, tabs, activeTab]);
+
+  // Restore session when workspace loads and we have no tabs (reload or switch); only once per workspace
+  useEffect(() => {
+    if (!wsId || tabs.length > 0 || restoredForWorkspaceRef.current === wsId) return;
+    const raw = localStorage.getItem(SESSION_KEY(wsId));
+    if (!raw) return;
+    let session: { paths: string[]; activePath: string | null };
+    try {
+      session = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (!session.paths?.length) return;
+    restoredForWorkspaceRef.current = wsId;
+    let cancelled = false;
+    (async () => {
+      const contents = await Promise.all(
+        session.paths.map((path: string) =>
+          fetch(
+            `/api/workspaces/${wsId}/files?path=${encodeURIComponent(path)}`
+          ).then((r) => (r.ok ? r.json() : { content: "" }))
+        )
+      );
+      if (cancelled) return;
+      const newTabs: Tab[] = session.paths.map((path, i) => ({
+        path,
+        content: contents[i]?.content ?? "",
+        dirty: false,
+        savedContent: contents[i]?.content ?? "",
+      }));
+      setTabs(newTabs);
+      setActiveTabState(
+        session.activePath && session.paths.includes(session.activePath)
+          ? session.activePath
+          : session.paths[0]
+      );
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [wsId, tabs.length]);
 
   const openFile = useCallback((path: string, content: string) => {
     setTabs((prev) => {
@@ -143,6 +203,18 @@ export function EditorProvider({
     [tabs]
   );
 
+  const applyExternalEdits = useCallback((edits: { path: string; content: string }[]) => {
+    if (edits.length === 0) return;
+    setTabs((prev) => {
+      const byPath = new Map(edits.map((e) => [e.path, e.content]));
+      return prev.map((t) => {
+        const content = byPath.get(t.path);
+        if (content === undefined) return t;
+        return { ...t, content, savedContent: content, dirty: false };
+      });
+    });
+  }, []);
+
   const value: EditorContextValue = {
     tabs,
     activeTab,
@@ -156,6 +228,7 @@ export function EditorProvider({
     updateContent,
     saveFile,
     getTab,
+    applyExternalEdits,
     workspaceId: wsId,
     setWorkspaceId: setWsId,
   };

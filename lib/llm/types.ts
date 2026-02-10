@@ -15,6 +15,8 @@ export type ChatContext = {
 export type ChatOptions = {
   context?: ChatContext | null;
   model?: string;
+  /** 0 = deterministic, higher = more variation. Use ~0.2–0.4 for debug to reduce repetitive output. */
+  temperature?: number;
 };
 
 export type LLMUsage = {

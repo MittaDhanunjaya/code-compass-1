@@ -3,6 +3,8 @@ import { createClient } from "@/lib/supabase/server";
 import { getProvider, getModelForProvider, OPENROUTER_FREE_MODELS, PROVIDERS, PROVIDER_LABELS, type ProviderId } from "@/lib/llm/providers";
 import { isRateLimitError } from "@/lib/llm/rate-limit";
 import type { AgentPlan } from "@/lib/agent/types";
+import type { ScopeMode } from "@/lib/agent/types";
+import { computeRunScope, applyScopeCaps } from "@/lib/agent/scope";
 import { createAgentEvent, formatStreamEvent, type AgentEvent } from "@/lib/agent-events";
 import { detectErrorLogKind } from "@/lib/agent/error-log-utils";
 import { safeClose, safeEnqueue } from "@/lib/stream-utils";
@@ -11,6 +13,7 @@ import { loadRules, formatRulesForPrompt } from "@/lib/rules";
 import { buildIntelligentContext, formatIntelligentContext } from "@/lib/indexing/intelligent-context";
 import { learnCodebasePatterns, formatLearnedPatterns } from "@/lib/indexing/pattern-learning";
 import { multiStepReasoning } from "@/lib/agent/chain-of-thought";
+import { applyEnvRouting } from "@/lib/llm/task-routing";
 
 // Same system prompt as plan route, but with instruction to emit reasoning messages
 const PLAN_SYSTEM = `You are an intelligent coding agent planner. Your job is to understand the user's request, analyze the codebase, and create a plan that accomplishes the task.
@@ -91,6 +94,7 @@ When fixing errors or bugs (CRITICAL - minimal edits):
 - **Prefer oldContent/newContent** for targeted replacements of the specific lines that cause the bug. Do not replace entire files or handlers when fixing a single bug.
 - If the user says "fix the error" or "fix the 500", identify the single root cause and change only what is necessary. Do not simplify, refactor, or remove unrelated code.
 - **Never delete code the user did not ask to remove.** Preserve existing logic; only fix the faulty part (e.g. a wrong URL, a missing character, a typo).
+- **Fix the actual code or config, not only documentation.** When the user reports a runtime error, "port in use", "GET /api/… 500", or similar, you MUST include at least one file_edit step that changes executable code or configuration (e.g. server port, API handler, .env, or config file). Do not add or change only README, HOW_TO_RUN, or comments. The fix must address the root cause in code or config.
 
 When creating projects:
 - **Think about completeness**: Will this actually run? Include README or HOW_TO_RUN, dependencies, and verify steps in dependency order.
@@ -125,6 +129,7 @@ export async function POST(request: Request) {
     fileList?: string[];
     fileContents?: Record<string, string>;
     useIndex?: boolean;
+    scopeMode?: ScopeMode;
   };
   try {
     body = await request.json();
@@ -163,6 +168,7 @@ export async function POST(request: Request) {
       };
 
       try {
+        applyEnvRouting();
         emit(createAgentEvent('status', 'Agent started planning...'));
 
         const messageKind = detectErrorLogKind(instruction);
@@ -172,7 +178,6 @@ export async function POST(request: Request) {
 
         let apiKey: string | null = null;
         let providerId: ProviderId | null = null;
-        let modelOpt: string | undefined;
 
         const { resolveInvocationConfig, getConfigByRole } = await import("@/lib/models/invocation-config");
         const configs = await resolveInvocationConfig(supabase, user.id, {
@@ -187,7 +192,7 @@ export async function POST(request: Request) {
         const inv = getConfigByRole(configs, "planner") ?? configs[0];
         apiKey = inv.apiKey || "";
         providerId = inv.providerId;
-        modelOpt = inv.modelSlug;
+        const modelOpt = inv.modelSlug;
         eventMeta = {
           modelId: inv.modelId,
           modelLabel: inv.modelLabel,
@@ -732,7 +737,11 @@ export async function POST(request: Request) {
           const { logError } = await import("@/lib/utils/error-handler");
           
           let parseResult = parseJSONRobust<AgentPlan>(trimmed, ["steps"]);
-          
+
+          if (!parseResult.success) {
+            emit(createAgentEvent('status', 'Retrying plan parsing…'));
+          }
+
           // If that fails, try extracting JSON object first (double- or single-quoted "steps")
           if (!parseResult.success) {
             const extracted = extractJsonObject(trimmed);
@@ -747,6 +756,10 @@ export async function POST(request: Request) {
             if (jsonStart > 0) {
               parseResult = parseJSONRobust<AgentPlan>(trimmed.slice(jsonStart), ["steps"]);
             }
+          }
+          if (!parseResult.success && trimmed.includes("{")) {
+            const firstBrace = trimmed.indexOf("{");
+            parseResult = parseJSONRobust<AgentPlan>(trimmed.slice(firstBrace), ["steps"]);
           }
           // Repair common LLM mistakes (trailing commas) and retry once
           if (!parseResult.success) {
@@ -928,6 +941,42 @@ export async function POST(request: Request) {
           emit(createAgentEvent('reasoning', `Warning: ${invalidSteps.length} invalid step(s) were filtered out`));
         }
 
+        // Error-fix path filter: for error-fix intents, require at least one edit outside docs/README
+        const docsOnlyPatterns = /^(README|HOW_TO_RUN|CONTRIBUTING|CHANGELOG)(\.\w+)?$/i;
+        const isDocsOnlyPath = (path: string) => {
+          const p = (path || "").trim();
+          if (!p) return true;
+          const base = p.split("/").pop() ?? p;
+          if (docsOnlyPatterns.test(base)) return true;
+          if (/^docs\//i.test(p) || /\.(md|mdx|txt)$/i.test(p)) return true;
+          return false;
+        };
+        const fileEditPaths = plan.steps.filter((s: any) => s.type === "file_edit").map((s: any) => (s.path || "").trim());
+        const hasNonDocsEdit = fileEditPaths.some((p: string) => !isDocsOnlyPath(p));
+        if (looksLikeErrorFix && fileEditPaths.length > 0 && !hasNonDocsEdit) {
+          emit(createAgentEvent('status', 'Warning: This looks like an error fix but the plan only touches documentation (e.g. README, .md). The fix should change code or config. Try rephrasing or ask to "fix the code" explicitly.'));
+          emit(createAgentEvent('reasoning', 'For runtime errors (port in use, 500, etc.), include at least one file_edit to executable code or config, not only README/docs.'));
+        }
+
+        const scopeMode: ScopeMode = body.scopeMode ?? "normal";
+        const { steps: cappedSteps, trimmed, message: capMessage } = applyScopeCaps(
+          plan.steps,
+          scopeMode,
+          errorFiles.size > 0 ? errorFiles : undefined
+        );
+        if (trimmed && capMessage) {
+          plan.steps = cappedSteps;
+          emit(createAgentEvent('status', capMessage, { scopeMode }));
+        }
+
+        const fileEditSteps = plan.steps.filter((s: any) => s.type === "file_edit");
+        const scope = computeRunScope(fileEditSteps);
+        const modeLabel = scopeMode === "conservative" ? "Conservative" : scopeMode === "aggressive" ? "Aggressive" : "Normal";
+        emit(createAgentEvent('status', `Planned changes: ${scope.fileCount} file(s), ≈${scope.approxLinesChanged} lines (mode: ${modeLabel}).`, {
+          scope: { fileCount: scope.fileCount, approxLinesChanged: scope.approxLinesChanged },
+          scopeMode,
+        }));
+
         if (plan.steps.length === 0) {
           console.error("Empty steps array in plan");
           console.error("Raw response (first 1000 chars):", raw.slice(0, 1000));
@@ -954,6 +1003,9 @@ export async function POST(request: Request) {
           ...(body.fileContents ? Object.keys(body.fileContents) : []),
         ])];
 
+        const fileEditStepsForScope = plan.steps.filter((s: any) => s.type === "file_edit");
+        const finalScope = computeRunScope(fileEditStepsForScope);
+
         // Send the plan as a final event (include model info for free-model fallback UI)
         safeEnqueue(controller, encoder, `data: ${JSON.stringify({
           type: 'plan',
@@ -963,6 +1015,8 @@ export async function POST(request: Request) {
           modelFallback: modelFallback ?? undefined,
           availableFreeModels: providerId === 'openrouter' ? OPENROUTER_FREE_MODELS.map((m) => ({ id: m.id, label: m.label })) : undefined,
           contextUsed: contextUsedFilePaths.length > 0 ? { filePaths: contextUsedFilePaths } : undefined,
+          scope: { fileCount: finalScope.fileCount, approxLinesChanged: finalScope.approxLinesChanged },
+          scopeMode: scopeMode ?? "normal",
         })}\n\n`);
         safeClose(controller);
       } catch (e) {

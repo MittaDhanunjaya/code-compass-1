@@ -65,7 +65,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  let body: { workspaceId?: string; plan?: AgentPlan; provider?: ProviderId; model?: string; modelId?: string; modelGroupId?: string; confirmedProtectedPaths?: string[]; skipProtected?: boolean };
+  let body: { workspaceId?: string; plan?: AgentPlan; provider?: ProviderId; model?: string; modelId?: string; modelGroupId?: string; confirmedProtectedPaths?: string[]; skipProtected?: boolean; scopeMode?: "conservative" | "normal" | "aggressive"; confirmedAggressive?: boolean };
   try {
     body = await request.json();
   } catch {
@@ -152,6 +152,15 @@ export async function POST(request: Request) {
 
         // Default to safe mode if column doesn't exist
         const safeEditMode = (workspace as any).safe_edit_mode !== false;
+        const scopeMode = body.scopeMode ?? "normal";
+        const confirmedAggressive = body.confirmedAggressive === true;
+        if (scopeMode === "aggressive" && safeEditMode && !confirmedAggressive) {
+          safeEmit(createAgentEvent('status', 'Aggressive mode with Safe Edit on requires confirmation'));
+          safeEnqueue(controller, encoder, `data: ${JSON.stringify({ type: 'needAggressiveConfirm' })}\n\n`);
+          safeClose(controller);
+          return;
+        }
+
         const fileEditPaths = plan.steps.filter((s): s is typeof s & { type: "file_edit" } => s.type === "file_edit").map((s) => s.path.trim());
         const protectedPaths = getProtectedPaths(fileEditPaths);
 

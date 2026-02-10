@@ -1,13 +1,40 @@
 {
   "name": "code-compass-desktop",
   "version": "1.0.0",
-  "description": "Code Compass desktop app (Electron wrapper)",
+  "description": "Code Compass desktop app (Electron wrapper). Local engines (Ollama, LM Studio) are optional; no bundled model weights.",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
     "dev": "APP_URL=http://localhost:3000 electron ."
   },
   "devDependencies": {
-    "electron": "^28.0.0"
+    "electron": "^28.0.0",
+    "electron-builder": "^24.0.0"
+  },
+  "dependencies": {
+    "electron-updater": "^6.0.0"
+  },
+  "build": {
+    "appId": "com.codecompass.app",
+    "productName": "Code Compass",
+    "directories": {
+      "output": "dist"
+    },
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "publish": {
+      "provider": "generic",
+      "url": "https://releases.example.com/code-compass"
+    }
   }
 }

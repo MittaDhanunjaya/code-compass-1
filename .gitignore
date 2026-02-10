@@ -39,4 +39,23 @@ Thumbs.db
 next-env.d.ts
 *.tsbuildinfo
 
+# Docs: only README.md is for GitHub; all other .md are internal
 *.md
+!README.md
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Turbo / cache
+.turbo
+.cache
+.eslintcache
+*.log
+.vite
+
+# Supabase local
+supabase/.temp/
+
+# Local Cursor IDE (optional: remove if you commit .cursor/rules)
+.cursor/projects/
