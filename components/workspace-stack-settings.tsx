@@ -3,8 +3,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { FileCode, FolderOpen } from "lucide-react";
-import type { CodeCompassConfig, CodeCompassServiceConfig, CodeCompassStack } from "@/lib/config/code-compass-config";
-import { CODE_COMPASS_CONFIG_PATH } from "@/lib/config/code-compass-config";
+import type { CodeCompassConfig, CodeCompassServiceConfig, CodeCompassStack } from "@/lib/config/code-compass-config-types";
+import { CODE_COMPASS_CONFIG_PATH } from "@/lib/config/code-compass-config-types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";

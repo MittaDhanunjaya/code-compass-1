@@ -252,9 +252,13 @@ export type DebugFromLogResponse = {
 export async function POST(request: Request, { params }: RouteParams) {
   const { id: workspaceId } = await params;
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { getDevBypassUser } = await import("@/lib/auth-dev-bypass");
+  const devUser = getDevBypassUser(request);
+  let user: { id: string } | null = devUser;
+  if (!user) {
+    const { data } = await supabase.auth.getUser();
+    user = data?.user ?? null;
+  }
   if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
@@ -498,6 +502,17 @@ ${fileContext}
     candidates = [{ providerId, model: modelOpt ?? undefined, apiKey }];
   }
 
+  // Dev bypass fallback: when using X-Dev-Token and no keys in DB, use DEV_OPENROUTER_API_KEY
+  if (candidates.length === 0) {
+    const devKey = process.env.NODE_ENV === "development" && devUser && process.env.DEV_OPENROUTER_API_KEY;
+    if (devKey) {
+      candidates = [{
+        providerId: "openrouter" as ProviderId,
+        model: "openrouter/free",
+        apiKey: process.env.DEV_OPENROUTER_API_KEY,
+      }];
+    }
+  }
   if (candidates.length === 0) {
     return NextResponse.json(
       { error: "No API key configured. Add one in API Key settings." },

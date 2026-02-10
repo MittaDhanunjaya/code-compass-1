@@ -112,11 +112,19 @@ function emitEvent(controller: ReadableStreamDefaultController, encoder: TextEnc
 
 export async function POST(request: Request) {
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { getDevBypassUser, getDevBypassConfigHint } = await import("@/lib/auth-dev-bypass");
+  const devUser = getDevBypassUser(request);
+  let user: { id: string } | null = devUser;
   if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    const { data } = await supabase.auth.getUser();
+    user = data?.user ?? null;
+  }
+  if (!user) {
+    const hint = getDevBypassConfigHint(request);
+    return NextResponse.json(
+      { error: hint ?? "Unauthorized" },
+      { status: hint ? 400 : 401 }
+    );
   }
 
   let body: {
@@ -180,10 +188,24 @@ export async function POST(request: Request) {
         let providerId: ProviderId | null = null;
 
         const { resolveInvocationConfig, getConfigByRole } = await import("@/lib/models/invocation-config");
-        const configs = await resolveInvocationConfig(supabase, user.id, {
+        let configs = await resolveInvocationConfig(supabase, user.id, {
           modelId: body.modelId,
           modelGroupId: body.modelGroupId,
         });
+        // Dev bypass fallback: when using X-Dev-Token and no keys in DB, use DEV_OPENROUTER_API_KEY
+        if (configs.length === 0) {
+          const devUser = getDevBypassUser(request);
+          const devKey = process.env.NODE_ENV === "development" && devUser && process.env.DEV_OPENROUTER_API_KEY;
+          if (devKey) {
+            configs = [{
+              modelId: "dev-openrouter",
+              modelLabel: "OpenRouter (dev)",
+              providerId: "openrouter" as ProviderId,
+              modelSlug: "openrouter/free",
+              apiKey: process.env.DEV_OPENROUTER_API_KEY,
+            }];
+          }
+        }
         if (configs.length === 0) {
           emit(createAgentEvent('status', 'Error: No model selected or no API key for the selected model/group. Add API keys in Settings or Models & groups.'));
           safeClose(controller);

@@ -12,6 +12,7 @@ dist
 # Environment
 .env
 .env.local
+.env.local.example
 .env.development.local
 .env.test.local
 .env.production.local
@@ -46,6 +47,11 @@ next-env.d.ts
 # Test / coverage
 coverage/
 .nyc_output/
+test-results/
+playwright-report/
+playwright/.cache/
+e2e-results-report.md
+e2e-output-validation-report.md
 
 # Turbo / cache
 .turbo

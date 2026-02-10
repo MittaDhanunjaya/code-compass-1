@@ -58,8 +58,13 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
       else if (commandId === "debugFromLog") setAiPanelTab("chat");
       else if (commandId === "reviewAllChanges") setAiPanelTab("agent");
     };
+    const onRunDebugFromLog = () => setAiPanelTab("chat");
     window.addEventListener("command-palette-run", onCommand);
-    return () => window.removeEventListener("command-palette-run", onCommand);
+    window.addEventListener("aiforge-run-debug-from-log", onRunDebugFromLog);
+    return () => {
+      window.removeEventListener("command-palette-run", onCommand);
+      window.removeEventListener("aiforge-run-debug-from-log", onRunDebugFromLog);
+    };
   }, []);
 
   // First-run wizard: when navigating with a pending playbook, switch to Agent tab

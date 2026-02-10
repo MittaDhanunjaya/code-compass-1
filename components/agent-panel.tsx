@@ -31,6 +31,8 @@ import { InlineEditDiffDialog } from "@/components/inline-edit-diff-dialog";
 import { getPlaybook, PLAYBOOKS } from "@/lib/playbooks";
 import { COPY } from "@/lib/copy";
 import { FeedbackPrompt } from "@/components/feedback-prompt";
+import type { LogAttachment } from "@/lib/chat/log-utils";
+import { looksLikeLog, createLogAttachment } from "@/lib/chat/log-utils";
 
 type AgentPhase = "idle" | "loading_plan" | "plan_ready" | "executing" | "done";
 
@@ -77,7 +79,12 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
   const [agentFullFileReplaceConfirmOpen, setAgentFullFileReplaceConfirmOpen] = useState(false);
   const [pendingFullFileReplaceEdits, setPendingFullFileReplaceEdits] = useState<{ path: string; content: string }[]>([]);
   const [error, setError] = useState<string | null>(null);
-  
+  const [logAttachment, setLogAttachment] = useState<LogAttachment | null>(null);
+  const [useDebugForLogs] = useState(() => {
+    if (typeof window === "undefined") return true;
+    return localStorage.getItem("useDebugForLogs") !== "false";
+  });
+
   // Load provider and model from localStorage, default to openrouter + deepseek-coder:free
   const getStoredProvider = (): ProviderId => {
     if (typeof window === "undefined") return "openrouter";
@@ -295,7 +302,30 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
   }, [workspaceId]);
 
   const startPlan = useCallback(async () => {
-    if (!instruction.trim() || !workspaceId || phase !== "idle") return;
+    const hasLog = !!logAttachment;
+    const canStart = instruction.trim() || hasLog;
+    if (!canStart || !workspaceId || phase !== "idle") return;
+
+    if (hasLog && useDebugForLogs && logAttachment) {
+      try {
+        sessionStorage.setItem(
+          "pendingDebugLog",
+          JSON.stringify({
+            logText: logAttachment.fullText,
+            userMessageContent: instruction.trim() || "Debug this error log.",
+            logAttachment,
+          })
+        );
+        window.dispatchEvent(new CustomEvent("aiforge-run-debug-from-log"));
+        setInstruction("");
+        setLogAttachment(null);
+      } catch {
+        setError("Failed to start debug");
+      }
+      return;
+    }
+
+    if (!instruction.trim()) return;
     setError(null);
     setPlanUsage(null);
     setPlanContextUsed(null);
@@ -585,7 +615,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
     } finally {
       abortControllerRef.current = null;
     }
-  }, [instruction, workspaceId, provider, model, modelSelection, phase, fetchFileList]);
+  }, [instruction, workspaceId, provider, model, modelSelection, phase, fetchFileList, logAttachment, useDebugForLogs]);
 
   const rejectPlan = useCallback(() => {
     setPlan(null);
@@ -1301,18 +1331,27 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
               const fromTerminal = e.clipboardData?.types?.includes("application/x-aiforge-terminal");
               if (fromTerminal && pasted && pasted.includes("\n")) {
                 e.preventDefault();
-                const lines = pasted.trim().split(/\r?\n/);
-                const formatted =
-                  `Terminal (lines 1-${lines.length}):\n` +
-                  lines.map((l, i) => `[${i + 1}] ${l}`).join("\n");
-                const ta = e.target as HTMLTextAreaElement;
-                if (ta && typeof ta.selectionStart === "number") {
-                  const start = ta.selectionStart;
-                  const end = ta.selectionEnd ?? instruction.length;
-                  setInstruction(instruction.slice(0, start) + formatted + instruction.slice(end));
+                if (looksLikeLog(pasted)) {
+                  setLogAttachment(createLogAttachment(pasted));
+                  setInstruction((prev) => prev || "Here's the error I'm seeing.");
                 } else {
-                  setInstruction(formatted);
+                  const lines = pasted.trim().split(/\r?\n/);
+                  const formatted =
+                    `Terminal (lines 1-${lines.length}):\n` +
+                    lines.map((l, i) => `[${i + 1}] ${l}`).join("\n");
+                  const ta = e.target as HTMLTextAreaElement;
+                  if (ta && typeof ta.selectionStart === "number") {
+                    const start = ta.selectionStart;
+                    const end = ta.selectionEnd ?? instruction.length;
+                    setInstruction(instruction.slice(0, start) + formatted + instruction.slice(end));
+                  } else {
+                    setInstruction(formatted);
+                  }
                 }
+              } else if (pasted && looksLikeLog(pasted)) {
+                e.preventDefault();
+                setLogAttachment(createLogAttachment(pasted));
+                setInstruction((prev) => prev || "Here's the error I'm seeing.");
               }
             }}
             disabled={phase !== "idle" && phase !== "done"}
@@ -1325,17 +1364,37 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
               }
             }}
           />
+          {logAttachment && (
+            <div className="inline-flex items-center gap-2 rounded bg-slate-800 px-2 py-1 text-xs text-slate-100 dark:bg-slate-700">
+              <span>
+                🖥 {logAttachment.source ?? "log"} ({logAttachment.lineCount} lines)
+              </span>
+              <button
+                type="button"
+                onClick={() => setLogAttachment(null)}
+                className="text-slate-300 hover:text-slate-100"
+                aria-label="Remove log"
+              >
+                ×
+              </button>
+            </div>
+          )}
+          {logAttachment && useDebugForLogs && workspaceId && (
+            <div className="text-xs text-muted-foreground">
+              Log detected – will run <strong>Debug-from-log</strong> on this workspace.
+            </div>
+          )}
           <Button
             className="w-full gap-2"
             onClick={startPlan}
             disabled={
-              !instruction.trim() ||
+              (!instruction.trim() && !logAttachment) ||
               phase === "loading_plan" ||
               phase === "executing"
             }
             title={
-              !instruction.trim()
-                ? "Enter a task to start"
+              !instruction.trim() && !logAttachment
+                ? "Enter a task or paste logs"
                 : phase === "loading_plan" || phase === "executing"
                   ? "Wait for the current step to finish"
                   : undefined

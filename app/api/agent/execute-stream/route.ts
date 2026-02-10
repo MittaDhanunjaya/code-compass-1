@@ -58,9 +58,13 @@ function emitEvent(
 
 export async function POST(request: Request) {
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { getDevBypassUser } = await import("@/lib/auth-dev-bypass");
+  const devUser = getDevBypassUser(request);
+  let user: { id: string } | null = devUser;
+  if (!user) {
+    const { data } = await supabase.auth.getUser();
+    user = data?.user ?? null;
+  }
   if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
@@ -117,7 +121,7 @@ export async function POST(request: Request) {
             workspaceError = minimalRetry.error;
             workspace = null;
           } else {
-            workspace = minimalRetry.data;
+            workspace = { ...minimalRetry.data, safe_edit_mode: true };
             workspaceError = null;
           }
         }

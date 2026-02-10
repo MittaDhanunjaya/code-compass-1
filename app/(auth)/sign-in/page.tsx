@@ -1,8 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useAuth } from "@/lib/auth-context";
 import { createClient } from "@/lib/supabase/client";
 import { Button } from "@/components/ui/button";
@@ -16,6 +16,25 @@ export default function SignInPage() {
   const [loading, setLoading] = useState(false);
   const { signIn } = useAuth();
   const router = useRouter();
+  const searchParams = useSearchParams();
+
+  // Show error from URL (query or hash) - e.g. expired reset link
+  useEffect(() => {
+    const fromQuery = searchParams.get("error_description") ?? searchParams.get("error");
+    if (fromQuery) {
+      setError(decodeURIComponent(fromQuery));
+      return;
+    }
+    const hash = typeof window !== "undefined" ? window.location.hash : "";
+    if (!hash) return;
+    const params = new URLSearchParams(hash.replace(/^#/, ""));
+    const desc = params.get("error_description") ?? params.get("error");
+    if (desc) {
+      setError(decodeURIComponent(desc.replace(/\+/g, " ")));
+      // Clear hash so the message doesn't persist on refresh
+      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    }
+  }, [searchParams]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -75,7 +94,15 @@ export default function SignInPage() {
           />
         </div>
         <div className="space-y-2">
-          <Label htmlFor="password">Password</Label>
+          <div className="flex items-center justify-between">
+            <Label htmlFor="password">Password</Label>
+            <Link
+              href="/forgot-password"
+              className="text-xs text-muted-foreground hover:text-primary underline-offset-4 hover:underline"
+            >
+              Forgot password?
+            </Link>
+          </div>
           <Input
             id="password"
             type="password"
@@ -87,7 +114,16 @@ export default function SignInPage() {
           />
         </div>
         {error && (
-          <p className="text-sm text-destructive">{error}</p>
+          <div className="space-y-1">
+            <p className="text-sm text-destructive">{error}</p>
+            {error.toLowerCase().includes("expired") || error.toLowerCase().includes("invalid") ? (
+              <p className="text-sm text-muted-foreground">
+                <Link href="/forgot-password" className="underline underline-offset-4 hover:text-primary">
+                  Request a new password reset link
+                </Link>
+              </p>
+            ) : null}
+          </div>
         )}
         <Button type="submit" className="w-full" disabled={loading}>
           {loading ? "Signing in…" : "Sign in"}

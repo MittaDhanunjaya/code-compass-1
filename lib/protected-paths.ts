@@ -21,6 +21,41 @@ export const DEFAULT_PROTECTED_PATTERNS = [
 /** Patterns used for matching (defaults to DEFAULT_PROTECTED_PATTERNS). */
 export type ProtectedPattern = string;
 
+/** Check if path matches a directory-prefix pattern (e.g. "infra/**" matches infra/...) */
+function matchesDirectoryPrefix(path: string, prefix: string): boolean {
+  if (prefix === "") return true;
+  return path === prefix || path.startsWith(prefix + "/");
+}
+
+/** Check if path matches a basename prefix pattern (e.g. ".env*" matches .env, .env.local) */
+function matchesBasenamePrefix(path: string, prefix: string): boolean {
+  const basename = path.includes("/") ? path.split("/").pop() ?? path : path;
+  return basename === prefix || basename.startsWith(prefix);
+}
+
+/** Check if path matches a suffix pattern (e.g. "*.pem" matches key.pem, certs/key.pem) */
+function matchesSuffix(path: string, suffix: string): boolean {
+  return path === suffix || path.endsWith("/" + suffix) || path.endsWith(suffix);
+}
+
+/** Check if a single pattern matches the given path. */
+function singlePatternMatches(path: string, pattern: string): boolean {
+  const p = pattern.trim();
+  if (!p) return false;
+
+  if (p.endsWith("/**")) {
+    return matchesDirectoryPrefix(path, p.slice(0, -3));
+  }
+  if (p.startsWith("*.")) {
+    return matchesSuffix(path, p.slice(1));
+  }
+  // * only at end: basename prefix (e.g. .env*)
+  if (p.endsWith("*") && p.indexOf("*") === p.length - 1) {
+    return matchesBasenamePrefix(path, p.slice(0, -1));
+  }
+  return path === p;
+}
+
 /**
  * Check if a file path matches any of the protected patterns.
  * Pattern rules:
@@ -37,37 +72,8 @@ export function isProtectedPath(
   if (!normalized) return false;
 
   for (const pattern of patterns) {
-    const p = pattern.trim();
-    if (!p) continue;
-
-    // ** = prefix match (directory and all descendants)
-    if (p.endsWith("/**")) {
-      const prefix = p.slice(0, -3);
-      if (prefix === "" || normalized === prefix || normalized.startsWith(prefix + "/")) {
-        return true;
-      }
-      continue;
-    }
-
-    // * at start only: suffix match (e.g. *.pem)
-    if (p.startsWith("*.")) {
-      const suffix = p.slice(1);
-      if (normalized === suffix || normalized.endsWith("/" + suffix) || normalized.endsWith(suffix)) return true;
-      continue;
-    }
-
-    // * at end only: prefix match for basename (e.g. .env*)
-    if (p.endsWith("*") && !p.includes("*", 1)) {
-      const prefix = p.slice(0, -1);
-      const basename = normalized.includes("/") ? normalized.split("/").pop() ?? normalized : normalized;
-      if (basename === prefix || basename.startsWith(prefix)) return true;
-      continue;
-    }
-
-    // Exact match
-    if (normalized === p) return true;
+    if (singlePatternMatches(normalized, pattern)) return true;
   }
-
   return false;
 }
 

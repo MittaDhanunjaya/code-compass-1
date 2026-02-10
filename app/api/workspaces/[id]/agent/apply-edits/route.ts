@@ -16,9 +16,13 @@ const FULL_FILE_REPLACE_RATIO = 0.95;
 export async function POST(request: Request, { params }: RouteParams) {
   const { id: workspaceId } = await params;
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { getDevBypassUser } = await import("@/lib/auth-dev-bypass");
+  const devUser = getDevBypassUser(request);
+  let user: { id: string } | null = devUser;
+  if (!user) {
+    const { data } = await supabase.auth.getUser();
+    user = data?.user ?? null;
+  }
   if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }

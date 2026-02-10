@@ -29,6 +29,8 @@ import { SAFE_EDIT_MAX_FILES } from "@/lib/protected-paths";
 import { COPY } from "@/lib/copy";
 import { ErrorWithAction } from "@/components/error-with-action";
 import { FeedbackPrompt } from "@/components/feedback-prompt";
+import type { LogAttachment } from "@/lib/chat/log-utils";
+import { looksLikeLog, createLogAttachment } from "@/lib/chat/log-utils";
 
 const MonacoDiffEditor = dynamic(
   () => import("@monaco-editor/react").then((mod) => mod.DiffEditor),
@@ -56,6 +58,7 @@ type Message = {
   id: string;
   role: "user" | "assistant";
   content: string;
+  logAttachment?: LogAttachment;
 };
 
 type ChatPanelProps = {
@@ -132,6 +135,156 @@ export function ChatPanel({
   const [historyFilter, setHistoryFilter] = useState<"all" | "chat" | "debug">("all");
   const [showDebugFeedback, setShowDebugFeedback] = useState(false);
   const [debugRetrySummary, setDebugRetrySummary] = useState<{ attempt1: boolean; attempt2: boolean } | null>(null);
+  const [logAttachment, setLogAttachment] = useState<LogAttachment | null>(null);
+  const [useDebugForLogs, setUseDebugForLogs] = useState(() => {
+    if (typeof window === "undefined") return true;
+    const stored = window.localStorage.getItem("useDebugForLogs");
+    return stored !== "false";
+  });
+  const [expandedLogMessageId, setExpandedLogMessageId] = useState<string | null>(null);
+
+  const runDebugFromLog = useCallback(
+    async (wsId: string, logText: string, options?: { userMessageContent?: string; logAttachment?: LogAttachment }) => {
+      setDebugRunWorkspaceId(wsId);
+      const userMsg: Message = {
+        id: crypto.randomUUID(),
+        role: "user",
+        content: options?.userMessageContent ?? logText,
+        logAttachment: options?.logAttachment,
+      };
+      setMessages((prev) => [...prev, userMsg]);
+      setErrorLogConfirmOpen(false);
+      setPendingLogMessage(null);
+      setWorkspaceIdWhenLogPasted(null);
+      setDebugLoading(true);
+      setError(null);
+      try {
+        const scopeMode = (typeof window !== "undefined" && wsId)
+          ? (localStorage.getItem(`composer-scope-mode-${wsId}`) || localStorage.getItem(`agent-scope-mode-${wsId}`) || "normal")
+          : "normal";
+        const res = await fetch(`/api/workspaces/${wsId}/debug-from-log`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            logText,
+            provider,
+            model: provider === "openrouter" ? model : undefined,
+            scopeMode: scopeMode === "conservative" || scopeMode === "aggressive" ? scopeMode : "normal",
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || "Debug request failed");
+        }
+        const explanation = data.explanation ?? data.summary ?? "Analysis complete.";
+        const suspectedRootCause = data.suspectedRootCause ?? "";
+        const rawEdits = Array.isArray(data.edits) ? data.edits : [];
+        const steps: DebugReviewStep[] = [];
+        for (const e of rawEdits) {
+          const path = typeof e.path === "string" ? e.path.trim() : "";
+          const newContent = typeof e.newContent === "string" ? e.newContent : "";
+          if (!path || !newContent) continue;
+          let originalContent = "";
+          try {
+            const fileRes = await fetch(
+              `/api/workspaces/${wsId}/files?path=${encodeURIComponent(path)}`
+            );
+            if (fileRes.ok) {
+              const fileData = await fileRes.json();
+              originalContent = fileData.content ?? "";
+            }
+          } catch {
+            // keep empty (e.g. new file)
+          }
+          steps.push({
+            path,
+            originalContent,
+            newContent,
+            oldContent: typeof e.oldContent === "string" && e.oldContent.trim() ? e.oldContent.trim() : undefined,
+            description: typeof e.description === "string" && e.description.trim() ? e.description.trim() : undefined,
+          });
+        }
+        setDebugSummary(explanation);
+        setDebugRootCause(suspectedRootCause || null);
+        setDebugReviewSteps(steps);
+        setDebugSelectedPaths(new Set(steps.map((s) => s.path)));
+        setDebugExpandedPath(null);
+        setDebugFromLogMeta({
+          errorLog: logText,
+          errorType: suspectedRootCause || null,
+          modelUsed: provider === "openrouter" ? model : undefined,
+          providerId: provider,
+        });
+        let workspaceName = "this workspace";
+        try {
+          const nameRes = await fetch(`/api/workspaces/${wsId}`);
+          if (nameRes.ok) {
+            const wsData = await nameRes.json();
+            workspaceName = wsData?.name ?? workspaceName;
+          }
+        } catch {
+          // use fallback
+        }
+        const body =
+          suspectedRootCause.length > 0
+            ? `**Suspected root cause:** ${suspectedRootCause}\n\n${explanation}`
+            : explanation;
+        const sandboxNote = steps.length > 0
+          ? `\n\n**Note:** When you apply these changes, they will be tested in a sandbox (lint + tests) before being applied to your workspace. Only passing changes will be applied.`
+          : "";
+        const assistantContent = `**Debugged from runtime logs — ${workspaceName}**\n\n${body}${
+          steps.length > 0
+            ? `\n\nProposed changes in ${steps.length} file(s). Review and apply below.${sandboxNote}`
+            : ""
+        }`;
+        setMessages((prev) => [
+          ...prev,
+          { id: crypto.randomUUID(), role: "assistant", content: assistantContent },
+        ]);
+        fetch("/api/chat/save-message", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workspaceId: wsId, role: "assistant", content: assistantContent, runType: "debug" }),
+        }).catch(() => {});
+      } catch (e) {
+        const errMsg = e instanceof Error ? e.message : "Debug failed";
+        setError(errMsg);
+        const failContent = `Debug failed: ${errMsg}`;
+        setMessages((prev) => [
+          ...prev,
+          { id: crypto.randomUUID(), role: "assistant", content: failContent },
+        ]);
+        fetch("/api/chat/save-message", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workspaceId: wsId, role: "assistant", content: failContent, runType: "debug" }),
+        }).catch(() => {});
+      } finally {
+        setDebugLoading(false);
+      }
+    },
+    [provider, model]
+  );
+
+  // When switching to chat from Agent with pending debug log, run it
+  useEffect(() => {
+    if (activeTab !== "chat" || !workspaceId) return;
+    try {
+      const raw = sessionStorage.getItem("pendingDebugLog");
+      if (!raw) return;
+      const { logText, userMessageContent, logAttachment } = JSON.parse(raw) as {
+        logText: string;
+        userMessageContent?: string;
+        logAttachment?: LogAttachment;
+      };
+      sessionStorage.removeItem("pendingDebugLog");
+      if (logText) {
+        runDebugFromLog(workspaceId, logText, { userMessageContent, logAttachment });
+      }
+    } catch {
+      sessionStorage.removeItem("pendingDebugLog");
+    }
+  }, [activeTab, workspaceId, runDebugFromLog]);
 
   // Restore chat history on mount and when filter changes
   useEffect(() => {
@@ -284,128 +437,6 @@ export function ChatPanel({
   }, [workspaceId, mounted]);
 
   const tab = activeFilePath ? getTab(activeFilePath) : null;
-
-  const runDebugFromLog = useCallback(
-    async (wsId: string, logText: string) => {
-      setDebugRunWorkspaceId(wsId);
-      const userMsg: Message = {
-        id: crypto.randomUUID(),
-        role: "user",
-        content: logText,
-      };
-      setMessages((prev) => [...prev, userMsg]);
-      setErrorLogConfirmOpen(false);
-      setPendingLogMessage(null);
-      setWorkspaceIdWhenLogPasted(null);
-      setDebugLoading(true);
-      setError(null);
-      try {
-        const scopeMode = (typeof window !== "undefined" && wsId)
-          ? (localStorage.getItem(`composer-scope-mode-${wsId}`) || localStorage.getItem(`agent-scope-mode-${wsId}`) || "normal")
-          : "normal";
-        const res = await fetch(`/api/workspaces/${wsId}/debug-from-log`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            logText,
-            provider,
-            model: provider === "openrouter" ? model : undefined,
-            scopeMode: scopeMode === "conservative" || scopeMode === "aggressive" ? scopeMode : "normal",
-          }),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data.error || "Debug request failed");
-        }
-        const explanation = data.explanation ?? data.summary ?? "Analysis complete.";
-        const suspectedRootCause = data.suspectedRootCause ?? "";
-        const rawEdits = Array.isArray(data.edits) ? data.edits : [];
-        const steps: DebugReviewStep[] = [];
-        for (const e of rawEdits) {
-          const path = typeof e.path === "string" ? e.path.trim() : "";
-          const newContent = typeof e.newContent === "string" ? e.newContent : "";
-          if (!path || !newContent) continue;
-          let originalContent = "";
-          try {
-            const fileRes = await fetch(
-              `/api/workspaces/${wsId}/files?path=${encodeURIComponent(path)}`
-            );
-            if (fileRes.ok) {
-              const fileData = await fileRes.json();
-              originalContent = fileData.content ?? "";
-            }
-          } catch {
-            // keep empty (e.g. new file)
-          }
-          steps.push({
-            path,
-            originalContent,
-            newContent,
-            oldContent: typeof e.oldContent === "string" && e.oldContent.trim() ? e.oldContent.trim() : undefined,
-            description: typeof e.description === "string" && e.description.trim() ? e.description.trim() : undefined,
-          });
-        }
-        setDebugSummary(explanation);
-        setDebugRootCause(suspectedRootCause || null);
-        setDebugReviewSteps(steps);
-        setDebugSelectedPaths(new Set(steps.map((s) => s.path)));
-        setDebugExpandedPath(null);
-        setDebugFromLogMeta({
-          errorLog: logText,
-          errorType: suspectedRootCause || null,
-          modelUsed: provider === "openrouter" ? model : undefined,
-          providerId: provider,
-        });
-        let workspaceName = "this workspace";
-        try {
-          const nameRes = await fetch(`/api/workspaces/${wsId}`);
-          if (nameRes.ok) {
-            const wsData = await nameRes.json();
-            workspaceName = wsData?.name ?? workspaceName;
-          }
-        } catch {
-          // use fallback
-        }
-        const body =
-          suspectedRootCause.length > 0
-            ? `**Suspected root cause:** ${suspectedRootCause}\n\n${explanation}`
-            : explanation;
-        const sandboxNote = steps.length > 0
-          ? `\n\n**Note:** When you apply these changes, they will be tested in a sandbox (lint + tests) before being applied to your workspace. Only passing changes will be applied.`
-          : "";
-        const assistantContent = `**Debugged from runtime logs — ${workspaceName}**\n\n${body}${
-          steps.length > 0
-            ? `\n\nProposed changes in ${steps.length} file(s). Review and apply below.${sandboxNote}`
-            : ""
-        }`;
-        setMessages((prev) => [
-          ...prev,
-          { id: crypto.randomUUID(), role: "assistant", content: assistantContent },
-        ]);
-        fetch("/api/chat/save-message", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ workspaceId: wsId, role: "assistant", content: assistantContent, runType: "debug" }),
-        }).catch(() => {});
-      } catch (e) {
-        const errMsg = e instanceof Error ? e.message : "Debug failed";
-        setError(errMsg);
-        const failContent = `Debug failed: ${errMsg}`;
-        setMessages((prev) => [
-          ...prev,
-          { id: crypto.randomUUID(), role: "assistant", content: failContent },
-        ]);
-        fetch("/api/chat/save-message", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ workspaceId: wsId, role: "assistant", content: failContent, runType: "debug" }),
-        }).catch(() => {});
-      } finally {
-        setDebugLoading(false);
-      }
-    },
-    [provider, model]
-  );
 
   const applyDebugEdits = useCallback(
     async (steps: FileEditStep[], confirmedProtectedPaths?: string[]) => {
@@ -877,6 +908,32 @@ export function ChatPanel({
             }`}
           >
             <div className="whitespace-pre-wrap break-words">{m.content}</div>
+            {m.logAttachment && (
+              <div className="mt-1.5 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setExpandedLogMessageId((id) => (id === m.id ? null : m.id))}
+                  className={
+                    m.role === "user"
+                      ? "rounded bg-primary-foreground/20 px-2 py-1 hover:bg-primary-foreground/30 text-primary-foreground"
+                      : "rounded bg-slate-800 px-2 py-1 hover:bg-slate-700 text-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600"
+                  }
+                >
+                  🖥 {m.logAttachment.source ?? "log"} ({m.logAttachment.lineCount} lines) – {expandedLogMessageId === m.id ? "Hide" : "View"}
+                </button>
+                {expandedLogMessageId === m.id && (
+                  <pre
+                    className={
+                      m.role === "user"
+                        ? "mt-2 max-h-64 overflow-auto rounded bg-primary-foreground/10 p-2 text-xs text-primary-foreground whitespace-pre-wrap break-words"
+                        : "mt-2 max-h-64 overflow-auto rounded bg-slate-900 p-2 text-xs text-slate-100 whitespace-pre-wrap break-words"
+                    }
+                  >
+                    {m.logAttachment.fullText}
+                  </pre>
+                )}
+              </div>
+            )}
           </div>
         ))}
         {loading && (
@@ -1131,6 +1188,43 @@ export function ChatPanel({
             These look like runtime logs. Select a workspace if you want me to apply code fixes; otherwise I&apos;ll just explain the error.
           </p>
         )}
+        {logAttachment && useDebugForLogs && workspaceId && (
+          <div className="text-xs text-muted-foreground">
+            Log detected – will run <strong>Debug-from-log</strong> on this workspace.
+          </div>
+        )}
+        {logAttachment && (
+          <div className="inline-flex items-center gap-2 rounded bg-slate-800 px-2 py-1 text-xs text-slate-100 dark:bg-slate-700">
+            <span>
+              🖥 {logAttachment.source ?? "log"} ({logAttachment.lineCount} lines)
+            </span>
+            <button
+              type="button"
+              onClick={() => setLogAttachment(null)}
+              className="text-slate-300 hover:text-slate-100"
+              aria-label="Remove log"
+            >
+              ×
+            </button>
+          </div>
+        )}
+        <label className="flex items-center gap-1.5 text-xs text-muted-foreground cursor-pointer">
+          <input
+            type="checkbox"
+            checked={useDebugForLogs}
+            onChange={() => {
+              setUseDebugForLogs((prev) => {
+                const next = !prev;
+                if (typeof window !== "undefined") {
+                  window.localStorage.setItem("useDebugForLogs", String(next));
+                }
+                return next;
+              });
+            }}
+            className="rounded border-border"
+          />
+          Use Debug-from-log for pasted logs
+        </label>
         {(selection?.text || tab) && (
           <Button
             variant="outline"
@@ -1202,6 +1296,8 @@ export function ChatPanel({
         <form
           className="flex gap-2"
           onKeyDown={(e) => {
+            // When log is attached, let form submit handle (debug-from-log)
+            if (logAttachment && e.key === "Enter" && !e.shiftKey) return;
             // Handle slash commands on Enter
             if (e.key === "Enter" && !e.shiftKey && input.trim().startsWith("/")) {
               e.preventDefault();
@@ -1210,7 +1306,6 @@ export function ChatPanel({
                 setInput(expanded);
                 sendMessage(expanded);
               } else {
-                // Unknown slash command, send as-is
                 sendMessage(input);
               }
             }
@@ -1218,13 +1313,32 @@ export function ChatPanel({
           onSubmit={(e) => {
             e.preventDefault();
             const content = input.trim();
-            if (!content || loading) return;
-            setInput("");
-            if (!workspaceId) {
-              sendMessage(content, { prependNoWorkspaceNote: true });
+            const hasLog = !!logAttachment;
+            const canSend = content || hasLog;
+            if (!canSend || loading) return;
+
+            const shouldDebug = hasLog && useDebugForLogs && workspaceId;
+            const textToSend = content || (hasLog ? logAttachment!.fullText : "");
+
+            if (shouldDebug && logAttachment) {
+              runDebugFromLog(workspaceId, logAttachment.fullText, {
+                userMessageContent: content || "Debug this error log.",
+                logAttachment,
+              });
+              setInput("");
+              setLogAttachment(null);
               return;
             }
-            sendMessage(content);
+
+            if (!workspaceId) {
+              sendMessage(textToSend, { prependNoWorkspaceNote: true });
+            } else if (hasLog) {
+              sendMessage(textToSend, { treatAsNormal: true });
+            } else {
+              sendMessage(textToSend);
+            }
+            setInput("");
+            setLogAttachment(null);
           }}
         >
           <Textarea
@@ -1237,18 +1351,27 @@ export function ChatPanel({
               const fromTerminal = e.clipboardData?.types?.includes("application/x-aiforge-terminal");
               if (fromTerminal && pasted && pasted.includes("\n")) {
                 e.preventDefault();
-                const lines = pasted.trim().split(/\r?\n/);
-                const formatted =
-                  `Terminal (lines 1-${lines.length}):\n` +
-                  lines.map((l, i) => `[${i + 1}] ${l}`).join("\n");
-                const ta = e.target as HTMLTextAreaElement;
-                if (ta && typeof ta.selectionStart === "number") {
-                  const start = ta.selectionStart;
-                  const end = ta.selectionEnd ?? input.length;
-                  setInput(input.slice(0, start) + formatted + input.slice(end));
+                if (looksLikeLog(pasted)) {
+                  setLogAttachment(createLogAttachment(pasted));
+                  setInput((prev) => prev || "Here's the error I'm seeing.");
                 } else {
-                  setInput(formatted);
+                  const lines = pasted.trim().split(/\r?\n/);
+                  const formatted =
+                    `Terminal (lines 1-${lines.length}):\n` +
+                    lines.map((l, i) => `[${i + 1}] ${l}`).join("\n");
+                  const ta = e.target as HTMLTextAreaElement;
+                  if (ta && typeof ta.selectionStart === "number") {
+                    const start = ta.selectionStart;
+                    const end = ta.selectionEnd ?? input.length;
+                    setInput(input.slice(0, start) + formatted + input.slice(end));
+                  } else {
+                    setInput(formatted);
+                  }
                 }
+              } else if (pasted && looksLikeLog(pasted)) {
+                e.preventDefault();
+                setLogAttachment(createLogAttachment(pasted));
+                setInput((prev) => prev || "Here's the error I'm seeing.");
               }
             }}
             disabled={loading}
@@ -1259,12 +1382,12 @@ export function ChatPanel({
           <Button
             type="submit"
             size="icon"
-            disabled={loading || !input.trim()}
+            disabled={loading || (!input.trim() && !logAttachment)}
             title={
               loading
                 ? "Sending…"
-                : !input.trim()
-                  ? "Enter a message"
+                : !input.trim() && !logAttachment
+                  ? "Enter a message or paste logs"
                   : "Send message"
             }
           >

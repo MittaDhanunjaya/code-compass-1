@@ -1,0 +1,12 @@
+{
+  "services": [
+    {
+      "name": "default",
+      "root": ".",
+      "stack": "nextjs",
+      "lintCommand": "npm run lint",
+      "testCommand": "npm run test",
+      "runCommand": "npm run dev"
+    }
+  ]
+}
