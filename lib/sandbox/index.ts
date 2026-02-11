@@ -8,6 +8,10 @@ import type { FileEditStep } from "@/lib/agent/types";
 import { applyEdit } from "@/lib/agent/diff-engine";
 import { beautifyCode } from "@/lib/utils/code-beautifier";
 import { getLintCommands, getTestCommands, getRunCommands, detectStack } from "./stack-commands";
+import { existsSync, readdirSync, readFileSync } from "fs";
+import { mkdir, writeFile } from "fs/promises";
+import { join, dirname, resolve } from "path";
+import { tmpdir } from "os";
 
 export type SandboxSource = "agent" | "composer" | "debug-from-log";
 
@@ -331,8 +335,6 @@ export async function promoteSandboxToWorkspace(
  * Get sandbox directory path for command execution.
  */
 export function getSandboxDir(sandboxRunId: string): string {
-  const { join, resolve } = require("path");
-  const { tmpdir } = require("os");
   const baseDir = process.env.SANDBOX_BASE_DIR || join(tmpdir(), "sandboxes");
   return resolve(baseDir, sandboxRunId);
 }
@@ -344,9 +346,6 @@ export async function syncSandboxToDisk(
   supabase: SupabaseClient,
   sandboxRunId: string
 ): Promise<void> {
-  const { mkdir, writeFile } = require("fs/promises");
-  const { join, dirname } = require("path");
-  const { existsSync } = require("fs");
 
   const sandboxDir = getSandboxDir(sandboxRunId);
 
@@ -394,14 +393,12 @@ export async function runSandboxChecks(
   // Debug: Log what files are in the sandbox (for troubleshooting)
   // This helps verify docker-compose.yml is present
   try {
-    const { readdirSync } = require("fs");
     const files = readdirSync(sandboxDir, { recursive: false });
     console.log(`[Sandbox] Files in sandbox: ${files.slice(0, 10).join(", ")}${files.length > 10 ? "..." : ""}`);
   } catch {
     // Ignore - just for debugging
   }
 
-  const { join } = require("path");
   const packageJsonPath = join(sandboxDir, "package.json");
   const hasPackageJson = existsSync(packageJsonPath);
   const stack = detectStack(sandboxDir);
@@ -556,7 +553,6 @@ export async function runSandboxChecks(
   } else if (hasPackageJson) {
     // Node.js project - Read package.json to find start/dev scripts
     try {
-      const { readFileSync } = require("fs");
       const packageJsonContent = readFileSync(packageJsonPath, "utf-8");
       const packageJson = JSON.parse(packageJsonContent);
       const scripts = packageJson.scripts || {};
@@ -691,7 +687,6 @@ export async function runSandboxChecks(
     
     if (hasPythonProject) {
       // Try to find main Python file (common patterns)
-      const { readdirSync } = require("fs");
       let mainPyFile: string | null = null;
       
       try {

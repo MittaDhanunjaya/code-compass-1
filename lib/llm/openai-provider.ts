@@ -69,6 +69,7 @@ export const openAIProvider: LLMProvider = {
       model: options?.model ?? "gpt-4o-mini",
       messages: built,
       stream: true,
+      ...(options?.temperature != null && { temperature: options.temperature }),
     });
 
     for await (const chunk of stream) {

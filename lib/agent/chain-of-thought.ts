@@ -41,12 +41,22 @@ Output your reasoning as a JSON object:
     }
   ],
   "finalPlan": {
-    "steps": [...],
-    "summary": "..."
+    "steps": [
+      { "type": "file_edit", "path": "path/to/file", "newContent": "full file content here" },
+      { "type": "command", "command": "npm install" }
+    ],
+    "summary": "Brief summary"
   }
 }
 
-Think deeply. Don't rush. Consider all aspects of the problem.`;
+CRITICAL: Each entry in finalPlan.steps MUST be an object with:
+- For file edits: { "type": "file_edit", "path": "file/path", "newContent": "complete file content" }
+- For commands: { "type": "command", "command": "shell command" }
+Never use plain text strings in steps—only objects with type, path/newContent, or command.
+
+Think deeply. Don't rush. Consider all aspects of the problem.
+
+Consistency: For the same problem, your finalPlan must always define the same set of deliverables (same file paths and commands). Decide the minimal complete set of steps once; do not vary the list of files or commands between runs.`;
 
 /**
  * Generate chain-of-thought reasoning for a complex problem.
@@ -75,7 +85,7 @@ Think through this problem step by step. Break it down into logical reasoning st
       { role: "user", content: userContent },
     ],
     options.apiKey,
-    { model: options.model }
+    { model: options.model, temperature: 0 }
   );
 
   // Parse JSON response robustly

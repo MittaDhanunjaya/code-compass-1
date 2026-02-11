@@ -4,7 +4,7 @@ import { decrypt } from "@/lib/encrypt";
 import { getProvider, getModelForProvider, PROVIDERS, type ProviderId } from "@/lib/llm/providers";
 import type { AgentPlan, AgentLogEntry, AgentExecuteResult } from "@/lib/agent/types";
 import { applyEdit } from "@/lib/agent/diff-engine";
-import { executeCommandInWorkspace } from "@/lib/agent/execute-command-server";
+import { executeCommandInWorkspace, executeCommand } from "@/lib/agent/execute-command-server";
 import { classifyCommandKind, classifyCommandResult } from "@/lib/agent/command-classify";
 import { proposeFixSteps, buildTails } from "@/lib/agent/self-debug";
 import { extractPortFromError, findAvailablePort } from "@/lib/agent/port-utils";
@@ -351,7 +351,6 @@ export async function POST(request: Request) {
             // Create command executor for sandbox
             const executeSandboxCommand = async (command: string, cwd: string) => {
               await syncSandboxToDisk(supabase, sandboxRunId!);
-              const { executeCommand } = require("@/lib/agent/execute-command-server");
               const COMMAND_TIMEOUT_MS = 60000;
               try {
                 const result = await executeCommand(command, cwd, COMMAND_TIMEOUT_MS);

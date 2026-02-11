@@ -13,7 +13,7 @@ import { test, expect } from "@playwright/test";
 import * as fs from "fs";
 import * as path from "path";
 
-const BASE_URL = process.env.E2E_BASE_URL || "http://localhost:3000";
+const BASE_URL = process.env.E2E_BASE_URL || "http://localhost:3001";
 const USER_EMAIL = process.env.E2E_USER_EMAIL;
 const USER_PASSWORD = process.env.E2E_USER_PASSWORD;
 const OPENROUTER_KEY = process.env.E2E_OPENROUTER_KEY;

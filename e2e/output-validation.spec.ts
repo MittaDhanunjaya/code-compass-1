@@ -8,7 +8,7 @@
  * Run: E2E_USER_EMAIL=... E2E_USER_PASSWORD=... npx playwright test e2e/output-validation.spec.ts --headed --timeout=900000
  *
  * Prerequisites:
- * - npm run dev on port 3000
+ * - npm run dev on port 3001 (or set E2E_BASE_URL)
  * - E2E_USER_EMAIL, E2E_USER_PASSWORD in .env.local
  * - API keys configured in Settings (OpenRouter, etc.)
  */
@@ -17,7 +17,7 @@ import { test, expect } from "@playwright/test";
 import * as fs from "fs";
 import * as path from "path";
 
-const BASE_URL = process.env.E2E_BASE_URL || "http://localhost:3000";
+const BASE_URL = process.env.E2E_BASE_URL || "http://localhost:3001";
 const USER_EMAIL = process.env.E2E_USER_EMAIL;
 const USER_PASSWORD = process.env.E2E_USER_PASSWORD;
 const REPORT_PATH = path.join(process.cwd(), "e2e-output-validation-report.md");
@@ -25,7 +25,7 @@ const REPORT_PATH = path.join(process.cwd(), "e2e-output-validation-report.md");
 // --- Helpers ---
 
 async function signIn(page: import("@playwright/test").Page) {
-  await page.goto(BASE_URL, { waitUntil: "networkidle" });
+  await page.goto(BASE_URL, { waitUntil: "load" });
   if (page.url().includes("/sign-in") && USER_EMAIL && USER_PASSWORD) {
     await page.getByLabel(/email/i).fill(USER_EMAIL);
     await page.getByLabel(/password/i).fill(USER_PASSWORD);
@@ -138,50 +138,122 @@ async function submitAgentTaskAndWait(
   instruction: string,
   opts?: { timeoutMs?: number }
 ): Promise<{ completed: boolean; hasPlan: boolean; hasExecuteResult: boolean; error?: string }> {
-  await page.getByRole("button", { name: /^agent$/i }).click();
-  await page.waitForTimeout(800);
+  try {
+    console.log("[TEST] Switching to Agent tab...");
+    const agentTab = page.locator('button').filter({ hasText: /^agent$/i }).first();
+    if (!(await agentTab.isVisible({ timeout: 5000 }).catch(() => false))) {
+      const agentTabAlt = page.getByRole("button", { name: /agent/i }).first();
+      await agentTabAlt.click({ timeout: 5000 });
+    } else {
+      await agentTab.click();
+    }
+    await page.waitForTimeout(1000);
+    console.log("[TEST] Agent tab clicked, waiting for panel to load...");
 
-  const textarea = page.getByPlaceholder(/add a readme|paste terminal|describe a task/i).first();
-  await textarea.fill(instruction);
-  await page.waitForTimeout(400);
+    const panelSelector = 'textarea, [placeholder*="task"], [placeholder*="readme"]';
+    await page.waitForSelector(panelSelector, { timeout: 15000 });
+    console.log("[TEST] Agent panel loaded, finding textarea...");
 
-  await page.getByRole("button", { name: /^start$/i }).click();
+    const textarea = page.getByPlaceholder(/add a readme|paste terminal|describe a task/i).first();
+    if (!(await textarea.isVisible({ timeout: 5000 }).catch(() => false))) {
+      const textareaAlt = page.locator('textarea').first();
+      await textareaAlt.fill(instruction);
+    } else {
+      await textarea.fill(instruction);
+    }
+    await page.waitForTimeout(500);
+    console.log("[TEST] Instruction filled, looking for Start button...");
+
+    const startBtn = page.getByRole("button", { name: /^start$/i }).first();
+    if (!(await startBtn.isVisible({ timeout: 5000 }).catch(() => false))) {
+      const startBtnAlt = page.locator('button').filter({ hasText: /start/i }).first();
+      await startBtnAlt.click({ timeout: 5000 });
+    } else {
+      await startBtn.click();
+    }
+    console.log("[TEST] Start button clicked, waiting for planning to begin...");
+  } catch (stepError) {
+    const msg = stepError instanceof Error ? stepError.message : String(stepError);
+    console.log(`[TEST] Agent setup failed: ${msg}`);
+    await page.screenshot({ path: `test-results/agent-setup-failed-${Date.now()}.png` }).catch(() => {});
+    return { completed: false, hasPlan: false, hasExecuteResult: false, error: `Setup failed: ${msg}` };
+  }
 
   const timeoutMs = opts?.timeoutMs ?? 600000; // 10 min default
   const start = Date.now();
 
-  // Wait for plan phase
-  await page.waitForSelector('text=/planning|Planned|Approve|Reject/i', { timeout: 60000 }).catch(() => {});
+  // Wait for plan phase with better error handling
+  console.log("[TEST] Waiting for planning to start (up to 60s)...");
+  try {
+    await page.waitForSelector('text=/planning|Planned|Approve|Reject/i', { timeout: 60000 });
+    console.log("[TEST] Planning phase detected!");
+  } catch (e) {
+    console.log("[TEST] Planning phase not detected, checking for errors...");
+    // Check for errors
+    const errorEl = page.locator('[class*="destructive"], [class*="error"]').first();
+    if (await errorEl.isVisible({ timeout: 2000 }).catch(() => false)) {
+      const errText = await errorEl.textContent().catch(() => "");
+      console.log(`[TEST] Error detected: ${errText}`);
+      return { completed: false, hasPlan: false, hasExecuteResult: false, error: errText || "Planning failed" };
+    }
+    // Take screenshot for debugging
+    await page.screenshot({ path: `test-results/planning-timeout-${Date.now()}.png` }).catch(() => {});
+  }
 
   // Click Approve if visible
+  console.log("[TEST] Checking for Approve button...");
   const approveBtn = page.getByRole("button", { name: /approve/i });
-  if (await approveBtn.isVisible().catch(() => false)) {
+  if (await approveBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+    console.log("[TEST] Approve button found, clicking...");
     await approveBtn.click();
     await page.waitForTimeout(3000);
+  } else {
+    console.log("[TEST] No Approve button found, continuing...");
   }
 
   // Wait for execute to complete (sandbox, review, or done)
+  console.log("[TEST] Waiting for execution to complete (up to 10 min)...");
+  let checkCount = 0;
   while (Date.now() - start < timeoutMs) {
+    checkCount++;
+    if (checkCount % 12 === 0) { // Log every minute
+      console.log(`[TEST] Still waiting... (${Math.floor((Date.now() - start) / 1000)}s elapsed)`);
+    }
+    
     const hasDone = await page.locator('text=/Files created|Applied|done|Apply accepted/i').isVisible().catch(() => false);
     const hasReview = await page.locator('text=/pendingReview|Review each file|Apply accepted/i').isVisible().catch(() => false);
-    const hasError = await page.locator('[class*="destructive"]').filter({
-      hasText: /no api key|401|failed|error/i,
+    const hasError = await page.locator('[class*="destructive"], [class*="error"]').filter({
+      hasText: /no api key|401|failed|error|unauthorized/i,
     }).isVisible().catch(() => false);
 
     if (hasError) {
-      const errEl = page.locator('[class*="destructive"]').first();
+      const errEl = page.locator('[class*="destructive"], [class*="error"]').first();
       const errText = await errEl.textContent().catch(() => "");
+      console.log(`[TEST] Error detected: ${errText}`);
+      await page.screenshot({ path: `test-results/error-${Date.now()}.png` }).catch(() => {});
       return { completed: false, hasPlan: true, hasExecuteResult: false, error: errText || "API/Model error" };
     }
 
-    if (hasDone || hasReview) {
+    if (hasDone) {
+      console.log("[TEST] Execution completed!");
+      return { completed: true, hasPlan: true, hasExecuteResult: true };
+    }
+    
+    if (hasReview) {
+      console.log("[TEST] Review phase detected!");
       return { completed: true, hasPlan: true, hasExecuteResult: true };
     }
 
     await page.waitForTimeout(5000);
   }
 
-  return { completed: false, hasPlan: true, hasExecuteResult: false, error: "Timeout" };
+  console.log("[TEST] Timeout reached, taking final screenshot...");
+  const screenshotPath = `test-results/timeout-${Date.now()}.png`;
+  await page.screenshot({ path: screenshotPath }).catch(() => {});
+  // Snapshot visible status text for the report
+  const statusText = await page.locator('[class*="status"], [class*="error"], [class*="destructive"]').first().textContent().catch(() => "").then((t) => (t || "").slice(0, 200));
+  console.log(`[TEST] Last visible status/error: ${statusText || "(none)"}`);
+  return { completed: false, hasPlan: true, hasExecuteResult: false, error: `Timeout after ${Math.round(timeoutMs / 60000)} min. ${statusText ? `Last: ${statusText}` : ""}` };
 }
 
 /** Apply all Agent review edits (check all, click Apply accepted). */
@@ -400,23 +472,39 @@ test.describe("Output Validation - Quality Assessment", () => {
   test.setTimeout(900_000); // 15 min per test
 
   test.beforeEach(async ({ page }) => {
+    // Ensure test-results directory exists
+    const testResultsDir = path.join(process.cwd(), "test-results");
+    if (!fs.existsSync(testResultsDir)) {
+      fs.mkdirSync(testResultsDir, { recursive: true });
+    }
+    
     if (!USER_EMAIL || !USER_PASSWORD) {
       test.skip(true, "Set E2E_USER_EMAIL and E2E_USER_PASSWORD");
       return;
     }
+    console.log(`[TEST] Signing in as ${USER_EMAIL}...`);
     await signIn(page);
     await page.waitForTimeout(1500);
+    console.log("[TEST] Signed in successfully");
   });
 
   test("1. Agent: Build complete 3-tier e-commerce project", async ({ page }) => {
+    console.log("[TEST] Starting Agent e-commerce test...");
     await dismissFirstRunDialog(page);
+    console.log("[TEST] First-run dialog dismissed");
 
     // Create empty workspace
+    console.log("[TEST] Creating workspace...");
     const workspaceId = await createWorkspace(page, `e2e-ecommerce-${Date.now()}`);
     expect(workspaceId).toBeTruthy();
+    console.log(`[TEST] Workspace created: ${workspaceId}`);
 
-    await page.goto(`${BASE_URL}/app/${workspaceId}`, { waitUntil: "networkidle" });
+    await page.goto(`${BASE_URL}/app/${workspaceId}`, { waitUntil: "load", timeout: 30000 });
     await page.waitForTimeout(2000);
+    console.log("[TEST] Navigated to workspace, waiting for UI to load...");
+    
+    // Take screenshot for debugging
+    await page.screenshot({ path: `test-results/workspace-loaded-${workspaceId}.png` }).catch(() => {});
 
     const task = `Build a complete 3-tier architecture for an online e-commerce website with:
 - Presentation tier: Next.js 15 app with pages for: Home (product listing), Product detail, Cart, Checkout.
@@ -426,7 +514,13 @@ test.describe("Output Validation - Quality Assessment", () => {
 - Tests: At least one unit test for the API routes.
 - The app must run on npm run dev and display the product list on the home page.`;
 
-    const result = await submitAgentTaskAndWait(page, task, { timeoutMs: 600000 });
+    const emptyPlanPattern = /empty plan|no valid steps|returned no steps|missing required fields/i;
+    let result = await submitAgentTaskAndWait(page, task, { timeoutMs: 600000 });
+    if (!result.completed && result.error && emptyPlanPattern.test(result.error)) {
+      console.log("[TEST] Empty-plan error detected; retrying agent task once...");
+      await page.waitForTimeout(3000);
+      result = await submitAgentTaskAndWait(page, task, { timeoutMs: 600000 });
+    }
     if (!result.completed) {
       validationResults.push({
         name: "Agent: 3-tier e-commerce",
@@ -523,11 +617,15 @@ test.describe("Output Validation - Quality Assessment", () => {
       { path: "tsconfig.json", content: tsconfig },
     ]);
 
-    await page.goto(`${BASE_URL}/app/${workspaceId}`, { waitUntil: "networkidle" });
+    await page.goto(`${BASE_URL}/app/${workspaceId}`, { waitUntil: "load", timeout: 30000 });
     await page.waitForTimeout(2000);
 
     await page.getByRole("button", { name: /^composer$/i }).click();
     await page.waitForTimeout(800);
+
+    // Use "Workspace" scope so Generate edits is enabled without opening a file
+    await page.getByRole("button", { name: /workspace\s*\(/i }).click();
+    await page.waitForTimeout(400);
 
     const textarea = page.getByPlaceholder(/add logging|edit instruction/i).first();
     await textarea.fill(
@@ -598,7 +696,7 @@ test.describe("Output Validation - Quality Assessment", () => {
     await dismissFirstRunDialog(page);
 
     const workspaceId = await createWorkspace(page, `e2e-chat-${Date.now()}`);
-    await page.goto(`${BASE_URL}/app/${workspaceId}`, { waitUntil: "networkidle" });
+    await page.goto(`${BASE_URL}/app/${workspaceId}`, { waitUntil: "load", timeout: 30000 });
     await page.waitForTimeout(2000);
 
     await page.getByRole("button", { name: /^chat$/i }).click();
@@ -616,7 +714,16 @@ test.describe("Output Validation - Quality Assessment", () => {
     const sendBtn = page.getByTitle(/send message/i).or(page.locator('form button[type="submit"]'));
     await sendBtn.click();
 
-    await page.waitForTimeout(60000);
+    // Wait for assistant response (last .bg-muted with substantial content) instead of fixed 60s
+    await page.waitForFunction(
+      () => {
+        const els = document.querySelectorAll(".bg-muted");
+        const last = els[els.length - 1];
+        return last && last.textContent && last.textContent.trim().length > 200;
+      },
+      { timeout: 120000 }
+    ).catch(() => {});
+    await page.waitForTimeout(2000);
 
     const response = await page.locator(".bg-muted").last().textContent().catch(() => "") || "";
     const hasExplanation = /CQRS|command.*query|segregation/i.test(response);
@@ -675,7 +782,7 @@ export async function GET() {
       },
     ]);
 
-    await page.goto(`${BASE_URL}/app/${workspaceId}`, { waitUntil: "networkidle" });
+    await page.goto(`${BASE_URL}/app/${workspaceId}`, { waitUntil: "load", timeout: 30000 });
     await page.waitForTimeout(2000);
 
     const fakeLog = `ReferenceError: product is not defined

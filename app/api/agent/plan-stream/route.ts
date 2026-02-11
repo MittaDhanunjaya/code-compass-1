@@ -48,6 +48,12 @@ Your approach:
 4. **Think about completeness**: Will the result actually work? Are all dependencies included? Are all configuration files present?
 5. **Consider edge cases**: What could go wrong? How can you prevent common errors?
 
+CONSISTENCY AND "THINK FIRST" (CRITICAL — same task must yield same plan every time):
+- **Enumerate before JSON**: Before outputting the JSON plan, in your reasoning messages explicitly list the exact set of file paths you will create or modify and the exact commands you will run. Example: "I will create: package.json, app/page.tsx, app/api/products/route.ts, ... and run: npm install, npm run dev." Then output a JSON plan that contains exactly those steps and no others.
+- **Canonical structure**: For project/application creation, determine the minimal complete set of deliverables required by the task (e.g. config, pages, API routes, data layer, tests). Use a fixed, canonical order: config first (package.json, tsconfig, etc.), then entry/app files, then routes/pages, then data/API, then tests, then commands (npm install, npm test, etc.). Same instruction must produce the same number of files and same paths on every run.
+- **No random variation**: Do not add optional files, extra pages, or alternate structures "for flexibility." Do not omit files that are required for the task. The plan must be deterministic: re-running the same user instruction should yield the same steps array (same paths and command list). Content inside files can vary; the list of deliverables (paths + commands) must not.
+- **One authoritative plan**: Produce exactly one complete plan. Do not output multiple alternatives or "option A / option B." Decide the minimal set that satisfies the task and output that set.
+
 Output format:
 1. Reasoning messages (emitted during thinking - see above)
 2. **ONLY** a single JSON object with this exact shape (no text before or after):
@@ -98,6 +104,7 @@ When fixing errors or bugs (CRITICAL - minimal edits):
 
 When creating projects:
 - **Think about completeness**: Will this actually run? Include README or HOW_TO_RUN, dependencies, and verify steps in dependency order.
+- For any command step like "npm run <script>", ensure your plan includes a step that defines that script (e.g. in package.json) before the command runs.
 - Use existing codebase patterns and structure.
 
 Remember: Your goal is to create working, maintainable solutions. Think through the problem systematically and use the codebase context to inform your decisions.`;
@@ -507,9 +514,15 @@ export async function POST(request: Request) {
         const isComplexTask =
           !looksLikeErrorFix &&
           !looksLikeSimpleRequest &&
-          instruction.length > 800 &&
-          instruction.split("\n").length > 15 &&
-          (lowerInstruction.includes("create") && (lowerInstruction.includes("application") || lowerInstruction.includes("from scratch") || lowerInstruction.includes("full project")));
+          (instruction.length > 400 &&
+            (lowerInstruction.includes("create") || lowerInstruction.includes("build")) &&
+            (lowerInstruction.includes("application") ||
+              lowerInstruction.includes("from scratch") ||
+              lowerInstruction.includes("full project") ||
+              lowerInstruction.includes("architecture") ||
+              lowerInstruction.includes("e-commerce") ||
+              lowerInstruction.includes("3-tier") ||
+              lowerInstruction.includes("tier")));
 
         let plan: AgentPlan | null = null;
 
@@ -519,34 +532,46 @@ export async function POST(request: Request) {
         }
         if (isComplexTask) {
           emit(createAgentEvent('reasoning', 'Using multi-step reasoning for complex task...'));
-          
+          const COT_TIMEOUT_MS = 90_000;
+          const HEARTBEAT_MS = 45_000;
+          const heartbeat = setInterval(() => {
+            emit(createAgentEvent('reasoning', 'Still reasoning... (complex tasks can take 1–2 min)'));
+          }, HEARTBEAT_MS);
+          const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), COT_TIMEOUT_MS));
+
           try {
-            const reasoningResult = await multiStepReasoning(
-              instruction,
-              userContent,
-              {
-                apiKey,
-                providerId,
-                model: resolvedModel,
+            const reasoningResult = await Promise.race([
+              multiStepReasoning(instruction, userContent, { apiKey, providerId, model: resolvedModel }),
+              timeoutPromise,
+            ]);
+            clearInterval(heartbeat);
+            if (reasoningResult === null) {
+              emit(createAgentEvent('reasoning', 'Reasoning took too long; using direct planning for faster response.'));
+              plan = null;
+            } else {
+              if (reasoningResult.reasoning.steps.length > 0) {
+                emit(createAgentEvent('reasoning', `Reasoned through ${reasoningResult.reasoning.steps.length} steps`));
+                for (const step of reasoningResult.reasoning.steps.slice(0, 5)) {
+                  emit(createAgentEvent('reasoning', `Step ${step.step}: ${step.thought}`));
+                }
               }
-            );
-
-            if (reasoningResult.reasoning.steps.length > 0) {
-              emit(createAgentEvent('reasoning', `Reasoned through ${reasoningResult.reasoning.steps.length} steps`));
-              for (const step of reasoningResult.reasoning.steps.slice(0, 5)) {
-                emit(createAgentEvent('reasoning', `Step ${step.step}: ${step.thought}`));
+              if (reasoningResult.plan) {
+                const cotPlan = reasoningResult.plan;
+                const hasStringSteps = Array.isArray(cotPlan.steps) && cotPlan.steps.length > 0 && cotPlan.steps.every((s: any) => typeof s === "string");
+                if (hasStringSteps) {
+                  emit(createAgentEvent('reasoning', `Reasoning returned text descriptions instead of step objects; using direct planning instead.`));
+                  plan = null;
+                } else {
+                  plan = cotPlan;
+                  emit(createAgentEvent('reasoning', `Plan generated from reasoning: ${plan.steps.length} step(s)`));
+                }
               }
-            }
-
-            if (reasoningResult.plan) {
-              plan = reasoningResult.plan;
-              emit(createAgentEvent('reasoning', `Plan generated from reasoning: ${plan.steps.length} step(s)`));
             }
           } catch (e) {
+            clearInterval(heartbeat);
             const reasoningError = e instanceof Error ? e.message : "Unknown error";
             console.error("Chain-of-thought reasoning failed, falling back to direct planning:", e);
             emit(createAgentEvent('reasoning', `Chain-of-thought failed: ${reasoningError}. Falling back to direct planning...`));
-            // Fall through to direct planning
           }
         }
 
@@ -581,7 +606,7 @@ export async function POST(request: Request) {
               { role: "user", content: userContent },
             ],
             apiKey,
-            { model: tryModel }
+            { model: tryModel, temperature: 0 }
           )) {
             raw += chunk;
             buffer += chunk;
@@ -758,7 +783,19 @@ export async function POST(request: Request) {
           const { parseJSONRobust } = await import("@/lib/utils/json-parser");
           const { logError } = await import("@/lib/utils/error-handler");
           
-          let parseResult = parseJSONRobust<AgentPlan>(trimmed, ["steps"]);
+          let parseResult: { success: boolean; data: AgentPlan | null; error?: string; raw?: string };
+          try {
+            parseResult = parseJSONRobust<AgentPlan>(trimmed, ["steps"]);
+          } catch (parseErr) {
+            const parseErrMsg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+            if (/maximum call stack size exceeded|rangeerror|stack overflow/i.test(parseErrMsg)) {
+              emit(createAgentEvent('status', 'Error: Plan response was too large or complex to parse. Try a shorter task or a different model.'));
+              emit(createAgentEvent('reasoning', 'The parser hit a limit. Try rephrasing the task or splitting it into smaller steps.'));
+              safeClose(controller);
+              return;
+            }
+            throw parseErr;
+          }
 
           if (!parseResult.success) {
             emit(createAgentEvent('status', 'Retrying plan parsing…'));
@@ -830,18 +867,194 @@ export async function POST(request: Request) {
               return;
             }
             
-            // If we still don't have a plan, log the parsing error
-            logError(
-              `Plan JSON parse failed: ${parseResult.error}`,
-              { category: "parsing", severity: "high" },
-              { raw: parseResult.raw || trimmed.slice(0, 500), originalLength: trimmed.length }
-            );
-            emit(createAgentEvent('status', `Error: Failed to parse JSON plan. ${parseResult.error}`));
-            emit(createAgentEvent('reasoning', `Parse error: ${parseResult.error}. Raw preview (first 500 chars): ${parseResult.raw || trimmed.slice(0, 500)}`));
-            safeClose(controller);
-            return;
+            // One retry: ask model to fix JSON syntax (include broken JSON so it can repair it)
+            const hasStepsKeyword = trimmed.includes('"steps"') || trimmed.includes("'steps'");
+            if (!plan && hasStepsKeyword && apiKey) {
+              emit(createAgentEvent('status', 'Plan JSON had syntax errors; retrying once for corrected output...'));
+              try {
+                const brokenJson = (extractJsonObject(trimmed) ?? trimmed.replace(/^[\s\S]*?(\{[\s\S]*\})\s*$/, "$1") ?? trimmed).slice(0, 25000);
+                const fixHint = "\n\n[System: Your previous response had invalid JSON. Fix the syntax errors (unescaped quotes in strings, missing commas, trailing commas) and output ONLY the corrected JSON object with a \"steps\" array. No markdown, no extra text.]\n\nBroken JSON to fix:\n" + brokenJson;
+                const retryModel = modelUsed || modelsToTry[0];
+                const retryResponse = await provider.chat(
+                  [
+                    { role: "system", content: systemPromptWithRules },
+                    { role: "user", content: userContent + fixHint },
+                  ],
+                  apiKey,
+                  { model: retryModel, temperature: 0 }
+                );
+                const retryRaw = (retryResponse.content || "").trim();
+                const jsonMatch = retryRaw.match(/\{[\s\S]*\}/);
+                const toParse = jsonMatch ? jsonMatch[0] : retryRaw;
+                if (toParse) {
+                  const retryResult = parseJSONRobust<AgentPlan>(toParse, ["steps"]);
+                  if (retryResult.success && retryResult.data?.steps?.length) {
+                    plan = retryResult.data;
+                    emit(createAgentEvent('reasoning', 'Retry succeeded: got valid JSON plan.'));
+                  }
+                }
+              } catch (retryErr) {
+                console.warn("JSON-syntax retry failed:", retryErr);
+              }
+            }
+
+            if (!plan) {
+              logError(
+                `Plan JSON parse failed: ${parseResult.error}`,
+                { category: "parsing", severity: "high" },
+                { raw: parseResult.raw || trimmed.slice(0, 500), originalLength: trimmed.length }
+              );
+              emit(createAgentEvent('status', `Error: Failed to parse JSON plan. ${parseResult.error}`));
+              emit(createAgentEvent('reasoning', `Parse error: ${parseResult.error}. Raw preview (first 500 chars): ${parseResult.raw || trimmed.slice(0, 500)}`));
+              safeClose(controller);
+              return;
+            }
           }
         } // End of "if (!plan)" parsing block
+
+        // Retry once when model returns valid JSON but empty steps (common with some OpenRouter/free models)
+        if (plan && Array.isArray(plan.steps) && plan.steps.length === 0 && apiKey) {
+          const retrySuffix = "\n\n[System: Your previous response had an empty \"steps\" array. You MUST output a JSON object with a non-empty \"steps\" array. Each step must be an object with \"type\" (\"file_edit\" or \"command\"), and for file_edit: \"path\" and \"newContent\"; for command: \"command\". Output ONLY valid JSON, no markdown or extra text.]";
+          emit(createAgentEvent('status', 'Model returned empty steps; retrying once with stronger prompt...'));
+          emit(createAgentEvent('reasoning', 'Retrying plan generation (empty steps array).'));
+          try {
+            const retryModel = modelUsed || modelsToTry[0];
+            const retryResponse = await provider.chat(
+              [
+                { role: "system", content: systemPromptWithRules },
+                { role: "user", content: userContent + retrySuffix },
+              ],
+              apiKey,
+              { model: retryModel }
+            );
+            const retryRaw = (retryResponse.content || "").trim();
+            if (retryRaw) {
+              const { parseJSONRobust } = await import("@/lib/utils/json-parser");
+              const retryResult = parseJSONRobust<AgentPlan>(retryRaw, ["steps"]);
+              if (retryResult.success && retryResult.data?.steps && Array.isArray(retryResult.data.steps) && retryResult.data.steps.length > 0) {
+                plan = retryResult.data;
+                emit(createAgentEvent('reasoning', `Retry succeeded: got ${plan.steps.length} step(s).`));
+              }
+            }
+          } catch (retryErr) {
+            console.warn("Empty-steps retry failed:", retryErr);
+            emit(createAgentEvent('reasoning', 'Retry failed; will report empty plan.'));
+          }
+        }
+
+        // Validate: any "npm run <script>" must have a prior step that defines that script (e.g. in package.json)
+        function missingNpmScripts(p: AgentPlan): string[] {
+          const steps = Array.isArray(p.steps) ? p.steps : [];
+          const scriptUsed = new Set<string>();
+          for (const s of steps) {
+            if (s?.type === "command" && typeof (s as any).command === "string") {
+              const m = (s as any).command.trim().match(/^npm\s+run\s+(\S+)/);
+              if (m) scriptUsed.add(m[1]);
+            }
+          }
+          if (scriptUsed.size === 0) return [];
+          const packageJsonContent = steps
+            .filter((s: any) => s?.type === "file_edit" && (s.path === "package.json" || s.path?.endsWith("/package.json")))
+            .map((s: any) => (s.newContent || ""))
+            .join("\n");
+          const missing: string[] = [];
+          for (const script of scriptUsed) {
+            if (!packageJsonContent.includes(`"${script}"`) && !packageJsonContent.includes(`'${script}'`))
+              missing.push(script);
+          }
+          return missing;
+        }
+
+        if (plan && Array.isArray(plan.steps) && plan.steps.length > 0 && apiKey) {
+          const missing = missingNpmScripts(plan);
+          if (missing.length > 0) {
+            const scriptsList = missing.join(", ");
+            emit(createAgentEvent('reasoning', `Plan runs "npm run ${scriptsList}" but no step defines ${missing.length === 1 ? "this script" : "these scripts"} in package.json. Asking the model to correct the plan.`));
+            const scriptsForPrompt = missing.map((s) => '"' + s + '"').join(", ");
+            const hint = "\n\n[System: Your plan includes command(s) \"npm run " + scriptsList + "\" but no file_edit step that adds " + (missing.length === 1 ? "this script" : "these scripts") + " to package.json. Add or adjust a package.json step so that \"scripts\" includes " + scriptsForPrompt + " (e.g. \"dev\": \"next dev\" or \"vite\"). Then output the corrected JSON plan only.]";
+            try {
+              const retryModel = modelUsed || modelsToTry[0];
+              const retryResponse = await provider.chat(
+                [
+                  { role: "system", content: systemPromptWithRules },
+                  { role: "user", content: userContent + hint },
+                ],
+                apiKey,
+                { model: retryModel, temperature: 0 }
+              );
+              const retryRaw = (retryResponse.content || "").trim();
+              const jsonMatch = retryRaw.match(/\{[\s\S]*\}/);
+              const toParse = jsonMatch ? jsonMatch[0] : retryRaw;
+              if (toParse) {
+                const { parseJSONRobust } = await import("@/lib/utils/json-parser");
+                const retryResult = parseJSONRobust<AgentPlan>(toParse, ["steps"]);
+                if (retryResult.success && retryResult.data?.steps?.length) {
+                  const stillMissing = missingNpmScripts(retryResult.data);
+                  if (stillMissing.length === 0) {
+                    plan = retryResult.data;
+                    emit(createAgentEvent('reasoning', `Plan corrected: package.json now defines required script(s).`));
+                  }
+                }
+              }
+            } catch (retryErr) {
+              console.warn("npm-script validation retry failed:", retryErr);
+            }
+            // If still missing after retry: patch package.json step or inject one
+            const stillMissing = plan ? missingNpmScripts(plan) : [];
+            if (stillMissing.length > 0 && workspaceId && plan?.steps) {
+              const defaultScripts: Record<string, string> = {
+                dev: "next dev",
+                start: "next start",
+                build: "next build",
+                test: "vitest run",
+              };
+              try {
+                const pkgIdx = plan.steps.findIndex((st: any) => st?.type === "file_edit" && (st.path === "package.json" || st.path?.endsWith("/package.json")));
+                let pkg: Record<string, unknown>;
+                if (pkgIdx >= 0 && (plan.steps[pkgIdx] as any).newContent) {
+                  try {
+                    pkg = JSON.parse((plan.steps[pkgIdx] as any).newContent);
+                  } catch {
+                    pkg = { name: "app", version: "1.0.0" };
+                  }
+                } else {
+                  const { data: pkgRows } = await supabase
+                    .from("workspace_files")
+                    .select("path, content")
+                    .eq("workspace_id", workspaceId)
+                    .in("path", ["package.json"]);
+                  pkg = pkgRows?.[0]?.content ? (() => {
+                    try { return JSON.parse(pkgRows[0].content as string); } catch { return {}; }
+                  })() : { name: "app", version: "1.0.0" };
+                }
+                if (!pkg || typeof pkg !== "object") pkg = { name: "app", version: "1.0.0" };
+                if (!pkg.name) pkg.name = "app";
+                if (!pkg.version) pkg.version = "1.0.0";
+                const scripts = (pkg.scripts && typeof pkg.scripts === "object") ? { ...pkg.scripts } : {};
+                for (const s of stillMissing) {
+                  const cmd = defaultScripts[s as keyof typeof defaultScripts] || "echo 'Add script'";
+                  scripts[s] = scripts[s] || cmd;
+                  if (s === "dev" && cmd.startsWith("next ") && (!pkg.dependencies || !(pkg.dependencies as Record<string, string>).next)) {
+                    const deps = (pkg.dependencies && typeof pkg.dependencies === "object") ? { ...pkg.dependencies } : {};
+                    deps.next = deps.next || "^14.0.0";
+                    pkg.dependencies = deps;
+                  }
+                }
+                pkg.scripts = scripts;
+                const newContent = JSON.stringify(pkg, null, 2);
+                if (pkgIdx >= 0) {
+                  (plan.steps[pkgIdx] as any).newContent = newContent;
+                  emit(createAgentEvent('reasoning', `Patched package.json step to add scripts: ${stillMissing.join(", ")}`));
+                } else {
+                  plan.steps.unshift({ type: "file_edit" as const, path: "package.json", newContent, description: `Add scripts: ${stillMissing.join(", ")}` });
+                  emit(createAgentEvent('reasoning', `Injected package.json step to add scripts: ${stillMissing.join(", ")}`));
+                }
+              } catch (injectErr) {
+                console.warn("Failed to inject/patch package.json step:", injectErr);
+              }
+            }
+          }
+        }
 
         if (!plan || !Array.isArray(plan.steps)) {
           console.error("Invalid plan structure:", plan);
@@ -870,12 +1083,38 @@ export async function POST(request: Request) {
         
         // Check if steps are strings (descriptions) instead of objects - common LLM mistake
         const allStepsAreStrings = plan.steps.length > 0 && plan.steps.every((s: any) => typeof s === "string");
-        if (allStepsAreStrings) {
+        if (allStepsAreStrings && apiKey) {
+          emit(createAgentEvent('status', 'Steps were plain text; retrying with hint for proper step objects...'));
+          const hint = "\n\n[System: Your previous response had \"steps\" as an array of STRINGS (e.g. [\"Create file X\", \"Run npm install\"]). WRONG. Each step MUST be an OBJECT: {\"type\": \"file_edit\", \"path\": \"...\", \"newContent\": \"...\"} or {\"type\": \"command\", \"command\": \"...\"}. Output ONLY valid JSON with step objects.]";
+          try {
+            const retryModel = modelUsed || modelsToTry[0];
+            const retryResponse = await provider.chat(
+              [
+                { role: "system", content: systemPromptWithRules },
+                { role: "user", content: userContent + hint },
+              ],
+              apiKey,
+              { model: retryModel, temperature: 0 }
+            );
+            const retryRaw = (retryResponse.content || "").trim();
+            const jsonMatch = retryRaw.match(/\{[\s\S]*\}/);
+            const toParse = jsonMatch ? jsonMatch[0] : retryRaw;
+            if (toParse) {
+              const { parseJSONRobust } = await import("@/lib/utils/json-parser");
+              const retryResult = parseJSONRobust<AgentPlan>(toParse, ["steps"]);
+              const hasObjectSteps = retryResult.success && Array.isArray(retryResult.data?.steps) && retryResult.data.steps.length > 0 && retryResult.data.steps.every((s: any) => s && typeof s === "object");
+              if (hasObjectSteps) {
+                plan = retryResult.data;
+                emit(createAgentEvent('reasoning', 'Retry succeeded: got proper step objects.'));
+              }
+            }
+          } catch (retryErr) {
+            console.warn("String-steps retry failed:", retryErr);
+          }
+        }
+        if (allStepsAreStrings && (!plan || plan.steps.some((s: any) => typeof s === "string"))) {
           emit(createAgentEvent('status', 'Error: Plan steps are plain text descriptions instead of step objects.'));
-          emit(createAgentEvent('reasoning', 'The model returned step descriptions (strings) instead of step objects. Each step must be an OBJECT.'));
-          emit(createAgentEvent('reasoning', 'WRONG: "steps": ["Modify package.json", "Update README"]'));
-          emit(createAgentEvent('reasoning', 'CORRECT: "steps": [{"type": "file_edit", "path": "package.json", "newContent": "..."}, {"type": "command", "command": "npm start"}]'));
-          emit(createAgentEvent('reasoning', 'Each step must have: type ("file_edit" or "command"), and for file_edit: path + newContent; for command: command'));
+          emit(createAgentEvent('reasoning', 'Each step must be an OBJECT with type, path/newContent or command.'));
           safeClose(controller);
           return;
         }
@@ -948,7 +1187,10 @@ export async function POST(request: Request) {
                 `  Step ${index + 1}: ${reason}\n    Full step: ${JSON.stringify(step, null, 2).slice(0, 400)}`
               ).join("\n\n")}`
             : "";
-          emit(createAgentEvent('status', `Error: Plan has no valid steps. All ${plan.steps.length} step(s) are missing required fields.${errorDetails}`));
+          const emptyStepsMessage = plan.steps.length === 0
+            ? "Error: The model returned no steps (empty plan). Try again, use a different model (e.g. another OpenRouter model), or rephrase the task."
+            : `Error: Plan has no valid steps. All ${plan.steps.length} step(s) are missing required fields.${errorDetails}`;
+          emit(createAgentEvent('status', emptyStepsMessage));
           emit(createAgentEvent('reasoning', `Full plan structure: ${JSON.stringify(plan, null, 2).slice(0, 1000)}`));
           console.error("Invalid plan steps:", JSON.stringify(plan.steps, null, 2));
           safeClose(controller);

@@ -209,7 +209,7 @@ function doResolve(
   resolve(result);
 }
 
-async function executeCommand(
+export async function executeCommand(
   command: string,
   cwd: string,
   timeoutMs: number,

@@ -79,6 +79,10 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
   const [agentFullFileReplaceConfirmOpen, setAgentFullFileReplaceConfirmOpen] = useState(false);
   const [pendingFullFileReplaceEdits, setPendingFullFileReplaceEdits] = useState<{ path: string; content: string }[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [autoRetryIn, setAutoRetryIn] = useState<number | null>(null); // seconds until auto-retry, null when not scheduled
+  const autoRetryCountRef = useRef(0);
+  const autoRetryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoRetryIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [logAttachment, setLogAttachment] = useState<LogAttachment | null>(null);
   const [useDebugForLogs] = useState(() => {
     if (typeof window === "undefined") return true;
@@ -158,6 +162,11 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
   const [defaultGroupSaving, setDefaultGroupSaving] = useState(false);
   const [rulesFile, setRulesFile] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  /** Stuck detection: if no stream progress for this long, auto-abort so user isn't left hanging. */
+  const STUCK_TIMEOUT_MS = 240_000; // 4 minutes
+  const lastActivityRef = useRef<number>(0);
+  const stuckTimeoutIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const stuckTimeoutAbortRef = useRef(false);
   const eventsEndRef = useRef<HTMLDivElement | null>(null);
   const [showAgentFeedback, setShowAgentFeedback] = useState(false);
 
@@ -293,6 +302,52 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
     } catch {}
   }, [workspaceId]);
 
+  // Reset auto-retry count when user changes instruction or workspace (new run gets one retry)
+  useEffect(() => {
+    autoRetryCountRef.current = 0;
+  }, [instruction, workspaceId]);
+
+  // Clear pending auto-retry on unmount or when instruction/workspace changes
+  useEffect(() => {
+    return () => {
+      if (autoRetryIntervalRef.current != null) {
+        clearInterval(autoRetryIntervalRef.current);
+        autoRetryIntervalRef.current = null;
+      }
+      if (autoRetryTimeoutRef.current != null) {
+        clearTimeout(autoRetryTimeoutRef.current);
+        autoRetryTimeoutRef.current = null;
+      }
+      setAutoRetryIn(null);
+    };
+  }, [instruction, workspaceId]);
+
+  // Stuck-timeout: if no stream progress for 2 min while planning/executing, auto-abort so user isn't left hanging
+  useEffect(() => {
+    if (phase !== "loading_plan" && phase !== "executing") {
+      if (stuckTimeoutIntervalRef.current) {
+        clearInterval(stuckTimeoutIntervalRef.current);
+        stuckTimeoutIntervalRef.current = null;
+      }
+      stuckTimeoutAbortRef.current = false;
+      return;
+    }
+    lastActivityRef.current = Date.now();
+    const checkMs = 15_000;
+    stuckTimeoutIntervalRef.current = setInterval(() => {
+      if (Date.now() - lastActivityRef.current > STUCK_TIMEOUT_MS && abortControllerRef.current) {
+        stuckTimeoutAbortRef.current = true;
+        abortControllerRef.current.abort();
+      }
+    }, checkMs);
+    return () => {
+      if (stuckTimeoutIntervalRef.current) {
+        clearInterval(stuckTimeoutIntervalRef.current);
+        stuckTimeoutIntervalRef.current = null;
+      }
+    };
+  }, [phase]);
+
   const fetchFileList = useCallback(async (): Promise<string[]> => {
     if (!workspaceId) return [];
     const res = await fetch(`/api/workspaces/${workspaceId}/files`);
@@ -376,6 +431,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
 
       while (true) {
         const { done, value } = await reader.read();
+        if (value) lastActivityRef.current = Date.now();
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
@@ -571,6 +627,12 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
       }
     } catch (e) {
       if (e instanceof Error && e.name === "AbortError") {
+        if (stuckTimeoutAbortRef.current) {
+          stuckTimeoutAbortRef.current = false;
+          setError("Request timed out. The model may have stalled. Try again.");
+          setPhase("idle");
+          return;
+        }
         const cancelEvent: AgentEvent = {
           id: `${Date.now()}`,
           type: "status",
@@ -592,6 +654,9 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
         return;
       }
       const errorMsg = e instanceof Error ? e.message : "Plan failed";
+      const isRetryable =
+        /empty plan returned|no valid steps|returned no steps|maximum call stack size exceeded|missing required fields/i.test(errorMsg);
+
       if (/failed to fetch|network error|load failed|network request failed/i.test(errorMsg)) {
         setError("Connection lost. Check your network and try again.");
       } else if (errorMsg.includes("No API key configured")) {
@@ -612,6 +677,29 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
         setError(msg);
       }
       setPhase("idle");
+
+      // Auto-retry once for model/plan failures (empty plan, stack overflow, etc.)
+      if (isRetryable && autoRetryCountRef.current < 1) {
+        autoRetryCountRef.current = 1;
+        const delayMs = 3000;
+        let remaining = Math.ceil(delayMs / 1000);
+        setAutoRetryIn(remaining);
+        const intervalId = setInterval(() => {
+          remaining -= 1;
+          setAutoRetryIn((r) => (r != null && r > 0 ? r - 1 : null));
+        }, 1000);
+        autoRetryIntervalRef.current = intervalId;
+        autoRetryTimeoutRef.current = window.setTimeout(() => {
+          if (autoRetryIntervalRef.current) {
+            clearInterval(autoRetryIntervalRef.current);
+            autoRetryIntervalRef.current = null;
+          }
+          autoRetryTimeoutRef.current = null;
+          setAutoRetryIn(null);
+          setError(null);
+          startPlan();
+        }, delayMs);
+      }
     } finally {
       abortControllerRef.current = null;
     }
@@ -669,8 +757,8 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
 
         while (true) {
           const { done, value } = await reader.read();
-          
           if (value) {
+            lastActivityRef.current = Date.now();
             buffer += decoder.decode(value, { stream: true });
           }
           
@@ -904,6 +992,12 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
         window.dispatchEvent(new CustomEvent("refresh-file-tree"));
       } catch (e) {
         if (e instanceof Error && e.name === "AbortError") {
+          if (stuckTimeoutAbortRef.current) {
+            stuckTimeoutAbortRef.current = false;
+            setError("Request timed out. The model may have stalled. Try Rerun to try again.");
+            setPhase("plan_ready");
+            return;
+          }
           const cancelEvent: AgentEvent = {
             id: `${Date.now()}`,
             type: "status",
@@ -1072,7 +1166,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
     : "Workspace: …";
 
   return (
-    <div className="flex flex-1 flex-col overflow-hidden">
+    <div className="flex flex-1 flex-col min-h-0 overflow-hidden">
       <div className="flex shrink-0 flex-col gap-1 border-b border-border px-2 py-1.5 min-w-0">
         <p className="text-xs font-medium text-muted-foreground truncate" title={workspaceLabelText}>
           {workspaceLabelText}
@@ -1262,7 +1356,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
         </div>
       </div>
 
-      <div className="flex flex-1 flex-col overflow-y-auto p-3 space-y-3">
+      <div className="flex flex-1 flex-col min-h-0 overflow-y-auto overflow-x-hidden p-3 space-y-3">
         <p className="text-[11px] text-muted-foreground/90 flex items-center gap-1.5 flex-wrap">
           <span>Rules: {rulesFile ?? "No rules file"}</span>
           <button
@@ -1423,11 +1517,25 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
         {error && (
           <div className="space-y-2">
             <ErrorWithAction message={error} />
+            {autoRetryIn != null && autoRetryIn > 0 ? (
+              <p className="text-sm text-muted-foreground">
+                Retrying in {autoRetryIn} second{autoRetryIn !== 1 ? "s" : ""}…
+              </p>
+            ) : null}
             <Button
               variant="outline"
               size="sm"
               className="h-8"
               onClick={() => {
+                if (autoRetryTimeoutRef.current != null) {
+                  clearTimeout(autoRetryTimeoutRef.current);
+                  autoRetryTimeoutRef.current = null;
+                }
+                if (autoRetryIntervalRef.current != null) {
+                  clearInterval(autoRetryIntervalRef.current);
+                  autoRetryIntervalRef.current = null;
+                }
+                setAutoRetryIn(null);
                 setError(null);
                 if (phase === "plan_ready" && plan) {
                   approveAndExecute();
@@ -1436,7 +1544,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                 }
               }}
             >
-              Retry
+              {autoRetryIn != null ? "Retry now" : "Retry"}
             </Button>
           </div>
         )}
@@ -1472,32 +1580,34 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
           </div>
         )}
 
-        {/* Plan review */}
+        {/* Plan review: constrained height so Approve/Reject stay visible */}
         {phase === "plan_ready" && plan && (
-          <div className="space-y-2 rounded-lg border border-border bg-muted/20 p-3">
-            <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground flex-wrap">
-              <span className="font-medium">
-                Plan ({plan.steps.length} steps){runScope ? ` • Planned: ${runScope.fileCount} file(s), ≈${runScope.approxLinesChanged} lines` : ""} • {PROVIDER_LABELS[provider]}
-              </span>
-              {planUsage && (
-                <span className="rounded bg-background/60 px-2 py-0.5">
-                  {planUsage}
+          <div className="flex flex-col rounded-lg border border-border bg-muted/20 p-3 max-h-[min(65vh,520px)] min-h-0">
+            <div className="shrink-0 space-y-2">
+              <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground flex-wrap">
+                <span className="font-medium">
+                  Plan ({plan.steps.length} steps){runScope ? ` • Planned: ${runScope.fileCount} file(s), ≈${runScope.approxLinesChanged} lines` : ""} • {PROVIDER_LABELS[provider]}
                 </span>
+                {planUsage && (
+                  <span className="rounded bg-background/60 px-2 py-0.5">
+                    {planUsage}
+                  </span>
+                )}
+              </div>
+              {planContextUsed && planContextUsed.length > 0 && (
+                <div className="rounded bg-background/40 px-2 py-1 text-[11px] text-muted-foreground">
+                  <span className="font-medium text-foreground/80">Context used: </span>
+                  {planContextUsed.slice(0, 8).map((p) => (
+                    <span key={p} className="font-mono truncate inline-block max-w-[180px] align-bottom mr-1" title={p}>{p}</span>
+                  ))}
+                  {planContextUsed.length > 8 && <span>+{planContextUsed.length - 8} more</span>}
+                </div>
+              )}
+              {plan.summary && (
+                <p className="text-sm text-muted-foreground">{plan.summary}</p>
               )}
             </div>
-            {planContextUsed && planContextUsed.length > 0 && (
-              <div className="rounded bg-background/40 px-2 py-1 text-[11px] text-muted-foreground">
-                <span className="font-medium text-foreground/80">Context used: </span>
-                {planContextUsed.slice(0, 8).map((p) => (
-                  <span key={p} className="font-mono truncate inline-block max-w-[180px] align-bottom mr-1" title={p}>{p}</span>
-                ))}
-                {planContextUsed.length > 8 && <span>+{planContextUsed.length - 8} more</span>}
-              </div>
-            )}
-            {plan.summary && (
-              <p className="text-sm text-muted-foreground">{plan.summary}</p>
-            )}
-            <ul className="space-y-1.5 text-sm">
+            <ul className="flex-1 min-h-0 space-y-1.5 text-sm overflow-y-auto overflow-x-hidden pr-1 mt-2">
               {plan.steps && plan.steps.length > 0 ? (
                 plan.steps.map((step: PlanStep, i: number) => {
                   const stepContent = step.type === "file_edit"
@@ -1541,21 +1651,6 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                 </li>
               )}
             </ul>
-            <div className="flex gap-2 pt-2">
-              <Button size="sm" className="gap-1" onClick={approveAndExecute}>
-                <Check className="h-3.5 w-3.5" />
-                Approve
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                className="gap-1"
-                onClick={rejectPlan}
-              >
-                <X className="h-3.5 w-3.5" />
-                Reject
-              </Button>
-            </div>
           </div>
         )}
 
@@ -2013,12 +2108,33 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                 </div>
               ) : null}
             </div>
-            <Button size="sm" variant="outline" onClick={rerun}>
-              Rerun
-            </Button>
           </div>
         )}
       </div>
+
+      {/* Rerun fixed at bottom of panel when execution is done - always visible without scrolling */}
+      {phase === "done" && executeResult && (
+        <div className="shrink-0 min-h-[52px] border-t border-border bg-background px-3 py-2 flex items-center gap-2 flex-wrap shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.1)] dark:shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.3)]">
+          <Button size="sm" variant="outline" onClick={rerun}>
+            Rerun
+          </Button>
+        </div>
+      )}
+
+      {/* Approve/Reject fixed at bottom of panel when plan is ready */}
+      {phase === "plan_ready" && plan && (
+        <div className="shrink-0 min-h-[52px] border-t border-border bg-background px-3 py-2 flex items-center gap-2 flex-wrap shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.1)] dark:shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.3)]">
+          <Button size="sm" className="gap-1" onClick={approveAndExecute}>
+            <Check className="h-3.5 w-3.5" />
+            Approve
+          </Button>
+          <Button size="sm" variant="outline" className="gap-1" onClick={rejectPlan}>
+            <X className="h-3.5 w-3.5" />
+            Reject
+          </Button>
+        </div>
+      )}
+
       </div>
 
       <Dialog open={largeFileConfirmOpen} onOpenChange={(open) => { if (!open) setLargeFileConfirmOpen(false); }}>

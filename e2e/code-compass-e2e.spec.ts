@@ -9,7 +9,7 @@
 
 import { test, expect } from "@playwright/test";
 
-const BASE_URL = process.env.E2E_BASE_URL || "http://localhost:3000"; // Or 3001 if using npm run dev:3001
+const BASE_URL = process.env.E2E_BASE_URL || "http://localhost:3001";
 
 test.describe("Code Compass E2E", () => {
   test.beforeEach(async ({ page }) => {
@@ -39,7 +39,7 @@ test.describe("Code Compass E2E", () => {
     }
   });
 
-  test("3. Settings page loads or redirects to sign-in", async ({ page }) => {
+  test("3. Settings page loads", async ({ page }) => {
     await page.goto(`${BASE_URL}/app/settings`, { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(2000); // Allow redirect/auth
     const url = page.url();
@@ -47,8 +47,7 @@ test.describe("Code Compass E2E", () => {
       || await page.locator('text=API Keys').first().isVisible().catch(() => false)
       || await page.locator('text=API key').first().isVisible().catch(() => false)
       || url.includes("/settings");
-    const redirectedToSignIn = url.includes("/sign-in");
-    expect(hasSettings || redirectedToSignIn).toBeTruthy();
+    expect(hasSettings).toBeTruthy();
   });
 
   test("4. Health API responds", async ({ request }) => {

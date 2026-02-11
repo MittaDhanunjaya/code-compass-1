@@ -99,6 +99,7 @@ export const openRouterProvider: LLMProvider = {
       model: normalizeModel(options?.model),
       messages: built,
       stream: true,
+      ...(options?.temperature != null && { temperature: options.temperature }),
     });
 
     for await (const chunk of stream) {

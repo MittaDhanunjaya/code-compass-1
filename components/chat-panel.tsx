@@ -762,7 +762,7 @@ export function ChatPanel({
     : "Workspace: …";
 
   return (
-    <div className="flex flex-1 flex-col overflow-hidden">
+    <div className="flex flex-1 flex-col min-h-0 overflow-hidden">
       <div className="flex shrink-0 flex-col gap-1 border-b border-border px-2 py-1.5">
         <p className="text-xs font-medium text-muted-foreground truncate" title={workspaceLabelText}>
           {workspaceLabelText}
@@ -867,7 +867,7 @@ export function ChatPanel({
           </Button>
         </div>
       </div>
-      <div className="flex-1 overflow-y-auto p-3 space-y-3">
+      <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3">
         {usageText && (
           <div className="flex items-center justify-end gap-2">
             <div className="rounded-md bg-muted/80 px-2.5 py-1 text-xs text-muted-foreground border border-border/50">
@@ -1182,7 +1182,9 @@ export function ChatPanel({
         )}
         <div ref={messagesEndRef} />
       </div>
-      <div className="border-t border-border p-2 space-y-2">
+
+      {/* Input area pinned to bottom so no blank space below */}
+      <div className="shrink-0 border-t border-border bg-background p-2 space-y-2">
         {noWorkspaceErrorLogNote && (
           <p className="text-xs text-muted-foreground italic">
             These look like runtime logs. Select a workspace if you want me to apply code fixes; otherwise I&apos;ll just explain the error.

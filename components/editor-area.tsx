@@ -88,14 +88,16 @@ export function EditorArea() {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [diffOpen, setDiffOpen] = useState(false);
   const TERMINAL_VISIBLE_KEY = "aiforge-terminal-visible";
-  const [terminalVisible, setTerminalVisibleState] = useState(() => {
-    if (typeof window === "undefined") return false;
+  const [terminalVisible, setTerminalVisibleState] = useState(false);
+  useEffect(() => {
     try {
-      return window.sessionStorage.getItem(TERMINAL_VISIBLE_KEY) === "1";
+      if (typeof window !== "undefined" && window.sessionStorage.getItem(TERMINAL_VISIBLE_KEY) === "1") {
+        setTerminalVisibleState(true);
+      }
     } catch {
-      return false;
+      // ignore
     }
-  });
+  }, []);
   const setTerminalVisible = useCallback((value: boolean | ((prev: boolean) => boolean)) => {
     setTerminalVisibleState((prev) => {
       const next = typeof value === "function" ? value(prev) : value;

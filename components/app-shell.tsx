@@ -78,12 +78,12 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="flex h-screen w-full overflow-hidden bg-background">
-      {/* Left sidebar */}
-      <aside className="flex w-56 flex-col border-r border-border bg-muted/30">
-        <div className="flex h-12 items-center gap-2 border-b border-border px-3">
+      {/* Left sidebar - min-h-0 so flex-1 scrollable area gets bounded height */}
+      <aside className="flex w-56 flex-col min-h-0 border-r border-border bg-muted/30">
+        <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-3">
           <span className="font-semibold text-foreground">AIForge</span>
         </div>
-        <div className="flex-1 overflow-y-auto p-2">
+        <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-2">
           <WorkspaceSelector />
           {workspaceId && (
             <>
@@ -131,8 +131,8 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
         {workspaceId && !isWorkspaceSettings ? <EditorArea /> : children}
       </main>
 
-      {/* Right: AI panel */}
-      <aside className="flex w-80 flex-col border-l border-border bg-muted/20">
+      {/* Right: AI panel - min-h-0 + overflow-y-auto so content scrolls when long */}
+      <aside className="flex w-80 flex-col min-h-0 border-l border-border bg-muted/20 overflow-hidden">
         <div className="flex h-12 shrink-0 items-center border-b border-border">
           <div className="flex gap-1 px-2">
             {(["chat", "composer", "agent"] as const).map((tab) => (
@@ -150,7 +150,9 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
             ))}
           </div>
         </div>
-        <ChatPanel workspaceId={workspaceId} activeTab={aiPanelTab} />
+        <div className="flex flex-1 flex-col min-h-0 overflow-hidden">
+          <ChatPanel workspaceId={workspaceId} activeTab={aiPanelTab} />
+        </div>
       </aside>
       <CommandPalette />
       <FirstRunChecklist />
