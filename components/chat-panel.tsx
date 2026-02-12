@@ -21,8 +21,12 @@ import {
 import { useEditor } from "@/lib/editor-context";
 import { useWorkspaceLabel } from "@/lib/use-workspace-label";
 import { PROVIDERS, PROVIDER_LABELS, OPENROUTER_FREE_MODELS, type ProviderId } from "@/lib/llm/providers";
-import { AgentPanel } from "@/components/agent-panel";
-import { ComposerPanel } from "@/components/composer-panel";
+const AgentPanel = dynamic(() => import("@/components/agent-panel").then((m) => ({ default: m.AgentPanel })), {
+  loading: () => <div className="flex flex-1 items-center justify-center p-4 text-sm text-muted-foreground">Loading Agent…</div>,
+});
+const ComposerPanel = dynamic(() => import("@/components/composer-panel").then((m) => ({ default: m.ComposerPanel })), {
+  loading: () => <div className="flex flex-1 items-center justify-center p-4 text-sm text-muted-foreground">Loading Composer…</div>,
+});
 import type { FileEditStep } from "@/lib/agent/types";
 import { SAFE_EDIT_MAX_FILES } from "@/lib/protected-paths";
 import { COPY } from "@/lib/copy";
@@ -30,6 +34,7 @@ import { ErrorWithAction } from "@/components/error-with-action";
 import { FeedbackPrompt } from "@/components/feedback-prompt";
 import type { LogAttachment } from "@/lib/chat/log-utils";
 import { looksLikeLog, createLogAttachment } from "@/lib/chat/log-utils";
+import { Skeleton } from "@/components/ui/skeleton";
 
 const MonacoDiffEditor = dynamic(
   () => import("@monaco-editor/react").then((mod) => mod.DiffEditor),
@@ -968,9 +973,14 @@ export function ChatPanel({
           />
         ))}
         {loading && (
-          <div className="mr-4 flex items-center gap-2 rounded-lg bg-muted px-3 py-2 text-sm text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            Thinking…
+          <div className="mr-4 flex flex-col gap-2 rounded-lg bg-muted px-3 py-3">
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin shrink-0" />
+              Thinking…
+            </div>
+            <Skeleton className="h-3 w-full" />
+            <Skeleton className="h-3 w-4/5" />
+            <Skeleton className="h-3 w-2/3" />
           </div>
         )}
         {error && (

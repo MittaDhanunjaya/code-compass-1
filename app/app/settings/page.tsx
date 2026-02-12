@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { KeySettingsContent } from "@/components/key-settings-content";
+import { KeyboardShortcutsSettings } from "@/components/keyboard-shortcuts-settings";
 
 type SettingsTab = "general" | "keys" | "safety" | "shortcuts" | "github";
 
@@ -233,12 +234,10 @@ function SettingsContent() {
         </div>
       )}
       {activeTab === "shortcuts" && (
-        <div className="space-y-4">
+        <div className="space-y-6">
+          <KeyboardShortcutsSettings />
           <section className="space-y-2">
-            <Label className="text-base font-medium flex items-center gap-2">
-              <Keyboard className="h-4 w-4" />
-              Keyboard shortcuts & actions
-            </Label>
+            <Label className="text-base font-medium">All shortcuts</Label>
             <p className="text-sm text-muted-foreground">
               In-app shortcuts and Agent actions you can use while coding.
             </p>

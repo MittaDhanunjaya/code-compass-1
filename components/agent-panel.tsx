@@ -13,6 +13,7 @@ import { openFileInWorkspace } from "@/lib/open-file-in-workspace";
 import { useWorkspaceLabel } from "@/lib/use-workspace-label";
 import { ModelsManagerDialog } from "@/components/models-manager-dialog";
 import { getPlaybook } from "@/lib/playbooks";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   AgentInstructionInput,
   AgentFooterActions,
@@ -748,6 +749,16 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                 <X className="h-3.5 w-3.5" />
               </Button>
             </div>
+          </div>
+        )}
+
+        {/* Plan skeleton when loading */}
+        {phase === "loading_plan" && !plan && (
+          <div className="flex flex-col rounded-lg border border-border bg-muted/20 p-3 space-y-2">
+            <Skeleton className="h-4 w-32" />
+            <Skeleton className="h-4 w-full" />
+            <Skeleton className="h-4 w-5/6" />
+            <Skeleton className="h-4 w-4/5" />
           </div>
         )}
 

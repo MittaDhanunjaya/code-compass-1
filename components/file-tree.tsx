@@ -15,6 +15,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { buildFileTree, type FileTreeNode } from "@/lib/file-tree";
+import { Skeleton } from "@/components/ui/skeleton";
 import { useEditor } from "@/lib/editor-context";
 import { ErrorWithAction } from "@/components/error-with-action";
 import { Button } from "@/components/ui/button";
@@ -293,9 +294,12 @@ export function FileTree({ workspaceId }: FileTreeProps) {
 
   if (loading) {
     return (
-      <div className="flex items-center gap-2 px-2 py-3 text-xs text-muted-foreground">
-        <Loader2 className="h-4 w-4 animate-spin shrink-0" />
-        <span>Loading files…</span>
+      <div className="space-y-2 px-2 py-3">
+        <Skeleton className="h-4 w-24" />
+        <Skeleton className="h-4 w-32" />
+        <Skeleton className="h-4 w-28" />
+        <Skeleton className="h-4 w-36" />
+        <Skeleton className="h-4 w-20" />
       </div>
     );
   }
