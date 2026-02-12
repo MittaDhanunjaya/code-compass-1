@@ -100,7 +100,7 @@ test.describe("Agent Quality E2E", () => {
     const atApp = url.includes("/app");
     expect(atSignIn || atApp).toBeTruthy();
     if (atApp) {
-      await expect(page.getByText("AIForge").first()).toBeVisible({ timeout: 5000 });
+      await expect(page.getByText("Code Compass").first()).toBeVisible({ timeout: 5000 });
     }
   });
 

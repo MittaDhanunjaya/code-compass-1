@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { hasRulesFile } from "@/lib/rules";
 
-const RULES_FILE_PATH = ".aiforge-rules";
+const RULES_FILE_PATH = ".code-compass-rules";
 
 type RouteParams = { params: Promise<{ id: string }> };
 

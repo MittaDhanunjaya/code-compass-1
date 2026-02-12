@@ -1,4 +1,4 @@
--- AIForge: provider_keys table for storing encrypted API keys per user
+-- Code Compass: provider_keys table for storing encrypted API keys per user
 -- Keys are stored as encrypted blobs; decryption happens server-side only
 
 CREATE TABLE IF NOT EXISTS public.provider_keys (

@@ -520,7 +520,7 @@ export function WorkspaceSelector() {
       const res = await fetch(`/api/workspaces/${ws.id}/git/commit-push`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: commitMessage.trim() || "Update from AIForge" }),
+        body: JSON.stringify({ message: commitMessage.trim() || "Update from Code Compass" }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Commit or push failed");

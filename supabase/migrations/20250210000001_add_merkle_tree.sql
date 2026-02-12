@@ -1,4 +1,4 @@
--- AIForge: Add Merkle tree storage for efficient incremental indexing
+-- Code Compass: Add Merkle tree storage for efficient incremental indexing
 -- Stores workspace Merkle root for change detection
 
 ALTER TABLE public.workspaces

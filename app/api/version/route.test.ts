@@ -13,7 +13,7 @@ describe("GET /api/version", () => {
     expect(typeof data.version).toBe("string");
     expect(data.version.length).toBeGreaterThan(0);
     expect(data).toHaveProperty("app");
-    expect(data.app).toBe("aiforge");
+    expect(data.app).toBe("code-compass");
   });
 
   it("returns semver-like version string", async () => {

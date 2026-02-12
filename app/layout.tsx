@@ -5,7 +5,7 @@ import { ThemeProvider } from "@/components/theme-provider";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "AIForge",
+  title: "Code Compass",
   description: "AI-first code editor in the browser",
 };
 

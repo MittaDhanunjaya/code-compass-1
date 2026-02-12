@@ -206,8 +206,8 @@ export async function POST(request: Request) {
       apiKey,
       baseURL: OPENROUTER_BASE,
       defaultHeaders: {
-        "HTTP-Referer": typeof window !== "undefined" ? window.location.origin : "https://aiforge.app",
-        "X-Title": "AIForge-Tab",
+        "HTTP-Referer": typeof window !== "undefined" ? window.location.origin : "https://codecompass.app",
+        "X-Title": "Code Compass Tab",
       },
     });
 

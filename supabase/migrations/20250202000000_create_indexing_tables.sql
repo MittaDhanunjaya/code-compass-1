@@ -1,4 +1,4 @@
--- AIForge: Basic indexing tables for codebase intelligence (v1)
+-- Code Compass: Basic indexing tables for codebase intelligence (v1)
 -- Stores file chunks and symbol information for TS/JS files
 
 -- code_chunks: indexed chunks of file content

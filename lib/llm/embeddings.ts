@@ -29,8 +29,8 @@ export async function generateEmbeddings(
         defaultHeaders:
           providerId === "openrouter"
             ? {
-                "HTTP-Referer": typeof window !== "undefined" ? window.location.origin : "https://aiforge.app",
-                "X-Title": "AIForge",
+                "HTTP-Referer": typeof window !== "undefined" ? window.location.origin : "https://codecompass.app",
+                "X-Title": "Code Compass",
               }
             : undefined,
       });

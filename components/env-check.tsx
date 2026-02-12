@@ -16,7 +16,7 @@ export function EnvCheck() {
 
   return (
     <div className="border-b border-amber-500/50 bg-amber-500/10 px-4 py-2 text-center text-sm text-amber-200">
-      AIForge: Supabase not configured. Copy{" "}
+      Code Compass: Supabase not configured. Copy{" "}
       <code className="rounded bg-amber-500/20 px-1">.env.local.example</code>{" "}
       to <code className="rounded bg-amber-500/20 px-1">.env.local</code> and
       add your project URL and anon key.

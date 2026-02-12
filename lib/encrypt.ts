@@ -11,6 +11,7 @@ function getEncryptionKey(): Buffer {
       "ENCRYPTION_KEY env var is required (min 16 chars) for API key storage. Add to .env.local."
     );
   }
+  // Keep legacy salt for backward compatibility with existing encrypted provider keys
   return scryptSync(secret, "aiforge-salt", KEY_LENGTH);
 }
 

@@ -1,6 +1,9 @@
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 
+// Skip prerendering: requires Supabase env vars at request time (not available in CI build)
+export const dynamic = "force-dynamic";
+
 export default async function AppPage() {
   const supabase = await createClient();
   const {

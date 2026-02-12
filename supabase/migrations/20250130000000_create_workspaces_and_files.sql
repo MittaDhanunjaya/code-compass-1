@@ -1,4 +1,4 @@
--- AIForge: workspaces and workspace_files tables
+-- Code Compass: workspaces and workspace_files tables
 -- Run via: supabase db push (if using Supabase CLI) or execute in SQL Editor
 
 -- Enable UUID extension if not already enabled

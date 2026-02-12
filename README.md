@@ -145,7 +145,7 @@ The **first-run checklist** may appear with steps (API key, workspace, try a pla
 |--------|-------------|------------------|
 | **Create workspace** | Sidebar → New/Create; choose empty, GitHub URL, or local folder. | Work on multiple projects; each has its own files and state. |
 | **Stack & Commands** | Per-workspace **Stack & Commands** (or `.code-compass/config.json`): define lint, test, run commands per service. | Sandbox and debug-from-log use the right commands for your stack. |
-| **Project rules** | “Project rules” in sidebar (or `.aiforge-rules`). | Give the Agent/Composer consistent instructions per project. |
+| **Project rules** | “Project rules” in sidebar (or `.code-compass-rules`). | Give the Agent/Composer consistent instructions per project. |
 | **Git** | Workspace selector / workspace UI: branch, commit, push, pull (when GitHub is connected). | Keep changes in sync with your repo. |
 
 ### Terminal
@@ -224,7 +224,7 @@ npm run lint
 ## Configuration
 
 - **Per-workspace stack** — `.code-compass/config.json` in the repo (or via Stack & Commands in the UI): `services[]` with `name`, `root`, `stack`, `lintCommand`, `testCommand`, `runCommand`. Used by the sandbox and debug-from-log.
-- **Per-workspace rules** — Project rules (e.g. `.aiforge-rules`) for Agent/Composer behavior.
+- **Per-workspace rules** — Project rules (e.g. `.code-compass-rules`) for Agent/Composer behavior.
 - **Env overrides** — Task routing and provider behavior can be tuned via environment variables; see `lib/llm/task-routing.ts` and provider code.
 
 ---

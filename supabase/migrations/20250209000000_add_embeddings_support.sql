@@ -1,4 +1,4 @@
--- AIForge: Add pgvector extension and embeddings support for semantic search
+-- Code Compass: Add pgvector extension and embeddings support for semantic search
 -- Enables vector similarity search for codebase intelligence
 
 -- Enable pgvector extension

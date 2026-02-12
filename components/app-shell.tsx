@@ -60,10 +60,10 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     };
     const onRunDebugFromLog = () => setAiPanelTab("chat");
     window.addEventListener("command-palette-run", onCommand);
-    window.addEventListener("aiforge-run-debug-from-log", onRunDebugFromLog);
+    window.addEventListener("code-compass-run-debug-from-log", onRunDebugFromLog);
     return () => {
       window.removeEventListener("command-palette-run", onCommand);
-      window.removeEventListener("aiforge-run-debug-from-log", onRunDebugFromLog);
+      window.removeEventListener("code-compass-run-debug-from-log", onRunDebugFromLog);
     };
   }, []);
 
@@ -81,7 +81,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
       {/* Left sidebar - min-h-0 so flex-1 scrollable area gets bounded height */}
       <aside className="flex w-56 flex-col min-h-0 border-r border-border bg-muted/30">
         <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-3">
-          <span className="font-semibold text-foreground">AIForge</span>
+          <span className="font-semibold text-foreground">Code Compass</span>
         </div>
         <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-2">
           <WorkspaceSelector />
@@ -91,7 +91,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
                 type="button"
                 onClick={() => setRulesDialogOpen(true)}
                 className="mt-2 flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-                title="Edit project rules (.aiforge-rules) used by Agent and Composer"
+                title="Edit project rules (.code-compass-rules) used by Agent and Composer"
               >
                 Project rules
               </button>

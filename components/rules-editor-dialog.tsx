@@ -11,7 +11,7 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 
-const RULES_PATH = ".aiforge-rules";
+const RULES_PATH = ".code-compass-rules";
 
 type RulesEditorDialogProps = {
   workspaceId: string | null;
@@ -98,7 +98,7 @@ export function RulesEditorDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[85vh] flex flex-col max-w-2xl">
         <DialogHeader>
-          <DialogTitle>Project rules (.aiforge-rules)</DialogTitle>
+          <DialogTitle>Project rules (.code-compass-rules)</DialogTitle>
         </DialogHeader>
         <p className="text-sm text-muted-foreground">
           One rule per line. Lines starting with # are comments. These rules are included in Agent and Composer context.

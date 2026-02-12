@@ -30,7 +30,7 @@ export async function POST(request: Request, { params }: RouteParams) {
   } catch {
     body = {};
   }
-  const message = (body.message ?? "").trim() || "Update from AIForge";
+  const message = (body.message ?? "").trim() || "Update from Code Compass";
 
   const { data: workspace, error: fetchError } = await supabase
     .from("workspaces")

@@ -1,4 +1,4 @@
--- AIForge: Add persistent chat memory per workspace
+-- Code Compass: Add persistent chat memory per workspace
 -- Stores conversation history for better context continuity
 
 CREATE TABLE IF NOT EXISTS public.chat_messages (

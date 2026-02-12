@@ -2,6 +2,9 @@ import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { AuthHashHandler } from "@/components/auth-hash-handler";
 
+// Skip prerendering: requires Supabase env vars at request time (not available in CI build)
+export const dynamic = "force-dynamic";
+
 export default async function HomePage(props: {
   searchParams: Promise<{ code?: string; next?: string; type?: string }>;
 }) {

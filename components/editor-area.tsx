@@ -88,7 +88,7 @@ export function EditorArea() {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [diffOpen, setDiffOpen] = useState(false);
-  const TERMINAL_VISIBLE_KEY = "aiforge-terminal-visible";
+  const TERMINAL_VISIBLE_KEY = "code-compass-terminal-visible";
   const [terminalVisible, setTerminalVisibleState] = useState(false);
   useEffect(() => {
     try {
@@ -113,8 +113,8 @@ export function EditorArea() {
 
   useEffect(() => {
     const showTerminal = () => setTerminalVisible(true);
-    window.addEventListener("aiforge-show-terminal", showTerminal);
-    return () => window.removeEventListener("aiforge-show-terminal", showTerminal);
+    window.addEventListener("code-compass-show-terminal", showTerminal);
+    return () => window.removeEventListener("code-compass-show-terminal", showTerminal);
   }, [setTerminalVisible]);
 
   const [tabCompletionPending, setTabCompletionPending] = useState(false);
@@ -831,7 +831,7 @@ export function EditorArea() {
                   tabCompletionDisposable.current = monaco.languages.registerInlineCompletionsProvider(
                     { pattern: "**" },
                     {
-                      displayName: "AIForge Tab",
+                      displayName: "Code Compass Tab",
                       debounceDelayMs: TAB_COMPLETION_DEBOUNCE_MS,
                       provideInlineCompletions: async (model: Monaco.editor.ITextModel, position: Monaco.Position, _context: Monaco.languages.InlineCompletionContext, token: Monaco.CancellationToken) => {
                         const ctx = tabCompletionContextRef.current;

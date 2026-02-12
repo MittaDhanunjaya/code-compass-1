@@ -364,7 +364,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
             logAttachment,
           })
         );
-        window.dispatchEvent(new CustomEvent("aiforge-run-debug-from-log"));
+        window.dispatchEvent(new CustomEvent("code-compass-run-debug-from-log"));
         setInstruction("");
         setLogAttachment(null);
       } catch {
@@ -968,7 +968,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
           }
         }
         if (logEntries.length > 0) {
-          window.dispatchEvent(new CustomEvent("aiforge-show-terminal"));
+          window.dispatchEvent(new CustomEvent("code-compass-show-terminal"));
         }
 
         // Update files

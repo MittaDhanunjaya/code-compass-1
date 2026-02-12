@@ -1,4 +1,4 @@
--- AIForge: Add vector similarity search function for semantic code search
+-- Code Compass: Add vector similarity search function for semantic code search
 -- Uses pgvector cosine distance for finding similar code chunks
 
 CREATE OR REPLACE FUNCTION match_code_chunks(

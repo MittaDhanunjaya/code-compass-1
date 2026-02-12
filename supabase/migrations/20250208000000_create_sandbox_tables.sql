@@ -1,4 +1,4 @@
--- AIForge: Sandbox tables for sandbox-first execution pipeline
+-- Code Compass: Sandbox tables for sandbox-first execution pipeline
 -- Sandboxes are temporary copies of workspace files used for testing edits before applying to main workspace
 
 -- sandbox_runs: tracks each sandbox run (one per agent/composer/debug-from-log execution)

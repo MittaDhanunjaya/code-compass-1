@@ -1,6 +1,6 @@
 /**
  * Rules system for project conventions.
- * Reads .aiforge-rules file from workspace root and enforces conventions.
+ * Reads .code-compass-rules file from workspace root and enforces conventions.
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
@@ -10,7 +10,7 @@ export type ProjectRules = {
   rawContent: string;
 };
 
-const RULES_FILE_PATH = ".aiforge-rules";
+const RULES_FILE_PATH = ".code-compass-rules";
 
 /**
  * Load rules from workspace root.
@@ -54,7 +54,7 @@ export function formatRulesForPrompt(rules: ProjectRules | null): string {
     return "";
   }
 
-  return `\n\nProject Rules (.aiforge-rules):\n${rules.rules.map((r) => `- ${r}`).join("\n")}\n\nYou MUST follow these rules. If you deviate, explain why briefly.`;
+  return `\n\nProject Rules (.code-compass-rules):\n${rules.rules.map((r) => `- ${r}`).join("\n")}\n\nYou MUST follow these rules. If you deviate, explain why briefly.`;
 }
 
 /**

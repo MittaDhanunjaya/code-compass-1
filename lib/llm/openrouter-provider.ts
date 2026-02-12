@@ -59,8 +59,8 @@ export const openRouterProvider: LLMProvider = {
       apiKey,
       baseURL: OPENROUTER_BASE,
       defaultHeaders: {
-        "HTTP-Referer": typeof window !== "undefined" ? window.location.origin : "https://aiforge.app",
-        "X-Title": "AIForge",
+        "HTTP-Referer": typeof window !== "undefined" ? window.location.origin : "https://codecompass.app",
+        "X-Title": "Code Compass",
       },
     });
     const built = buildMessages(messages, options?.context);
@@ -91,8 +91,8 @@ export const openRouterProvider: LLMProvider = {
       apiKey,
       baseURL: OPENROUTER_BASE,
       defaultHeaders: {
-        "HTTP-Referer": typeof window !== "undefined" ? window.location.origin : "https://aiforge.app",
-        "X-Title": "AIForge",
+        "HTTP-Referer": typeof window !== "undefined" ? window.location.origin : "https://codecompass.app",
+        "X-Title": "Code Compass",
       },
     });
     const built = buildMessages(messages, options?.context);

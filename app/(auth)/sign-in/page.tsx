@@ -73,7 +73,7 @@ function SignInForm() {
   return (
     <div className="w-full max-w-sm space-y-6">
       <div className="text-center">
-        <h1 className="text-2xl font-bold">AIForge</h1>
+        <h1 className="text-2xl font-bold">Code Compass</h1>
         <p className="mt-1 text-muted-foreground">Sign in to continue</p>
         <p className="mt-3 text-sm text-muted-foreground">
           You can connect your GitHub account, open any repo (including private ones), and let the AI read and understand your code. When you ask it to, it can create a branch, apply edits, commit, push, and open a pull request for you. Every write goes through a confirmation dialog first, and it never modifies your default branch without your explicit approval.

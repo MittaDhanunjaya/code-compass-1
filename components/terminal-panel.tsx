@@ -230,7 +230,7 @@ export function TerminalPanel({
       sel.anchorNode &&
       logsContainerRef.current.contains(sel.anchorNode);
 
-    const CLIPBOARD_TERMINAL_TYPE = "application/x-aiforge-terminal";
+    const CLIPBOARD_TERMINAL_TYPE = "application/x-code-compass-terminal";
 
     if (selectionInPanel && sel && sel.toString()) {
       const text = sel.toString();
@@ -284,9 +284,9 @@ export function TerminalPanel({
       return `[${time}] ${prefix} ${lines[0]}\n${lines.slice(1).map(l => `        ${l}`).join("\n")}`;
     }).join("\n\n");
 
-    const terminalBlob = new Blob(["1"], { type: "application/x-aiforge-terminal" });
+    const terminalBlob = new Blob(["1"], { type: "application/x-code-compass-terminal" });
     const blob = new Blob([formatted], { type: "text/plain" });
-    navigator.clipboard.write([new ClipboardItem({ "text/plain": blob, "application/x-aiforge-terminal": terminalBlob })]).then(
+    navigator.clipboard.write([new ClipboardItem({ "text/plain": blob, "application/x-code-compass-terminal": terminalBlob })]).then(
       () => {
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);

@@ -97,7 +97,7 @@ export function AgentInstructionInput({
         onChange={(e) => setInstruction(e.target.value)}
         onPaste={(e) => {
           const pasted = e.clipboardData?.getData("text");
-          const fromTerminal = e.clipboardData?.types?.includes("application/x-aiforge-terminal");
+          const fromTerminal = e.clipboardData?.types?.includes("application/x-code-compass-terminal");
           if (fromTerminal && pasted && pasted.includes("\n")) {
             e.preventDefault();
             if (looksLikeLog(pasted)) {
