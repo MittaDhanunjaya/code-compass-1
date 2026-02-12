@@ -40,9 +40,11 @@ Thumbs.db
 next-env.d.ts
 *.tsbuildinfo
 
-# Docs: only README.md is for GitHub; all other .md are internal
+# Docs: only README.md and docs/API.md, docs/ARCHITECTURE.md for GitHub; all other .md are internal
 *.md
 !README.md
+!docs/API.md
+!docs/ARCHITECTURE.md
 
 # Test / coverage
 coverage/
