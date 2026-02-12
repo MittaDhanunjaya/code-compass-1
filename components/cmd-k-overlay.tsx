@@ -12,6 +12,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { useEditor } from "@/lib/editor-context";
 import { InlineEditDiffDialog } from "@/components/inline-edit-diff-dialog";
+import { getEffectiveKeybinding, matchesKeybinding } from "@/lib/keybindings";
 import { PROVIDERS, type ProviderId } from "@/lib/llm/providers";
 import { formatDiagnosticsForPrompt } from "@/lib/sandbox/stack-profiles";
 
@@ -59,7 +60,8 @@ export function CmdKOverlay({ workspaceId, onAction }: CmdKOverlayProps) {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "k" && !e.shiftKey) {
+      const binding = getEffectiveKeybinding("open-cmd-k") ?? "meta+k";
+      if (matchesKeybinding(e, binding)) {
         e.preventDefault();
         if (activeTabPath && workspaceId) {
           setOpen(true);

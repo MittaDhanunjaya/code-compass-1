@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireWorkspaceAccess, withAuthResponse } from "@/lib/auth/require-auth";
 
 /**
  * GET /api/workspaces/[id]/safety-stats
@@ -7,16 +8,17 @@ import { createClient } from "@/lib/supabase/server";
  * Use for a simple safety dashboard; guardrail/blocked counts can be added when we persist them.
  */
 export async function GET(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id: workspaceId } = await params;
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  try {
+    await requireWorkspaceAccess(request, workspaceId, supabase);
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   const { data: workspace, error: wsError } = await supabase
@@ -25,8 +27,8 @@ export async function GET(
     .eq("id", workspaceId)
     .single();
 
-  if (wsError || !workspace || (workspace as { owner_id: string }).owner_id !== user.id) {
-    return NextResponse.json({ error: "Forbidden or not found" }, { status: 404 });
+  if (wsError || !workspace) {
+    return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
   }
 
   const { data: runs, error } = await supabase

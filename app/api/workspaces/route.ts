@@ -1,9 +1,11 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
 import { workspacesCreateBodySchema } from "@/lib/validation/schemas";
 import { validateBody } from "@/lib/validation";
 import { cloneRepo, cloneRepoWithToken, walkRepo, removeClone } from "@/lib/github-import";
 import { decrypt } from "@/lib/encrypt";
+import { logger } from "@/lib/logger";
 
 const selectWithBranch =
   "id, name, created_at, updated_at, safe_edit_mode, github_repo_url, github_default_branch, github_owner, github_repo, github_is_private, github_current_branch";
@@ -23,13 +25,15 @@ function parseOwnerRepo(url: string): { owner: string; repo: string } | null {
   return { owner: m[1], repo: m[2].replace(/\.git$/, "") };
 }
 
-export async function GET() {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+export async function GET(request: Request) {
+  let supabase: Awaited<ReturnType<typeof createClient>>;
+  try {
+    const auth = await requireAuth(request);
+    supabase = auth.supabase;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   // Select minimal columns that definitely exist, then add defaults
@@ -61,12 +65,16 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  let user: { id: string };
+  let supabase: Awaited<ReturnType<typeof createClient>>;
+  try {
+    const auth = await requireAuth(request);
+    user = auth.user;
+    supabase = auth.supabase;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   let rawBody: unknown;
@@ -217,7 +225,9 @@ export async function POST(request: Request) {
       repoRoot = await cloneRepoWithToken(workspace.id, owner, repo, branch, token);
       files = await walkRepo(repoRoot);
     } catch (e) {
-      await removeClone(workspace.id).catch(() => {});
+      await removeClone(workspace.id).catch((err) => {
+        logger.warn({ event: "remove_clone_failed", workspaceId: workspace.id, error: err instanceof Error ? err.message : String(err) });
+      });
       return NextResponse.json(
         { error: e instanceof Error ? e.message : "Clone failed" },
         { status: 500 }
@@ -240,7 +250,9 @@ export async function POST(request: Request) {
       repoRoot = await cloneRepo(workspace.id, repoUrl, branch);
       files = await walkRepo(repoRoot);
     } catch (e) {
-      await removeClone(workspace.id).catch(() => {});
+      await removeClone(workspace.id).catch((err) => {
+        logger.warn({ event: "remove_clone_failed", workspaceId: workspace.id, error: err instanceof Error ? err.message : String(err) });
+      });
       return NextResponse.json(
         { error: e instanceof Error ? e.message : "Clone failed" },
         { status: 500 }

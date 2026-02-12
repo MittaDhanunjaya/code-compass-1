@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
 
 type RouteParams = { params: Promise<{ id: string; runId: string }> };
 
@@ -8,14 +9,17 @@ type RouteParams = { params: Promise<{ id: string; runId: string }> };
  * Mark this sandbox run as user_rolled_back (user rejected or reverted changes).
  * Used for evaluation: "where the agent tends to fail" and refinement.
  */
-export async function POST(_request: Request, { params }: RouteParams) {
+export async function POST(request: Request, { params }: RouteParams) {
   const { id: workspaceId, runId } = await params;
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  let user: { id: string };
+  try {
+    const auth = await requireAuth(request);
+    user = auth.user;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   const { data: run } = await supabase

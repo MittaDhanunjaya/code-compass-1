@@ -6,10 +6,13 @@
 
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
+import { checkRateLimit, getRateLimitIdentifier } from "@/lib/api-rate-limit";
 import { getModelForProvider, PROVIDERS, type ProviderId } from "@/lib/llm/providers";
 import { invokeChat } from "@/lib/llm/router";
 import { resolveWorkspaceId } from "@/lib/workspaces/active-workspace";
 import { decrypt } from "@/lib/encrypt";
+import { validatePrAnalyzeOutput } from "@/lib/validation";
 
 const SYSTEM_PROMPT = `You are a code review assistant. Given a pull request diff (patch), produce:
 1. A short summary (2-4 sentences) of what the PR changes.
@@ -20,22 +23,34 @@ Respond with valid JSON only, no markdown code fence, in this exact shape:
 {"summary":"...","risks":["...","..."],"suggestions":["...","..."]}`;
 
 export async function POST(request: Request) {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  let user: { id: string };
+  let supabase: Awaited<ReturnType<typeof createClient>>;
+  try {
+    const auth = await requireAuth(request);
+    user = auth.user;
+    supabase = auth.supabase;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
+  }
+
+  const rl = await checkRateLimit(getRateLimitIdentifier(request, user.id), "pr-analyze", 30);
+  if (!rl.ok) {
+    return NextResponse.json(
+      { error: "Too many requests. Try again later.", retryAfter: rl.retryAfter },
+      { status: 429, headers: rl.retryAfter ? { "Retry-After": String(rl.retryAfter) } : {} }
+    );
   }
 
   let body: { diffText?: string; workspaceId?: string; provider?: string; model?: string };
   try {
-    body = await request.json();
+    body = (await request.json()) ?? {};
   } catch {
     return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
   }
 
-  const diffText = typeof body.diffText === "string" ? body.diffText.trim() : "";
+  const diffText = typeof body?.diffText === "string" ? body.diffText.trim() : "";
   if (!diffText || diffText.length > 500_000) {
     return NextResponse.json(
       { error: "diffText is required and must be under 500000 characters" },
@@ -104,23 +119,20 @@ export async function POST(request: Request) {
     );
   }
 
-  // Parse JSON from response (may be wrapped in markdown)
-  let json: { summary?: string; risks?: string[]; suggestions?: string[] };
+  // Parse JSON from response (may be wrapped in markdown) and validate with Zod
   const stripped = content.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  let parsed: unknown;
   try {
-    json = JSON.parse(stripped) as typeof json;
+    parsed = JSON.parse(stripped);
   } catch {
-    json = {
-      summary: content.slice(0, 1000),
-      risks: [],
-      suggestions: [],
-    };
+    parsed = { summary: content.slice(0, 1000), risks: [], suggestions: [] };
   }
+  const { summary, risks, suggestions } = validatePrAnalyzeOutput(parsed);
 
   return NextResponse.json({
-    summary: json.summary ?? "",
-    risks: Array.isArray(json.risks) ? json.risks : [],
-    suggestions: Array.isArray(json.suggestions) ? json.suggestions : [],
+    summary,
+    risks,
+    suggestions,
     workspaceId: workspaceId ?? undefined,
   });
 }

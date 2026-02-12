@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireAuth } from "@/lib/auth/require-auth";
 import { encrypt } from "@/lib/encrypt";
 import { getGitHubOAuthConfig } from "@/lib/github-oauth-config";
 
@@ -30,10 +31,11 @@ export async function GET(request: Request) {
   }
 
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
+  let user: { id: string };
+  try {
+    const auth = await requireAuth(request);
+    user = auth.user;
+  } catch {
     return NextResponse.redirect(
       `${origin()}/sign-in?next=/app/settings&github=error`
     );

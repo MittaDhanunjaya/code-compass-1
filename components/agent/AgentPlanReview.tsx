@@ -1,9 +1,56 @@
 "use client";
 
+import React from "react";
 import { FileEdit, Terminal } from "lucide-react";
 import type { AgentPlan, PlanStep, FileEditStep, CommandStep } from "@/lib/agent/types";
 import type { ProviderId } from "@/lib/llm/providers";
 import { PROVIDER_LABELS } from "@/lib/llm/providers";
+
+const PlanStepItem = React.memo(function PlanStepItem({
+  step,
+  index,
+}: {
+  step: PlanStep;
+  index: number;
+}) {
+  const stepContent =
+    step.type === "file_edit"
+      ? (step.path || "(no path specified)")
+      : (step.command || "(no command specified)");
+  return (
+    <li className="flex items-start gap-2">
+      {step.type === "file_edit" ? (
+        <FileEdit className="h-4 w-4 shrink-0 mt-0.5 text-muted-foreground" />
+      ) : (
+        <Terminal className="h-4 w-4 shrink-0 mt-0.5 text-muted-foreground" />
+      )}
+      <span className="flex-1">
+        <span
+          className={
+            !(step as FileEditStep).path && !(step as CommandStep).command
+              ? "text-destructive/70"
+              : ""
+          }
+        >
+          {stepContent}
+        </span>
+        {step.description && (
+          <span className="text-muted-foreground"> — {step.description}</span>
+        )}
+        {step.type === "file_edit" && !step.path && (
+          <span className="text-destructive/70 text-xs ml-1">
+            (invalid step: missing path)
+          </span>
+        )}
+        {step.type === "command" && !step.command && (
+          <span className="text-destructive/70 text-xs ml-1">
+            (invalid step: missing command)
+          </span>
+        )}
+      </span>
+    </li>
+  );
+});
 
 type AgentPlanReviewProps = {
   plan: AgentPlan;
@@ -48,41 +95,9 @@ export function AgentPlanReview({
       </div>
       <ul className="flex-1 min-h-0 space-y-1.5 text-sm overflow-y-auto overflow-x-hidden pr-1 mt-2">
         {plan.steps && plan.steps.length > 0 ? (
-          plan.steps.map((step: PlanStep, i: number) => {
-            const stepContent = step.type === "file_edit"
-              ? (step.path || "(no path specified)")
-              : (step.command || "(no command specified)");
-            return (
-              <li key={i} className="flex items-start gap-2">
-                {step.type === "file_edit" ? (
-                  <FileEdit className="h-4 w-4 shrink-0 mt-0.5 text-muted-foreground" />
-                ) : (
-                  <Terminal className="h-4 w-4 shrink-0 mt-0.5 text-muted-foreground" />
-                )}
-                <span className="flex-1">
-                  <span className={!(step as FileEditStep).path && !(step as CommandStep).command ? "text-destructive/70" : ""}>
-                    {stepContent}
-                  </span>
-                  {step.description && (
-                    <span className="text-muted-foreground">
-                      {" "}
-                      — {step.description}
-                    </span>
-                  )}
-                  {step.type === "file_edit" && !step.path && (
-                    <span className="text-destructive/70 text-xs ml-1">
-                      (invalid step: missing path)
-                    </span>
-                  )}
-                  {step.type === "command" && !step.command && (
-                    <span className="text-destructive/70 text-xs ml-1">
-                      (invalid step: missing command)
-                    </span>
-                  )}
-                </span>
-              </li>
-            );
-          })
+          plan.steps.map((step: PlanStep, i: number) => (
+            <PlanStepItem key={i} step={step} index={i} />
+          ))
         ) : (
           <li className="text-sm text-muted-foreground italic">
             No steps available (plan may be malformed)

@@ -8,6 +8,7 @@ import type { AgentPlan, PlanStep, FileEditStep, CommandStep } from "@/lib/agent
 import type { AgentEvent } from "@/lib/agent-events";
 import type { ProviderId } from "@/lib/llm/providers";
 import { PROVIDER_LABELS } from "@/lib/llm/providers";
+import { parseApiErrorForDisplay } from "@/lib/errors";
 import type { ScopeMode } from "@/lib/agent/types";
 
 export type ModelSelection =
@@ -44,7 +45,8 @@ export type UseAgentPlanParams = {
   onPlan: (plan: AgentPlan | null) => void;
   onPhase: (phase: "idle" | "loading_plan" | "plan_ready") => void;
   onError: (error: string | null) => void;
-  onAgentEvents: (events: AgentEvent[]) => void;
+  /** @deprecated Use setAgentEvents - kept for backward compatibility */
+  onAgentEvents?: (events: AgentEvent[]) => void;
   setAgentEvents: React.Dispatch<React.SetStateAction<AgentEvent[]>>;
   setRunSummary: React.Dispatch<React.SetStateAction<RunSummary | null>>;
   setPlanContextUsed: (paths: string[] | null) => void;
@@ -120,7 +122,18 @@ export function useAgentPlan(params: UseAgentPlanParams) {
 
       if (!res.ok) {
         const errorData = await res.json().catch(() => ({ error: "Plan failed" }));
-        throw new Error(errorData.error || "Plan failed");
+        const retryAfter =
+          errorData.retryAfter ??
+          (parseInt(res.headers.get("Retry-After") || "0", 10) || undefined);
+        onError(
+          parseApiErrorForDisplay(
+            errorData.error || "Plan failed",
+            res.status,
+            retryAfter
+          )
+        );
+        onPhase("idle");
+        return;
       }
 
       const reader = res.body?.getReader();

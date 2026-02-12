@@ -6,6 +6,7 @@
 import { createHash } from "crypto";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { decrypt } from "@/lib/encrypt";
+import { hashForCache } from "@/lib/cache";
 import { getModelForProvider, PROVIDERS, PROVIDER_LABELS, type ProviderId } from "@/lib/llm/providers";
 import { invokeChat } from "@/lib/llm/router";
 import type { FileEditStep } from "@/lib/agent/types";
@@ -245,6 +246,13 @@ export async function planComposer(input: PlanComposerInput): Promise<PlanCompos
   const systemPromptWithRules = COMPOSER_SYSTEM + rulesPrompt;
 
   const modelOpt = getModelForProvider(providerId, model);
+  const cacheKey = hashForCache(
+    "composer-plan",
+    userContent.slice(0, 4000),
+    rulesPrompt.slice(0, 500),
+    String(providerId),
+    String(modelOpt ?? "")
+  );
   const { content: raw, usage } = await invokeChat({
     messages: [
       { role: "system", content: systemPromptWithRules },
@@ -257,6 +265,7 @@ export async function planComposer(input: PlanComposerInput): Promise<PlanCompos
     userId,
     workspaceId,
     supabase,
+    cacheKey,
   });
 
   const trimmed = raw.trim();

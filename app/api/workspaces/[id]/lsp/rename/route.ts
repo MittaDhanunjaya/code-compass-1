@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireWorkspaceAccess, withAuthResponse } from "@/lib/auth/require-auth";
 import { getRenameEdits } from "@/lib/lsp/typescript-language-service";
 
 type RouteParams = { params: Promise<{ id: string }> };
@@ -20,22 +21,12 @@ function isTsJs(path: string): boolean {
 export async function POST(request: Request, { params }: RouteParams) {
   const { id } = await params;
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
-  const { data: workspace } = await supabase
-    .from("workspaces")
-    .select("id")
-    .eq("id", id)
-    .eq("owner_id", user.id)
-    .single();
-
-  if (!workspace) {
-    return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
+  try {
+    await requireWorkspaceAccess(request, id, supabase);
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   let body: { path?: string; line?: number; character?: number; newName?: string };

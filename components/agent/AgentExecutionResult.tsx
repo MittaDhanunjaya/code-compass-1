@@ -1,5 +1,6 @@
 "use client";
 
+import { Undo2, Redo2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { FeedbackPrompt } from "@/components/feedback-prompt";
 import type { AgentExecuteResult as AgentExecuteResultType, AgentLogEntry } from "@/lib/agent/types";
@@ -10,6 +11,11 @@ type AgentExecutionResultProps = {
   agentReviewAccepted: Set<string>;
   agentReviewApplying: boolean;
   showAgentFeedback: boolean;
+  canUndo?: boolean;
+  canRedo?: boolean;
+  onUndo?: () => void;
+  onRedo?: () => void;
+  onEditsApplied?: () => void;
   onOpenFile: (path: string, content?: string) => void;
   onUpdateContent: (path: string, content: string) => void;
   onSetExecuteResult: React.Dispatch<React.SetStateAction<AgentExecuteResultType | null>>;
@@ -44,6 +50,11 @@ export function AgentExecutionResult({
   onSetPendingLargeEditEdits,
   onSetAgentLargeEditConfirmOpen,
   onSetShowAgentFeedback,
+  canUndo,
+  canRedo,
+  onUndo,
+  onRedo,
+  onEditsApplied,
 }: AgentExecutionResultProps) {
   const applyEdits = async (edits: { path: string; content: string }[], confirmFullFileReplace?: boolean, confirmLargeEdit?: boolean) => {
     if (!workspaceId || edits.length === 0) return;
@@ -75,6 +86,7 @@ export function AgentExecutionResult({
         delete (next as Record<string, unknown>).pendingReview;
         return next;
       });
+      onEditsApplied?.();
     } catch (e) {
       onSetError(e instanceof Error ? e.message : "Failed to apply edits");
     } finally {
@@ -86,7 +98,35 @@ export function AgentExecutionResult({
 
   return (
     <div className="space-y-3 rounded-lg border border-border bg-muted/20 p-3">
-      <div className="text-xs font-medium text-muted-foreground">Execution log</div>
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-xs font-medium text-muted-foreground">Execution log</div>
+        {(canUndo || canRedo) && (
+          <div className="flex items-center gap-1">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 text-xs"
+              onClick={onUndo}
+              disabled={!canUndo}
+              title="Undo last agent edits (Ctrl+Z)"
+            >
+              <Undo2 className="h-3 w-3 mr-1" />
+              Undo
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 text-xs"
+              onClick={onRedo}
+              disabled={!canRedo}
+              title="Redo (Ctrl+Shift+Z)"
+            >
+              <Redo2 className="h-3 w-3 mr-1" />
+              Redo
+            </Button>
+          </div>
+        )}
+      </div>
       <ul className="space-y-1 text-sm">
         {executeResult.log.map((entry: AgentLogEntry, i: number) => (
           <li

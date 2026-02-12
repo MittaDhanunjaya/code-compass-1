@@ -1,23 +1,26 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireWorkspaceAccess, withAuthResponse } from "@/lib/auth/require-auth";
 import { setActiveWorkspaceIdForUser } from "@/lib/workspaces/active-workspace";
 
 type RouteParams = { params: Promise<{ id: string }> };
 
 /**
  * POST /api/workspaces/[id]/set-active
- * Sets the current user's active workspace. Auth required; enforces workspace ownership.
+ * Sets the current user's active workspace. Auth required; enforces workspace access.
  */
 export async function POST(request: Request, { params }: RouteParams) {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
   const { id: workspaceId } = await params;
+  const supabase = await createClient();
+  let user: { id: string };
+  try {
+    const auth = await requireWorkspaceAccess(request, workspaceId, supabase);
+    user = auth.user;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
+  }
   const trimmed = (workspaceId ?? "").trim();
   if (!trimmed) {
     return NextResponse.json({ error: "Workspace id is required" }, { status: 400 });

@@ -1,12 +1,16 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { decrypt } from "@/lib/encrypt";
+import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
+import { checkRateLimit, getRateLimitIdentifier } from "@/lib/api-rate-limit";
 import { getModelForProvider, PROVIDERS, PROVIDER_LABELS, type ProviderId } from "@/lib/llm/providers";
 import { invokeChat } from "@/lib/llm/router";
 import { getModelForTask, applyEnvRouting } from "@/lib/llm/task-routing";
 import { getPreferredModel } from "@/lib/llm/ab-stats";
 import { loadRules, formatRulesForPrompt } from "@/lib/rules";
 import { resolveWorkspaceId } from "@/lib/workspaces/active-workspace";
+import { sanitizePath } from "@/lib/validation/sanitize-path";
+import { hashForCache } from "@/lib/cache";
 
 const INLINE_EDIT_SYSTEM = `You are an inline code editor. You will receive:
 1. A file path
@@ -22,12 +26,24 @@ Your job: Output ONLY the complete new file content. No markdown, no \`\`\` wrap
 Output nothing but the raw file content. If the file is empty or you cannot produce a valid edit, return the original content unchanged.`;
 
 export async function POST(request: Request) {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  let user: { id: string };
+  let supabase: Awaited<ReturnType<typeof createClient>>;
+  try {
+    const auth = await requireAuth(request);
+    user = auth.user;
+    supabase = auth.supabase;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
+  }
+
+  const rl = await checkRateLimit(getRateLimitIdentifier(request, user.id), "inline-edit", 30);
+  if (!rl.ok) {
+    return NextResponse.json(
+      { error: "Too many requests. Try again later.", retryAfter: rl.retryAfter },
+      { status: 429, headers: rl.retryAfter ? { "Retry-After": String(rl.retryAfter) } : {} }
+    );
   }
 
   let body: {
@@ -52,6 +68,10 @@ export async function POST(request: Request) {
       { error: "filePath and currentContent are required" },
       { status: 400 }
     );
+  }
+  const pathResult = sanitizePath(filePath.trim());
+  if (!pathResult.ok) {
+    return NextResponse.json({ error: pathResult.error }, { status: 400 });
   }
   if (action !== "refactor" && action !== "docs" && action !== "fix") {
     return NextResponse.json(
@@ -127,7 +147,7 @@ export async function POST(request: Request) {
     ? `\nError message (use to guide the fix):\n${errorMessage.slice(0, 500)}\n`
     : "";
   const userContent = `Action: ${action}
-File: ${filePath}
+File: ${pathResult.path}
 ${rulesPrompt ? `Project rules to follow:\n${rulesPrompt}\n` : ""}
 Current full file content:
 \`\`\`
@@ -138,6 +158,17 @@ ${errorNote}
 
 Return ONLY the complete new file content (no markdown, no explanation).`;
 
+  const cacheKey = hashForCache(
+    "inline",
+    pathResult.path,
+    action,
+    currentContent.slice(0, 2000),
+    (selection ?? "").slice(0, 500),
+    (errorMessage ?? "").slice(0, 200),
+    rulesPrompt.slice(0, 500),
+    String(providerId),
+    String(modelOpt ?? "")
+  );
   try {
     const { content } = await invokeChat({
       messages: [
@@ -151,6 +182,7 @@ Return ONLY the complete new file content (no markdown, no explanation).`;
       userId: user.id,
       workspaceId,
       supabase,
+      cacheKey,
     });
 
     let newContent = typeof content === "string" ? content.trim() : "";
@@ -160,14 +192,14 @@ Return ONLY the complete new file content (no markdown, no explanation).`;
     }
     if (!newContent || newContent.length < 2) {
       return NextResponse.json({
-        path: filePath.trim(),
+        path: pathResult.path,
         newContent: currentContent,
         error: "No edit generated. Try again or use Chat.",
       });
     }
 
     return NextResponse.json({
-      path: filePath.trim(),
+      path: pathResult.path,
       newContent,
     });
   } catch (e) {

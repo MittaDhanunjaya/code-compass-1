@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireWorkspaceAccess, withAuthResponse } from "@/lib/auth/require-auth";
 import {
   getCloneRoot,
   cloneRepo,
@@ -9,6 +10,7 @@ import {
   removeClone,
 } from "@/lib/github-import";
 import { decrypt } from "@/lib/encrypt";
+import { logger } from "@/lib/logger";
 import { existsSync } from "fs";
 
 type RouteParams = { params: Promise<{ id: string }> };
@@ -18,21 +20,23 @@ type RouteParams = { params: Promise<{ id: string }> };
  * Pull latest from origin into the workspace repo, then overwrite workspace_files (Option A).
  * Uses OAuth token for private repos. Keeps clone on disk for future push.
  */
-export async function POST(_request: Request, { params }: RouteParams) {
+export async function POST(request: Request, { params }: RouteParams) {
   const { id: workspaceId } = await params;
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  let user: { id: string };
+  try {
+    const auth = await requireWorkspaceAccess(request, workspaceId, supabase);
+    user = auth.user;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   const { data: workspace, error: fetchError } = await supabase
     .from("workspaces")
     .select("id, github_repo_url, github_default_branch, github_owner, github_repo, github_is_private")
     .eq("id", workspaceId)
-    .eq("owner_id", user.id)
     .single();
 
   if (fetchError || !workspace) {
@@ -94,7 +98,11 @@ export async function POST(_request: Request, { params }: RouteParams) {
       }
     }
   } catch (e) {
-    if (!repoExists) await removeClone(workspaceId).catch(() => {});
+    if (!repoExists) {
+      await removeClone(workspaceId).catch((err) => {
+        logger.warn({ event: "remove_clone_failed", workspaceId, error: err instanceof Error ? err.message : String(err) });
+      });
+    }
     return NextResponse.json(
       { error: e instanceof Error ? e.message : "Pull failed" },
       { status: 500 }

@@ -1,0 +1,106 @@
+# Phase 13.3.1: Electron desktop builds for macOS, Windows, Linux.
+# Triggers on release publish (tag v*) or manual workflow_dispatch.
+# Artifacts are uploaded to the GitHub Release.
+#
+# Code signing (13.3.2): Add secrets for signed builds:
+#   - macOS: CSC_LINK (base64 .p12), CSC_KEY_PASSWORD, APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID
+#   - Windows: CSC_LINK (base64 .pfx), CSC_KEY_PASSWORD, CSC_FULL_NAME
+
+name: Electron Build
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v1.0.0). Leave empty to use latest tag."
+        required: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: mac
+          - os: windows-latest
+            platform: win
+          - os: ubuntu-latest
+            platform: linux
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      # Electron loads APP_URL in a browser; no need to build Next.js
+      - name: Install Electron dependencies
+        working-directory: electron
+        run: npm ci
+
+      - name: Build Electron app (macOS)
+        if: matrix.platform == 'mac'
+        working-directory: electron
+        run: npx electron-builder --mac --publish never
+        env:
+          APP_URL: ${{ vars.APP_URL || 'https://app.codecompass.dev' }}
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.CSC_LINK != '' }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Build Electron app (Windows)
+        if: matrix.platform == 'win'
+        working-directory: electron
+        run: npx electron-builder --win --publish never
+        env:
+          APP_URL: ${{ vars.APP_URL || 'https://app.codecompass.dev' }}
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          CSC_FULL_NAME: ${{ secrets.CSC_FULL_NAME }}
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.CSC_LINK != '' }}
+
+      - name: Build Electron app (Linux)
+        if: matrix.platform == 'linux'
+        working-directory: electron
+        run: npx electron-builder --linux --publish never
+
+      - name: Upload to Release (macOS)
+        if: matrix.platform == 'mac' && github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            electron/dist/*.dmg
+            electron/dist/*.zip
+          fail-on-unmatched-files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload to Release (Windows)
+        if: matrix.platform == 'win' && github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: electron/dist/*.exe
+          fail-on-unmatched-files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload to Release (Linux)
+        if: matrix.platform == 'linux' && github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: electron/dist/*.AppImage
+          fail-on-unmatched-files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

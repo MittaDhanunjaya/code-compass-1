@@ -4,7 +4,7 @@
  */
 
 import type { ZodSchema } from "zod";
-import { agentPlanOutputSchema, analyzeResultSchema, evalTasksResponseSchema } from "./schemas";
+import { agentPlanOutputSchema, analyzeResultSchema, evalTasksResponseSchema, prAnalyzeOutputSchema, debugFromLogOutputSchema } from "./schemas";
 
 export function validateBody<T>(schema: ZodSchema<T>, body: unknown): { success: true; data: T } | { success: false; error: string } {
   const result = schema.safeParse(body);
@@ -47,4 +47,29 @@ export function validateEvalTasksResponse(data: unknown): { success: true; data:
   if (result.success) return { success: true, data: result.data as { tasks: import("@/lib/eval/tasks").EvalTask[]; hint: string } };
   const err = result.error as { issues?: Array<{ message?: string }> };
   return { success: false, error: err?.issues?.[0]?.message ?? "Invalid eval tasks response" };
+}
+
+/** Validate PR analyze LLM output. Returns safe defaults on invalid. */
+export function validatePrAnalyzeOutput(parsed: unknown): { summary: string; risks: string[]; suggestions: string[] } {
+  const result = prAnalyzeOutputSchema.safeParse(parsed);
+  if (result.success) return result.data;
+  return { summary: "", risks: [], suggestions: [] };
+}
+
+/** Validate debug-from-log LLM output. Returns null fields on invalid. */
+export function validateDebugFromLogOutput(parsed: unknown): {
+  suspectedRootCause: string | null;
+  explanation: string | null;
+  edits: Array<{ path?: string; description?: string; oldContent?: string; newContent?: string }>;
+} {
+  const result = debugFromLogOutputSchema.safeParse(parsed);
+  if (result.success) {
+    const d = result.data;
+    return {
+      suspectedRootCause: typeof d.suspectedRootCause === "string" && d.suspectedRootCause.trim() ? d.suspectedRootCause.trim() : null,
+      explanation: typeof d.explanation === "string" && d.explanation.trim() ? d.explanation.trim() : null,
+      edits: Array.isArray(d.edits) ? d.edits : [],
+    };
+  }
+  return { suspectedRootCause: null, explanation: null, edits: [] };
 }

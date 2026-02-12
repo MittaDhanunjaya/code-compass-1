@@ -9,6 +9,7 @@ import { getModelForProvider, PROVIDERS, type ProviderId } from "@/lib/llm/provi
 import { applyEnvRouting } from "@/lib/llm/task-routing";
 import { getPatchModelCandidates } from "@/lib/llm/ab-stats";
 import { invokeChatWithFallback, type InvokeChatCandidate } from "@/lib/llm/router";
+import { validateDebugFromLogOutput } from "@/lib/validation";
 import { detectStackFromPaths } from "@/lib/sandbox/stack-commands";
 import { getDebugPromptHintsForStack } from "@/lib/sandbox/stack-profiles";
 
@@ -432,13 +433,9 @@ ${fileContext}
     const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
     const jsonStr = jsonMatch ? jsonMatch[0]! : trimmed;
 
-    let parsed: {
-      suspectedRootCause?: string | null;
-      explanation?: string | null;
-      edits?: Array<{ path?: string; description?: string; oldContent?: string; newContent?: string }>;
-    };
+    let parsed: unknown;
     try {
-      parsed = JSON.parse(jsonStr) as typeof parsed;
+      parsed = JSON.parse(jsonStr);
     } catch {
       return {
         suspectedRootCause: null,
@@ -447,16 +444,10 @@ ${fileContext}
       };
     }
 
-    const suspectedRootCause =
-      typeof parsed.suspectedRootCause === "string" && parsed.suspectedRootCause.trim()
-        ? parsed.suspectedRootCause.trim()
-        : null;
-    const explanation =
-      typeof parsed.explanation === "string" && parsed.explanation.trim()
-        ? parsed.explanation.trim()
-        : null;
-
-    const rawEdits = Array.isArray(parsed.edits) ? parsed.edits : [];
+    const validated = validateDebugFromLogOutput(parsed);
+    const suspectedRootCause = validated.suspectedRootCause;
+    const explanation = validated.explanation;
+    const rawEdits = validated.edits;
     const edits: DebugFromLogEdit[] = [];
     for (const e of rawEdits) {
       const path = typeof e.path === "string" ? e.path.trim() : "";

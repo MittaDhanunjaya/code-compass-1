@@ -13,6 +13,7 @@ Code Compass is a **safety-first, multi-provider AI IDE** for GitHub repos and l
 - [Configuration](#configuration)
 - [CI integration](#ci-integration)
 - [Project structure and what to commit](#project-structure-and-what-to-commit)
+- [Contributing](#contributing)
 - [Status and roadmap](#status-and-roadmap)
 
 ---
@@ -274,6 +275,12 @@ Important paths to keep in Git:
 - `.github/` — Workflow templates.
 
 Unnecessary or generated files are listed in `.gitignore` (e.g. `node_modules/`, `.next/`, `.env.local`, build artifacts, IDE/OS cruft). Only source, config, and docs that others need should be committed.
+
+---
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to run locally, code style, and the PR checklist. API and architecture docs are in [docs/API.md](docs/API.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ---
 

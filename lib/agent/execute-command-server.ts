@@ -1,4 +1,6 @@
 import { createClient } from "@/lib/supabase/server";
+import { getToolTimeoutMs } from "@/services/tools/registry";
+import { logToolExecution } from "@/lib/logger";
 import { spawn } from "child_process";
 import { mkdir, writeFile } from "fs/promises";
 import { join, dirname, resolve } from "path";
@@ -532,10 +534,19 @@ export async function executeCommandInWorkspace(
     await syncWorkspaceToDisk(supabase, workspaceId);
     const workspaceDir = getWorkspaceDir(workspaceId);
     const activeVenv = activeVenvs.get(workspaceId);
-    const timeout = isServerCommand(command) ? SERVER_COMMAND_TIMEOUT_MS : COMMAND_TIMEOUT_MS;
+    const perToolTimeout = getToolTimeoutMs("run_command");
+    const timeout = isServerCommand(command) ? SERVER_COMMAND_TIMEOUT_MS : perToolTimeout;
     const result = await executeCommand(command, workspaceDir, timeout, activeVenv, abortSignal);
+    const ok = result.exitCode === 0 && !result.errorMessage;
+    logToolExecution({
+      toolName: "run_command",
+      workspaceId,
+      durationMs: result.durationMs,
+      success: ok,
+      command,
+    });
     return {
-      ok: result.exitCode === 0 && !result.errorMessage,
+      ok,
       command,
       ...result,
     };

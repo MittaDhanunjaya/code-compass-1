@@ -9,7 +9,7 @@ import {
   agentExecuteStreamBodySchema,
   chatStreamBodySchema,
 } from "./schemas";
-import { validateBody, validateAgentPlanOutput } from "./index";
+import { validateBody, validateAgentPlanOutput, validatePrAnalyzeOutput, validateDebugFromLogOutput } from "./index";
 
 describe("agentPlanOutputSchema", () => {
   it("accepts valid plan with file_edit and command steps", () => {
@@ -124,5 +124,44 @@ describe("validateBody", () => {
   it("rejects execute without plan", () => {
     const result = validateBody(agentExecuteStreamBodySchema, {});
     expect(result.success).toBe(false);
+  });
+});
+
+describe("validatePrAnalyzeOutput", () => {
+  it("returns validated output for valid parsed object", () => {
+    const parsed = { summary: "Changed X", risks: ["risk1"], suggestions: ["sug1"] };
+    const result = validatePrAnalyzeOutput(parsed);
+    expect(result.summary).toBe("Changed X");
+    expect(result.risks).toEqual(["risk1"]);
+    expect(result.suggestions).toEqual(["sug1"]);
+  });
+
+  it("returns safe defaults for invalid parsed", () => {
+    const result = validatePrAnalyzeOutput({ foo: "bar" });
+    expect(result.summary).toBe("");
+    expect(result.risks).toEqual([]);
+    expect(result.suggestions).toEqual([]);
+  });
+});
+
+describe("validateDebugFromLogOutput", () => {
+  it("returns validated output for valid parsed object", () => {
+    const parsed = {
+      suspectedRootCause: "Missing import",
+      explanation: "Fixed by adding import",
+      edits: [{ path: "a.ts", newContent: "x" }],
+    };
+    const result = validateDebugFromLogOutput(parsed);
+    expect(result.suspectedRootCause).toBe("Missing import");
+    expect(result.explanation).toBe("Fixed by adding import");
+    expect(result.edits).toHaveLength(1);
+    expect(result.edits[0].path).toBe("a.ts");
+  });
+
+  it("returns null/empty for invalid parsed", () => {
+    const result = validateDebugFromLogOutput({ foo: "bar" });
+    expect(result.suspectedRootCause).toBeNull();
+    expect(result.explanation).toBeNull();
+    expect(result.edits).toEqual([]);
   });
 });

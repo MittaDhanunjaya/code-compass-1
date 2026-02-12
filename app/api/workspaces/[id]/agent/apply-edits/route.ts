@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
+import { pushEditBatch } from "@/lib/edit-history";
 
 type RouteParams = { params: Promise<{ id: string }> };
 
@@ -56,6 +57,7 @@ export async function POST(request: Request, { params }: RouteParams) {
   const applied: string[] = [];
   const largeEditPaths: string[] = [];
   const fullFileReplacePaths: string[] = [];
+  const editHistoryBatch: { path: string; oldContent: string; newContent: string }[] = [];
 
   for (const { path, content } of edits) {
     const trimmedPath = (path ?? "").trim();
@@ -87,7 +89,10 @@ export async function POST(request: Request, { params }: RouteParams) {
         .update({ content: content ?? "", updated_at: new Date().toISOString() })
         .eq("workspace_id", workspaceId)
         .eq("path", trimmedPath);
-      if (!error) applied.push(trimmedPath);
+      if (!error) {
+        applied.push(trimmedPath);
+        editHistoryBatch.push({ path: trimmedPath, oldContent: originalContent, newContent: content ?? "" });
+      }
     } else {
       const { error } = await supabase
         .from("workspace_files")
@@ -96,8 +101,15 @@ export async function POST(request: Request, { params }: RouteParams) {
           path: trimmedPath,
           content: content ?? "",
         });
-      if (!error) applied.push(trimmedPath);
+      if (!error) {
+        applied.push(trimmedPath);
+        editHistoryBatch.push({ path: trimmedPath, oldContent: "", newContent: content ?? "" });
+      }
     }
+  }
+
+  if (editHistoryBatch.length > 0) {
+    pushEditBatch(workspaceId, editHistoryBatch);
   }
 
   if (fullFileReplacePaths.length > 0) {

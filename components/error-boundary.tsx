@@ -9,6 +9,8 @@ type Props = {
   children: ReactNode;
   fallback?: ReactNode;
   onError?: (error: Error, errorInfo: ErrorInfo) => void;
+  /** Phase 12.3.2: Optional context for Sentry (workspaceId, operation). */
+  captureContext?: { workspaceId?: string; operation?: string };
 };
 
 type State = {
@@ -34,7 +36,10 @@ export class ErrorBoundary extends Component<Props, State> {
     if (typeof console !== "undefined") {
       console.error("[ErrorBoundary]", error, errorInfo.componentStack);
     }
-    captureExceptionSync(error, { componentStack: errorInfo.componentStack });
+    captureExceptionSync(error, {
+      componentStack: errorInfo.componentStack,
+      ...this.props.captureContext,
+    });
     this.props.onError?.(error, errorInfo);
   }
 

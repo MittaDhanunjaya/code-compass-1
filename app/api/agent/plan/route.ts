@@ -5,20 +5,31 @@
 
 import { NextResponse } from "next/server";
 import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
+import { checkRateLimit, getRateLimitIdentifier } from "@/lib/api-rate-limit";
 import { planAgent, PlanAgentError } from "@/services/agent.service";
 import type { ProviderId } from "@/lib/llm/providers";
+import { getUserFriendlyMessage } from "@/lib/errors";
 
 export async function POST(request: Request) {
   let user: { id: string };
   let supabase: Awaited<ReturnType<typeof import("@/lib/supabase/server").createClient>>;
   try {
-    const auth = await requireAuth();
+    const auth = await requireAuth(request);
     user = auth.user;
     supabase = auth.supabase;
   } catch (e) {
     const res = withAuthResponse(e);
     if (res) return res;
     throw e;
+  }
+
+  const rl = await checkRateLimit(getRateLimitIdentifier(request, user.id), "agent-plan", 30);
+  if (!rl.ok) {
+    const retryAfter = rl.retryAfter ?? 60;
+    return NextResponse.json(
+      { error: getUserFriendlyMessage("rate_limit", { retryAfterSeconds: retryAfter }), retryAfter },
+      { status: 429, headers: { "Retry-After": String(retryAfter) } }
+    );
   }
 
   let body: {

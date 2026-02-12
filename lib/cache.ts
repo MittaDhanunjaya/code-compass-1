@@ -1,7 +1,10 @@
 /**
  * In-memory caching layer for performance optimization.
- * Caches Tab completions, search results, and embeddings.
+ * Phase 6.1.4: getOrSet with Redis when REDIS_URL set, in-memory fallback.
+ * Caches Tab completions, search results, embeddings, and file tree.
  */
+
+import { createHash } from "crypto";
 
 type CacheEntry<T> = {
   value: T;
@@ -44,6 +47,10 @@ class SimpleCache<T> {
     });
   }
 
+  delete(key: string): void {
+    this.cache.delete(key);
+  }
+
   clear(): void {
     this.cache.clear();
   }
@@ -51,6 +58,153 @@ class SimpleCache<T> {
   size(): number {
     return this.cache.size;
   }
+}
+
+/** Lazy Redis client for cache - only created when REDIS_URL is set */
+let redisCacheClient: {
+  get: (key: string) => Promise<string | null>;
+  setex: (key: string, seconds: number, value: string) => Promise<unknown>;
+  del: (key: string) => Promise<number>;
+} | null = null;
+let redisCacheFailed = false;
+
+async function getRedisCacheClient(): Promise<typeof redisCacheClient> {
+  if (redisCacheClient) return redisCacheClient;
+  if (redisCacheFailed) return null;
+  const url = process.env.REDIS_URL;
+  if (!url) return null;
+  try {
+    const Redis = (await import("ioredis")).default;
+    const client = new Redis(url, { maxRetriesPerRequest: 2, enableReadyCheck: true, lazyConnect: true });
+    await client.connect();
+    redisCacheClient = {
+      get: (k) => client.get(k),
+      setex: (k, s, v) => client.setex(k, s, v),
+      del: (k) => client.del(k),
+    };
+    return redisCacheClient;
+  } catch {
+    redisCacheFailed = true;
+    return null;
+  }
+}
+
+const inMemoryStore = new Map<string, { value: string; expiresAt: number }>();
+
+function inMemoryGet(key: string): string | null {
+  const entry = inMemoryStore.get(key);
+  if (!entry || Date.now() > entry.expiresAt) {
+    if (entry) inMemoryStore.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function inMemorySet(key: string, value: string, ttlMs: number): void {
+  inMemoryStore.set(key, { value, expiresAt: Date.now() + ttlMs });
+}
+
+function inMemoryDelete(key: string): void {
+  inMemoryStore.delete(key);
+}
+
+/**
+ * Get or set a cached value. Uses Redis when REDIS_URL is set, else in-memory.
+ * @param key Cache key
+ * @param ttlMs TTL in milliseconds
+ * @param fn Async function to compute value when cache miss
+ * @returns Cached or computed value
+ */
+export async function getOrSet<T>(
+  key: string,
+  ttlMs: number,
+  fn: () => Promise<T>,
+  options?: { serialize?: (v: T) => string; deserialize?: (s: string) => T }
+): Promise<T> {
+  const serialize = options?.serialize ?? JSON.stringify;
+  const deserialize = options?.deserialize ?? (JSON.parse as (s: string) => T);
+
+  const redis = await getRedisCacheClient();
+  if (redis) {
+    try {
+      const cached = await redis.get(key);
+      if (cached) return deserialize(cached);
+    } catch {
+      // Fall through to compute
+    }
+    const value = await fn();
+    try {
+      const ttlSec = Math.max(1, Math.ceil(ttlMs / 1000));
+      await redis.setex(key, ttlSec, serialize(value));
+    } catch {
+      // Ignore set failure
+    }
+    return value;
+  }
+
+  const memCached = inMemoryGet(key);
+  if (memCached) return deserialize(memCached);
+  const value = await fn();
+  inMemorySet(key, serialize(value), ttlMs);
+  return value;
+}
+
+/**
+ * Get or set with metadata (whether value came from cache).
+ * Used when caller needs to skip side effects (e.g. token usage) on cache hit.
+ */
+export async function getOrSetWithMeta<T>(
+  key: string,
+  ttlMs: number,
+  fn: () => Promise<T>,
+  options?: { serialize?: (v: T) => string; deserialize?: (s: string) => T }
+): Promise<{ value: T; cached: boolean }> {
+  const serialize = options?.serialize ?? JSON.stringify;
+  const deserialize = options?.deserialize ?? (JSON.parse as (s: string) => T);
+
+  const redis = await getRedisCacheClient();
+  if (redis) {
+    try {
+      const cached = await redis.get(key);
+      if (cached) return { value: deserialize(cached), cached: true };
+    } catch {
+      // Fall through to compute
+    }
+    const value = await fn();
+    try {
+      const ttlSec = Math.max(1, Math.ceil(ttlMs / 1000));
+      await redis.setex(key, ttlSec, serialize(value));
+    } catch {
+      // Ignore set failure
+    }
+    return { value, cached: false };
+  }
+
+  const memCached = inMemoryGet(key);
+  if (memCached) return { value: deserialize(memCached), cached: true };
+  const value = await fn();
+  inMemorySet(key, serialize(value), ttlMs);
+  return { value, cached: false };
+}
+
+/**
+ * Invalidate a cache key (for getOrSet). Use for file tree when files change.
+ */
+export async function invalidateCache(key: string): Promise<void> {
+  inMemoryDelete(key);
+  const redis = await getRedisCacheClient();
+  if (redis) {
+    try {
+      await redis.del(key);
+    } catch {
+      // Ignore Redis delete failure
+    }
+  }
+}
+
+/** Simple hash for cache keys (e.g. instruction + scopeMode + model) */
+export function hashForCache(...parts: string[]): string {
+  return createHash("sha256").update(parts.join("|")).digest("hex").slice(0, 32);
 }
 
 // Cache instances

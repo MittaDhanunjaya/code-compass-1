@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireWorkspaceAccess, withAuthResponse } from "@/lib/auth/require-auth";
+import { sanitizePath } from "@/lib/validation/sanitize-path";
 import { writeFileSync, mkdtempSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -171,22 +173,12 @@ async function runPythonLint(path: string, content: string): Promise<LintDiagnos
 export async function POST(request: Request, { params }: RouteParams) {
   const { id: workspaceId } = await params;
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
-  const { data: workspace } = await supabase
-    .from("workspaces")
-    .select("id")
-    .eq("id", workspaceId)
-    .eq("owner_id", user.id)
-    .single();
-
-  if (!workspace) {
-    return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
+  try {
+    await requireWorkspaceAccess(request, workspaceId, supabase);
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   let body: { path?: string; content?: string; eslintConfig?: string };
@@ -196,12 +188,17 @@ export async function POST(request: Request, { params }: RouteParams) {
     return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
   }
 
-  const path = (body.path ?? "").trim();
+  const rawPath = (body.path ?? "").trim();
   let content = body.content;
 
-  if (!path) {
+  if (!rawPath) {
     return NextResponse.json({ error: "path is required" }, { status: 400 });
   }
+  const pathResult = sanitizePath(rawPath);
+  if (!pathResult.ok) {
+    return NextResponse.json({ error: pathResult.error }, { status: 400 });
+  }
+  const path = pathResult.path;
 
   if (content === undefined) {
     const { data: file } = await supabase

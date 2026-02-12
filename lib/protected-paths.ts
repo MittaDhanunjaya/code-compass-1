@@ -4,7 +4,8 @@
  */
 
 /** In Safe edit mode, AI operations that would modify more than this many files require extra confirmation. */
-export const SAFE_EDIT_MAX_FILES = 20;
+import { AGENT_CONFIG } from "@/lib/config/constants";
+export const SAFE_EDIT_MAX_FILES = AGENT_CONFIG.SAFE_EDIT_MAX_FILES;
 
 /** Over-edit guardrail: if a single file_edit would replace more than this fraction of the file (by length), treat as over-edit and require confirmation or reject. */
 export const OVER_EDIT_RATIO_THRESHOLD = 0.4;

@@ -1,12 +1,13 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { decrypt } from "@/lib/encrypt";
+import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
+import { checkRateLimit, getRateLimitIdentifier } from "@/lib/api-rate-limit";
 import { getModelForProvider } from "@/lib/llm/providers";
 import { getBestDefaultModel, getCompletionModel } from "@/lib/models/invocation-config";
-import OpenAI from "openai";
+import { invokeChat } from "@/lib/llm/router";
 import { tabCompletionCache, getTabCompletionKey, searchCache, getSearchKey } from "@/lib/cache";
-
-const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
+import { logger } from "@/lib/logger";
 const OLLAMA_BASE = process.env.OLLAMA_BASE_URL ?? "http://localhost:11434";
 
 /** Tab completion uses OpenRouter; fallback when best-default is not OpenRouter. */
@@ -19,12 +20,24 @@ const PREFIX_MAX = 320;
 const SUFFIX_MAX = 120;
 
 export async function POST(request: Request) {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  let user: { id: string };
+  let supabase: Awaited<ReturnType<typeof createClient>>;
+  try {
+    const auth = await requireAuth(request);
+    user = auth.user;
+    supabase = auth.supabase;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
+  }
+
+  const rl = await checkRateLimit(getRateLimitIdentifier(request, user.id), "completions-tab", 60);
+  if (!rl.ok) {
+    return NextResponse.json(
+      { error: "Too many requests. Try again later.", retryAfter: rl.retryAfter },
+      { status: 429, headers: rl.retryAfter ? { "Retry-After": String(rl.retryAfter) } : {} }
+    );
   }
 
   let body: {
@@ -135,8 +148,8 @@ export async function POST(request: Request) {
           codebaseContext = `\nSimilar: ${contextFiles}`;
         }
       }
-    } catch {
-      // Silently fail - codebase context is optional
+    } catch (e) {
+      logger.debug({ event: "tab_completion_codebase_context_failed", error: e instanceof Error ? e.message : String(e) });
     }
   }
 
@@ -202,29 +215,25 @@ export async function POST(request: Request) {
   }
 
   try {
-    const client = new OpenAI({
-      apiKey,
-      baseURL: OPENROUTER_BASE,
-      defaultHeaders: {
-        "HTTP-Referer": typeof window !== "undefined" ? window.location.origin : "https://codecompass.app",
-        "X-Title": "Code Compass Tab",
-      },
-    });
-
-    const completion = await client.chat.completions.create({
-      model,
+    const { content } = await invokeChat({
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
       ],
-      max_tokens: 200, // Increased for multi-line completions
-      temperature: 0.1, // Lower temperature for more deterministic completions
+      apiKey,
+      providerId: "openrouter",
+      model: getModelForProvider("openrouter", model) ?? model,
+      task: "chat",
+      maxTokens: 200,
+      temperature: 0.1,
+      userId: user.id,
+      workspaceId: workspaceId || undefined,
+      supabase,
     });
 
-    const raw = completion.choices[0]?.message?.content?.trim() ?? "";
+    const raw = (content ?? "").trim();
     const completionText = raw.replace(/\n?```[\w]*\n?/g, "").trim();
 
-    // Cache the result (30s TTL for Tab completions)
     if (completionText) {
       tabCompletionCache.set(cacheKey, completionText, 30000);
     }

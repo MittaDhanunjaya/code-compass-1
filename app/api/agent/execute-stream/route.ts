@@ -23,9 +23,12 @@ import {
 } from "@/lib/sandbox";
 import { beautifyCode } from "@/lib/utils/code-beautifier";
 import { safeEnqueue, safeClose, shouldStopStream, STREAM_UPSTREAM_TIMEOUT_MS } from "@/lib/stream-utils";
-import { validateToolName, validateToolInput } from "@/services/tools/registry";
+import { validateToolName, validateToolInput, acquireToolSlot, releaseToolSlot } from "@/services/tools/registry";
 import { agentExecuteStreamBodySchema } from "@/lib/validation/schemas";
 import { validateBody } from "@/lib/validation";
+import { logger, logAgentStarted, logAgentCompleted, getRequestId } from "@/lib/logger";
+import { captureException } from "@/lib/sentry";
+import { recordAgentExecuteDuration } from "@/lib/metrics";
 
 function commandKindToActionLabel(kind: "setup" | "test" | "other"): import("@/lib/agent/types").LogActionLabel {
   if (kind === "setup") return "CMD-SETUP";
@@ -53,7 +56,7 @@ function emitEvent(
       closedRef.current = true;
     }
     if (!closedRef?.current) {
-      console.error("Failed to emit event:", e);
+      logger.error({ event: "execute_emit_failed", error: e instanceof Error ? e.message : String(e) });
     }
   }
 }
@@ -110,13 +113,31 @@ export async function POST(request: Request) {
     );
   }
 
+  try {
+    acquireToolSlot(user.id);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Tool execution limit reached";
+    return NextResponse.json({ error: msg }, { status: 429 });
+  }
+
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
+      const execStart = Date.now();
+      let execError: Error | null = null;
       const closed = { current: false };
       const safeEmit = (event: AgentEvent) => emitEvent(controller, encoder, event, closed);
+      const requestId = getRequestId(request);
 
       try {
+        logAgentStarted({
+          phase: "execute",
+          workspaceId,
+          userId: user.id,
+          scopeMode: body.scopeMode,
+          stepCount: plan.steps.length,
+          requestId,
+        });
         safeEmit(createAgentEvent('status', 'Agent execution started...'));
 
         // Try to get workspace with safe_edit_mode, fallback to minimal if column doesn't exist
@@ -945,7 +966,10 @@ export async function POST(request: Request) {
         }
         safeClose(controller);
       } catch (e) {
-        const errorMsg = e instanceof Error ? e.message : "Execution failed";
+        execError = e instanceof Error ? e : new Error(String(e));
+        const errorMsg = execError.message;
+        logger.error({ event: "execute_error", error: errorMsg, workspaceId, userId: user.id });
+        captureException(execError, { workspaceId, operation: "agent_execute", userId: user.id });
         safeEmit(createAgentEvent('status', `Error: ${errorMsg}`));
         if (!closed.current) {
           const errorResult: AgentExecuteResult = {
@@ -956,6 +980,19 @@ export async function POST(request: Request) {
           safeEnqueue(controller, encoder, `data: ${JSON.stringify({ type: 'result', result: errorResult })}\n\n`);
         }
         safeClose(controller);
+      } finally {
+        releaseToolSlot(user.id);
+        const durationMs = Date.now() - execStart;
+        recordAgentExecuteDuration(durationMs);
+        logAgentCompleted({
+          phase: "execute",
+          workspaceId,
+          userId: user.id,
+          durationMs,
+          success: !execError,
+          error: execError?.message,
+          requestId,
+        });
       }
     },
   });

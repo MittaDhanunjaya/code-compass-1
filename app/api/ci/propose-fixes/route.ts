@@ -27,7 +27,7 @@ export async function POST(request: Request) {
     }
   } else {
     try {
-      await requireAuth();
+      await requireAuth(request);
     } catch (e) {
       const res = withAuthResponse(e);
       if (res) return res;

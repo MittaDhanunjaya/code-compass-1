@@ -68,4 +68,20 @@ describe("validateLocalFiles", () => {
   it("uses MAX_LOCAL_FILES constant as documented limit", () => {
     expect(MAX_LOCAL_FILES).toBe(500);
   });
+
+  it("rejects path traversal in file paths", () => {
+    const result = validateLocalFiles([
+      { path: "../etc/passwd", content: "" },
+    ]);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("Invalid path");
+  });
+
+  it("rejects absolute paths", () => {
+    const result = validateLocalFiles([
+      { path: "/etc/passwd", content: "" },
+    ]);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("Invalid path");
+  });
 });

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
 import { encrypt } from "@/lib/encrypt";
 import { getGitHubClientIdOnly } from "@/lib/github-oauth-config";
 
@@ -7,13 +8,13 @@ import { getGitHubClientIdOnly } from "@/lib/github-oauth-config";
  * GET /api/settings/github-oauth
  * Returns whether GitHub OAuth is configured and a masked client ID (never the secret).
  */
-export async function GET() {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+export async function GET(request: Request) {
+  try {
+    await requireAuth(request);
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   let clientId: string | null = null;
@@ -39,12 +40,14 @@ export async function GET() {
  * Env vars still take precedence at runtime.
  */
 export async function POST(request: Request) {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  let supabase: Awaited<ReturnType<typeof createClient>>;
+  try {
+    const auth = await requireAuth(request);
+    supabase = auth.supabase;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   let body: { clientId?: string; clientSecret?: string };

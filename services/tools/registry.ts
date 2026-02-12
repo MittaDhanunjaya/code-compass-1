@@ -116,3 +116,31 @@ export function getToolTimeoutMs(name: string): number {
   validateToolName(name);
   return REGISTRY[name].timeoutMs;
 }
+
+/** Max concurrent tool executions per user. */
+const MAX_CONCURRENT_TOOLS_PER_USER = 5;
+const activeToolCount = new Map<string, number>();
+
+/**
+ * Acquire a slot for tool execution. Call releaseToolSlot when done.
+ * Throws if over limit.
+ */
+export function acquireToolSlot(userId: string): void {
+  const count = activeToolCount.get(userId) ?? 0;
+  if (count >= MAX_CONCURRENT_TOOLS_PER_USER) {
+    throw new Error(`Tool execution limit reached (max ${MAX_CONCURRENT_TOOLS_PER_USER} concurrent). Please wait for current operations to complete.`);
+  }
+  activeToolCount.set(userId, count + 1);
+}
+
+/**
+ * Release a tool execution slot.
+ */
+export function releaseToolSlot(userId: string): void {
+  const count = activeToolCount.get(userId) ?? 1;
+  if (count <= 1) {
+    activeToolCount.delete(userId);
+  } else {
+    activeToolCount.set(userId, count - 1);
+  }
+}

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
 import { getBestDefaultModel } from "@/lib/models/invocation-config";
 import type { ProviderId } from "@/lib/llm/providers";
 import { PROVIDER_LABELS } from "@/lib/llm/providers";
@@ -10,13 +11,17 @@ import { PROVIDER_LABELS } from "@/lib/llm/providers";
  * (free models + API-connected models, free first). Used for Chat, Composer, Cmd+K, and tab completion
  * when the user has not set a preference. User can always change the model in the UI.
  */
-export async function GET() {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+export async function GET(request: Request) {
+  let user: { id: string };
+  let supabase: Awaited<ReturnType<typeof createClient>>;
+  try {
+    const auth = await requireAuth(request);
+    user = auth.user;
+    supabase = auth.supabase;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   const best = await getBestDefaultModel(supabase, user.id);

@@ -7,9 +7,9 @@ import { validateEvalTasksResponse } from "@/lib/validation";
  * GET /api/evaluation/tasks
  * Returns the list of synthetic eval tasks for running the eval suite across models/prompts.
  */
-export async function GET() {
+export async function GET(request: Request) {
   try {
-    await requireAuth();
+    await requireAuth(request);
   } catch (e) {
     const res = withAuthResponse(e);
     if (res) return res;

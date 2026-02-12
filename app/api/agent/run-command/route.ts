@@ -3,12 +3,13 @@ import { createClient } from "@/lib/supabase/server";
 import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
 import { executeCommandInWorkspace } from "@/lib/agent/execute-command-server";
 import { resolveWorkspaceId } from "@/lib/workspaces/active-workspace";
+import { validateToolInput, acquireToolSlot, releaseToolSlot } from "@/services/tools/registry";
 
 export async function POST(request: Request) {
   let user: { id: string };
   let supabase: Awaited<ReturnType<typeof createClient>>;
   try {
-    const auth = await requireAuth();
+    const auth = await requireAuth(request);
     user = auth.user;
     supabase = auth.supabase;
   } catch (e) {
@@ -28,6 +29,21 @@ export async function POST(request: Request) {
   }
 
   const command = (body.command ?? "").trim();
+  try {
+    validateToolInput<{ command: string }>("run_command", { command });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Invalid command";
+    return NextResponse.json({ error: msg }, { status: 400 });
+  }
+
+  try {
+    acquireToolSlot(user.id);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Tool execution limit reached";
+    return NextResponse.json({ error: msg }, { status: 429 });
+  }
+
+  try {
   const workspaceId = await resolveWorkspaceId(supabase, user.id, body.workspaceId);
 
   if (!workspaceId || !command) {
@@ -48,6 +64,9 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
   }
 
-  const result = await executeCommandInWorkspace(supabase, workspaceId, command, request.signal);
-  return NextResponse.json(result);
+    const result = await executeCommandInWorkspace(supabase, workspaceId, command, request.signal);
+    return NextResponse.json(result);
+  } finally {
+    releaseToolSlot(user.id);
+  }
 }

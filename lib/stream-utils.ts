@@ -1,14 +1,17 @@
 /**
  * Helpers for ReadableStream controllers so client abort doesn't throw
  * "Controller is already closed" or similar. Use before every enqueue/close.
+ * Phase 6.2: Uses STREAMING_CONFIG from constants.
  */
 
-/** Default upstream timeout for LLM streams (5 min per Phase 3.3.3). */
-export const STREAM_UPSTREAM_TIMEOUT_MS = 5 * 60 * 1000;
+import { STREAMING_CONFIG } from "@/lib/config/constants";
+export const STREAM_UPSTREAM_TIMEOUT_MS = STREAMING_CONFIG.STREAM_UPSTREAM_TIMEOUT_MS;
+export const MAX_STREAM_DURATION_MS = STREAMING_CONFIG.MAX_STREAM_DURATION_MS;
 
 /** Check if we should stop streaming (client disconnected or timeout). */
 export function shouldStopStream(request: Request, startTime: number, timeoutMs: number = STREAM_UPSTREAM_TIMEOUT_MS): boolean {
   if (request.signal?.aborted) return true;
+  if (Date.now() - startTime > MAX_STREAM_DURATION_MS) return true;
   return Date.now() - startTime > timeoutMs;
 }
 

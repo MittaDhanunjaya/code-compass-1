@@ -5,6 +5,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ReactNode,
@@ -80,7 +81,11 @@ export function EditorProvider({
           activePath: activeTab,
         })
       );
-    } catch (_) {}
+    } catch (e) {
+      if (process.env.NODE_ENV !== "production") {
+        console.debug("[editor-context] Failed to persist tab session:", e);
+      }
+    }
   }, [wsId, tabs, activeTab]);
 
   // Restore session when workspace loads and we have no tabs (reload or switch); only once per workspace
@@ -215,23 +220,40 @@ export function EditorProvider({
     });
   }, []);
 
-  const value: EditorContextValue = {
-    tabs,
-    activeTab,
-    selection,
-    pendingCmdKSuggestion,
-    setPendingCmdKSuggestion,
-    openFile,
-    closeTab,
-    setActiveTab,
-    setSelection,
-    updateContent,
-    saveFile,
-    getTab,
-    applyExternalEdits,
-    workspaceId: wsId,
-    setWorkspaceId: setWsId,
-  };
+  const value = useMemo<EditorContextValue>(
+    () => ({
+      tabs,
+      activeTab,
+      selection,
+      pendingCmdKSuggestion,
+      setPendingCmdKSuggestion,
+      openFile,
+      closeTab,
+      setActiveTab,
+      setSelection,
+      updateContent,
+      saveFile,
+      getTab,
+      applyExternalEdits,
+      workspaceId: wsId,
+      setWorkspaceId: setWsId,
+    }),
+    [
+      tabs,
+      activeTab,
+      selection,
+      pendingCmdKSuggestion,
+      openFile,
+      closeTab,
+      setActiveTab,
+      setSelection,
+      updateContent,
+      saveFile,
+      getTab,
+      applyExternalEdits,
+      wsId,
+    ]
+  );
 
   return (
     <EditorContext.Provider value={value}>{children}</EditorContext.Provider>

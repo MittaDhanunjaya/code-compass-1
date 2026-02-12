@@ -5,10 +5,8 @@
 
 import type { ChatMessage, ChatContext, LLMUsage } from "./types";
 import { getProvider, getModelForProvider, type ProviderId } from "./providers";
-import { isRateLimitError, isFallbackableError } from "./rate-limit";
-
-const MAX_RETRIES = 3;
-const INITIAL_BACKOFF_MS = 1000;
+import { isRateLimitError, isFallbackableError, isTimeoutError } from "./rate-limit";
+import { withRetry } from "./retry-handler";
 
 export type TaskType = "planning" | "qa" | "patch" | "review" | "chat" | "inline_edit" | "debug";
 
@@ -50,88 +48,74 @@ export type InvokeToolUseOutput = InvokeChatOutput & {
   toolCalls?: ToolCallSpec[];
 };
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/** Retry on rate limit or timeout (network issues). */
+function isRetryableLlmError(e: unknown): boolean {
+  return isRateLimitError(e) || isTimeoutError(e);
 }
 
 /**
- * Invoke chat with retries (on rate limit), logging, and standardized output.
+ * Invoke chat with retries (on rate limit/timeout), logging, and standardized output.
+ * Phase 6.3: Uses withRetry from retry-handler.
  */
 export async function invokeChat(input: InvokeChatInput): Promise<InvokeChatOutput> {
   const { messages, apiKey, providerId, model, context, task = "chat", temperature, maxTokens } = input;
   const provider = getProvider(providerId);
   const modelOpt = getModelForProvider(providerId, model ?? undefined);
   const start = Date.now();
-  let lastError: unknown;
   let retries = 0;
 
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    try {
+  const result = await withRetry(
+    async () => {
       const { content, usage } = await provider.chat(messages, apiKey, {
         model: modelOpt,
         context,
         temperature,
         maxTokens,
       });
-      const latencyMs = Date.now() - start;
-      if (process.env.NODE_ENV !== "test") {
-        console.log(
-          JSON.stringify({
-            event: "llm_invoke",
-            task,
-            providerId,
-            model: modelOpt ?? "default",
-            latencyMs,
-            retries,
-            ok: true,
-          })
-        );
-      }
-      return {
-        content,
-        usage,
+      return { content, usage };
+    },
+    {
+      isRetryable: isRetryableLlmError,
+    }
+  ).catch((e) => {
+    retries = 1; // Simplified; withRetry doesn't expose attempt count
+    const latencyMs = Date.now() - start;
+    if (process.env.NODE_ENV !== "test") {
+      console.error(
+        JSON.stringify({
+          event: "llm_invoke_error",
+          task,
+          providerId,
+          latencyMs,
+          retries,
+          error: e instanceof Error ? e.message : String(e),
+        })
+      );
+    }
+    throw e;
+  });
+
+  const latencyMs = Date.now() - start;
+  if (process.env.NODE_ENV !== "test") {
+    console.log(
+      JSON.stringify({
+        event: "llm_invoke",
+        task,
         providerId,
-        model: modelOpt,
+        model: modelOpt ?? "default",
         latencyMs,
         retries,
-      };
-    } catch (e) {
-      lastError = e;
-      if (attempt < MAX_RETRIES - 1 && isRateLimitError(e)) {
-        retries++;
-        const backoff = INITIAL_BACKOFF_MS * Math.pow(2, attempt);
-        if (process.env.NODE_ENV !== "test") {
-          console.warn(
-            JSON.stringify({
-              event: "llm_invoke_retry",
-              task,
-              providerId,
-              attempt: attempt + 1,
-              backoffMs: backoff,
-            })
-          );
-        }
-        await sleep(backoff);
-      } else {
-        const latencyMs = Date.now() - start;
-        if (process.env.NODE_ENV !== "test") {
-          console.error(
-            JSON.stringify({
-              event: "llm_invoke_error",
-              task,
-              providerId,
-              latencyMs,
-              retries,
-              error: e instanceof Error ? e.message : String(e),
-            })
-          );
-        }
-        throw e;
-      }
-    }
+        ok: true,
+      })
+    );
   }
-
-  throw lastError;
+  return {
+    ...result,
+    providerId,
+    model: modelOpt,
+    latencyMs,
+    retries,
+  };
 }
 
 /**

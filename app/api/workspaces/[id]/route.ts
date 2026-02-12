@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireWorkspaceAccess, withAuthResponse } from "@/lib/auth/require-auth";
 import { workspacesUpdateBodySchema } from "@/lib/validation/schemas";
 import { validateBody } from "@/lib/validation";
 
@@ -11,23 +12,25 @@ const WORKSPACE_SELECT_WITHOUT_BRANCH =
   "id, name, created_at, updated_at, safe_edit_mode, github_repo_url, github_default_branch, github_owner, github_repo, github_is_private";
 
 export async function GET(
-  _request: Request,
+  request: Request,
   { params }: RouteParams
 ) {
   const { id } = await params;
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  let user: { id: string };
+  try {
+    const auth = await requireWorkspaceAccess(request, id, supabase);
+    user = auth.user;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   let { data, error } = await supabase
     .from("workspaces")
     .select(WORKSPACE_SELECT_WITH_BRANCH)
     .eq("id", id)
-    .eq("owner_id", user.id)
     .single();
 
   // If error is about missing columns, try with fewer columns
@@ -38,7 +41,6 @@ export async function GET(
         .from("workspaces")
         .select("id, name, created_at, updated_at")
         .eq("id", id)
-        .eq("owner_id", user.id)
         .single();
       data = retry2.data as typeof data;
       error = retry2.error;
@@ -60,7 +62,6 @@ export async function GET(
         .from("workspaces")
         .select(WORKSPACE_SELECT_WITHOUT_BRANCH)
         .eq("id", id)
-        .eq("owner_id", user.id)
         .single();
       
       if (retry1.error && retry1.error.message?.includes("column")) {
@@ -69,7 +70,6 @@ export async function GET(
           .from("workspaces")
           .select("id, name, created_at, updated_at")
           .eq("id", id)
-          .eq("owner_id", user.id)
           .single();
         data = retry2.data as typeof data;
         error = retry2.error;
@@ -107,7 +107,6 @@ export async function GET(
       .from("workspaces")
       .select("id, name, created_at, updated_at")
       .eq("id", id)
-      .eq("owner_id", user.id)
       .single();
     if (minimalRetry.error || !minimalRetry.data) {
       return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
@@ -139,11 +138,19 @@ export async function PATCH(
 ) {
   const { id } = await params;
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  let user: { id: string };
+  try {
+    const auth = await requireWorkspaceAccess(request, id, supabase);
+    user = auth.user;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
+  }
+
+  const { data: ws } = await supabase.from("workspaces").select("owner_id").eq("id", id).single();
+  if (ws?.owner_id !== user.id) {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
   let rawBody: unknown;
@@ -217,16 +224,24 @@ export async function PATCH(
 }
 
 export async function DELETE(
-  _request: Request,
+  request: Request,
   { params }: RouteParams
 ) {
   const { id } = await params;
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  let user: { id: string };
+  try {
+    const auth = await requireWorkspaceAccess(request, id, supabase);
+    user = auth.user;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
+  }
+
+  const { data: ws } = await supabase.from("workspaces").select("owner_id").eq("id", id).single();
+  if (ws?.owner_id !== user.id) {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
   const { error } = await supabase

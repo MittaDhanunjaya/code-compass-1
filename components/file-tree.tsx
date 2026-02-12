@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ChevronRight,
   Database,
   File,
   Folder,
   FolderOpen,
+  Loader2,
   MoreHorizontal,
   Pencil,
   Plus,
@@ -58,7 +59,7 @@ export function FileTree({ workspaceId }: FileTreeProps) {
 
   const isDirty = (path: string) => getTab(path)?.dirty ?? false;
 
-  async function fetchFiles() {
+  const fetchFiles = useCallback(async () => {
     if (!workspaceId) return;
     try {
       const res = await fetch(`/api/workspaces/${workspaceId}/files`);
@@ -73,7 +74,7 @@ export function FileTree({ workspaceId }: FileTreeProps) {
     } finally {
       setLoading(false);
     }
-  }
+  }, [workspaceId]);
 
   useEffect(() => {
     if (!workspaceId) {
@@ -83,8 +84,7 @@ export function FileTree({ workspaceId }: FileTreeProps) {
     }
     setLoading(true);
     fetchFiles();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workspaceId]);
+  }, [workspaceId, fetchFiles]);
 
   // Fetch index status when workspace changes (for "Indexed N files" and progress)
   useEffect(() => {
@@ -139,9 +139,34 @@ export function FileTree({ workspaceId }: FileTreeProps) {
       window.removeEventListener("refresh-file-tree", handleRefresh);
       window.removeEventListener("workspace-files-synced", handleSynced);
     };
-  }, [workspaceId]);
+  }, [workspaceId, fetchFiles]);
 
-  const tree = buildFileTree(paths.map((p) => p.path));
+  const tree = React.useMemo(
+    () => buildFileTree(paths.map((p) => p.path)),
+    [paths]
+  );
+
+  const handleToggle = useCallback((path: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }, []);
+
+  const handleAddInFolder = useCallback((parent: string) => {
+    setCreateParent(parent);
+    setCreateName("");
+    setCreateOpen(true);
+  }, []);
+
+  const handleOpenRename = useCallback((path: string, name: string) => {
+    setRenamePath(path);
+    setRenameName(name);
+    setRenameOpen(true);
+    setError(null);
+  }, []);
 
   async function handleCreateFile(path: string, isFolder: boolean) {
     if (!workspaceId) return;
@@ -202,34 +227,40 @@ export function FileTree({ workspaceId }: FileTreeProps) {
     }
   }
 
-  async function handleDelete(path: string) {
-    if (!workspaceId) return;
-    const label = path.endsWith("/") ? `folder "${path}"` : `file "${path}"`;
-    if (!confirm(`Delete ${label}?`)) return;
-    setError(null);
-    try {
-      const res = await fetch(
-        `/api/workspaces/${workspaceId}/files?path=${encodeURIComponent(path)}`,
-        { method: "DELETE" }
-      );
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Failed to delete");
-      fetchFiles();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to delete");
-    }
-  }
+  const handleDelete = useCallback(
+    async (path: string) => {
+      if (!workspaceId) return;
+      const label = path.endsWith("/") ? `folder "${path}"` : `file "${path}"`;
+      if (!confirm(`Delete ${label}?`)) return;
+      setError(null);
+      try {
+        const res = await fetch(
+          `/api/workspaces/${workspaceId}/files?path=${encodeURIComponent(path)}`,
+          { method: "DELETE" }
+        );
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Failed to delete");
+        fetchFiles();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed to delete");
+      }
+    },
+    [workspaceId, fetchFiles]
+  );
 
-  async function handleFileClick(path: string) {
-    if (!workspaceId) return;
-    const res = await fetch(
-      `/api/workspaces/${workspaceId}/files?path=${encodeURIComponent(path)}`
-    );
-    if (res.ok) {
-      const data = await res.json();
-      openFile(path, data.content ?? "");
-    }
-  }
+  const handleFileClick = useCallback(
+    async (path: string) => {
+      if (!workspaceId) return;
+      const res = await fetch(
+        `/api/workspaces/${workspaceId}/files?path=${encodeURIComponent(path)}`
+      );
+      if (res.ok) {
+        const data = await res.json();
+        openFile(path, data.content ?? "");
+      }
+    },
+    [workspaceId, openFile]
+  );
 
   async function handleRebuildIndex() {
     if (!workspaceId) return;
@@ -262,8 +293,9 @@ export function FileTree({ workspaceId }: FileTreeProps) {
 
   if (loading) {
     return (
-      <div className="px-2 py-2 text-xs text-muted-foreground">
-        Loading files…
+      <div className="flex items-center gap-2 px-2 py-3 text-xs text-muted-foreground">
+        <Loader2 className="h-4 w-4 animate-spin shrink-0" />
+        <span>Loading files…</span>
       </div>
     );
   }
@@ -290,7 +322,11 @@ export function FileTree({ workspaceId }: FileTreeProps) {
             disabled={indexing}
             title={indexing ? "Indexing…" : indexStatus === "completed" && indexFileCount > 0 ? `Indexed ${indexFileCount} files. Click to rebuild (for @codebase and cross-file go-to-def).` : "Rebuild codebase index (for @codebase search and cross-file go-to-def). Index also runs when you open a workspace."}
           >
-            <Database className={`h-4 w-4 ${indexing ? "animate-pulse" : ""}`} />
+            {indexing ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Database className="h-4 w-4" />
+            )}
           </Button>
           <Dialog open={createOpen} onOpenChange={setCreateOpen}>
           <DialogTrigger asChild>
@@ -367,27 +403,11 @@ export function FileTree({ workspaceId }: FileTreeProps) {
         nodes={tree}
         expanded={expanded}
         isDirty={isDirty}
-        onToggle={(path) => {
-          setExpanded((prev) => {
-            const next = new Set(prev);
-            if (next.has(path)) next.delete(path);
-            else next.add(path);
-            return next;
-          });
-        }}
+        onToggle={handleToggle}
         onFileClick={handleFileClick}
-        onRename={(path, name) => {
-          setRenamePath(path);
-          setRenameName(name);
-          setRenameOpen(true);
-          setError(null);
-        }}
+        onRename={handleOpenRename}
         onDelete={handleDelete}
-        onAddInFolder={(parent) => {
-          setCreateParent(parent);
-          setCreateName("");
-          setCreateOpen(true);
-        }}
+        onAddInFolder={handleAddInFolder}
       />
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent>
@@ -437,7 +457,7 @@ export function FileTree({ workspaceId }: FileTreeProps) {
   );
 }
 
-function TreeNode({
+const TreeNode = React.memo(function TreeNode({
   nodes,
   expanded,
   isDirty,
@@ -578,4 +598,4 @@ function TreeNode({
       ))}
     </div>
   );
-}
+});

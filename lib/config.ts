@@ -35,6 +35,7 @@ const envSchema = z.object({
   LMSTUDIO_BASE_URL: z.string().optional(),
   OLLAMA_BASE_URL: z.string().optional(),
   REDIS_URL: z.string().optional(),
+  SENTRY_DSN: z.string().optional(),
 });
 
 export type EnvConfig = z.infer<typeof envSchema>;

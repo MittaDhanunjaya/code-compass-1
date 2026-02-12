@@ -1,6 +1,8 @@
 /**
  * Embeddings generation utilities.
  * Uses OpenAI text-embedding-3-small (1536 dimensions) for semantic search.
+ * Note: Embedding caching (Phase 6.1.1) lives in server-only layers (vector service, parallel-embeddings)
+ * to avoid pulling Node/cache into client bundle.
  */
 
 import OpenAI from "openai";

@@ -1,7 +1,10 @@
 /**
  * Validation for workspace file uploads (local folder / large project creation).
  * Used by POST /api/workspaces to enforce limits.
+ * Phase 10.3: Path sanitization (no traversal, no absolute paths).
  */
+
+import { sanitizePath } from "@/lib/validation/sanitize-path";
 
 export const MAX_LOCAL_FILES = 500;
 export const MAX_FILE_SIZE = 500_000;
@@ -25,6 +28,13 @@ export function validateLocalFiles(files: unknown): ValidateLocalFilesResult {
       ok: false,
       error: `Too many files (max ${MAX_LOCAL_FILES}). Use a smaller folder or GitHub import.`,
     };
+  }
+  for (const f of files) {
+    if (f == null || typeof f !== "object" || typeof (f as LocalFileInput).path !== "string") continue;
+    const path = (f as LocalFileInput).path.trim();
+    if (path.length === 0) continue;
+    const r = sanitizePath(path);
+    if (!r.ok) return { ok: false, error: `Invalid path: ${r.error}` };
   }
   const valid = files.filter(
     (f): f is LocalFileInput =>

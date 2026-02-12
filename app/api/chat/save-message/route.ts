@@ -3,6 +3,7 @@ import { createClient } from "@/lib/supabase/server";
 import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
 import { saveChatMessage } from "@/lib/chat-memory";
 import { resolveWorkspaceId } from "@/lib/workspaces/active-workspace";
+import { logger } from "@/lib/logger";
 
 /**
  * POST /api/chat/save-message
@@ -12,7 +13,7 @@ export async function POST(request: Request) {
   let user: { id: string };
   let supabase: Awaited<ReturnType<typeof createClient>>;
   try {
-    const auth = await requireAuth();
+    const auth = await requireAuth(request);
     user = auth.user;
     supabase = auth.supabase;
   } catch (e) {
@@ -33,6 +34,11 @@ export async function POST(request: Request) {
   const content = typeof body.content === "string" ? body.content : "";
   const role = body.role ?? "assistant";
   const runType = body.runType ?? "chat";
-  await saveChatMessage(supabase, workspaceId, user.id, role, content, { runType }).catch(() => {});
+  try {
+    await saveChatMessage(supabase, workspaceId, user.id, role, content, { runType });
+  } catch (e) {
+    logger.warn({ event: "save_chat_message_failed", workspaceId, userId: user.id, error: e instanceof Error ? e.message : String(e) });
+    return NextResponse.json({ error: "Failed to save message" }, { status: 500 });
+  }
   return NextResponse.json({ ok: true });
 }

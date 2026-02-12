@@ -1,7 +1,11 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireWorkspaceAccess, withAuthResponse } from "@/lib/auth/require-auth";
+import { getOrSet, invalidateCache } from "@/lib/cache";
 
 type RouteParams = { params: Promise<{ id: string }> };
+
+const FILE_TREE_CACHE_TTL_MS = 60 * 1000; // 1 minute; invalidate on mutate
 
 /**
  * GET /api/workspaces/[id]/files
@@ -19,22 +23,12 @@ export async function GET(
   const pathParam = searchParams.get("path");
 
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
-  // Verify workspace access (RLS will enforce, but we check existence)
-  const { data: workspace } = await supabase
-    .from("workspaces")
-    .select("id")
-    .eq("id", workspaceId)
-    .single();
-
-  if (!workspace) {
-    return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
+  try {
+    await requireWorkspaceAccess(request, workspaceId, supabase);
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   if (pathParam) {
@@ -52,21 +46,30 @@ export async function GET(
     return NextResponse.json(data);
   }
 
-  // List all files (paths and updated_at for tree)
-  const { data, error } = await supabase
-    .from("workspace_files")
-    .select("path, updated_at")
-    .eq("workspace_id", workspaceId)
-    .order("path", { ascending: true });
+  // List all files (paths and updated_at for tree) - Phase 6.1.3: cache file tree
+  const cacheKey = `filetree:${workspaceId}`;
+  try {
+    const data = await getOrSet(
+      cacheKey,
+      FILE_TREE_CACHE_TTL_MS,
+      async () => {
+        const { data: list, error } = await supabase
+          .from("workspace_files")
+          .select("path, updated_at")
+          .eq("workspace_id", workspaceId)
+          .order("path", { ascending: true });
 
-  if (error) {
+        if (error) throw new Error(error.message);
+        return list ?? [];
+      }
+    );
+    return NextResponse.json(data);
+  } catch (e) {
     return NextResponse.json(
-      { error: error.message },
+      { error: e instanceof Error ? e.message : "Failed to list files" },
       { status: 500 }
     );
   }
-
-  return NextResponse.json(data ?? []);
 }
 
 /**
@@ -82,11 +85,12 @@ export async function POST(
 ) {
   const { id: workspaceId } = await params;
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  try {
+    await requireWorkspaceAccess(request, workspaceId, supabase);
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   let body: { path?: string; content?: string };
@@ -132,6 +136,7 @@ export async function POST(
     );
   }
 
+  await invalidateCache(`filetree:${workspaceId}`);
   return NextResponse.json(data);
 }
 
@@ -146,11 +151,12 @@ export async function PATCH(
 ) {
   const { id: workspaceId } = await params;
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  try {
+    await requireWorkspaceAccess(request, workspaceId, supabase);
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   let body: { oldPath?: string; newPath?: string; path?: string; content?: string };
@@ -187,6 +193,7 @@ export async function PATCH(
         { status: 404 }
       );
     }
+    await invalidateCache(`filetree:${workspaceId}`);
     return NextResponse.json(data);
   }
 
@@ -245,6 +252,7 @@ export async function PATCH(
     }
   }
 
+  await invalidateCache(`filetree:${workspaceId}`);
   return NextResponse.json({ success: true });
 }
 
@@ -261,11 +269,12 @@ export async function DELETE(
   const pathParam = searchParams.get("path");
 
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  try {
+    await requireWorkspaceAccess(request, workspaceId, supabase);
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   if (!pathParam) {
@@ -331,6 +340,7 @@ export async function DELETE(
     }
   }
 
+  await invalidateCache(`filetree:${workspaceId}`);
   return NextResponse.json({ success: true });
 }
 

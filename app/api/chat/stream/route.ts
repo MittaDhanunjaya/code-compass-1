@@ -1,6 +1,7 @@
 import { createClient } from "@/lib/supabase/server";
 import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
 import { checkRateLimit, getRateLimitIdentifier } from "@/lib/api-rate-limit";
+import { getUserFriendlyMessage } from "@/lib/errors";
 import { PROVIDERS, PROVIDER_LABELS, type ProviderId } from "@/lib/llm/providers";
 import { chatStreamBodySchema } from "@/lib/validation/schemas";
 import { validateBody } from "@/lib/validation";
@@ -10,7 +11,7 @@ export async function POST(request: Request) {
   let user: { id: string };
   let supabase: Awaited<ReturnType<typeof createClient>>;
   try {
-    const auth = await requireAuth();
+    const auth = await requireAuth(request);
     user = auth.user;
     supabase = auth.supabase;
   } catch (e) {
@@ -21,9 +22,13 @@ export async function POST(request: Request) {
 
   const rl = await checkRateLimit(getRateLimitIdentifier(request, user.id), "chat-stream", 60);
   if (!rl.ok) {
+    const retryAfter = rl.retryAfter ?? 60;
     return new Response(
-      JSON.stringify({ error: "Too many requests. Try again later.", retryAfter: rl.retryAfter }),
-      { status: 429, headers: { "Content-Type": "application/json", "Retry-After": String(rl.retryAfter ?? 60) } }
+      JSON.stringify({
+        error: getUserFriendlyMessage("rate_limit", { retryAfterSeconds: retryAfter }),
+        retryAfter,
+      }),
+      { status: 429, headers: { "Content-Type": "application/json", "Retry-After": String(retryAfter) } }
     );
   }
 

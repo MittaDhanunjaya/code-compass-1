@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { Send, Loader2, Sparkles, Check, ChevronDown, ChevronRight, GitPullRequest } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -43,6 +43,60 @@ type DebugReviewStep = {
   oldContent?: string;
   description?: string;
 };
+
+const ChatMessageItem = React.memo(function ChatMessageItem({
+  id,
+  role,
+  content,
+  logAttachment,
+  isExpanded,
+  onToggleLog,
+}: {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  logAttachment?: LogAttachment;
+  isExpanded: boolean;
+  onToggleLog: (id: string) => void;
+}) {
+  return (
+    <div
+      className={`rounded-lg px-3 py-2 text-sm ${
+        role === "user"
+          ? "ml-4 bg-primary text-primary-foreground"
+          : "mr-4 bg-muted"
+      }`}
+    >
+      <div className="whitespace-pre-wrap break-words">{content}</div>
+      {logAttachment && (
+        <div className="mt-1.5 text-xs">
+          <button
+            type="button"
+            onClick={() => onToggleLog(id)}
+            className={
+              role === "user"
+                ? "rounded bg-primary-foreground/20 px-2 py-1 hover:bg-primary-foreground/30 text-primary-foreground"
+                : "rounded bg-slate-800 px-2 py-1 hover:bg-slate-700 text-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600"
+            }
+          >
+            🖥 {logAttachment.source ?? "log"} ({logAttachment.lineCount} lines) – {isExpanded ? "Hide" : "View"}
+          </button>
+          {isExpanded && (
+            <pre
+              className={
+                role === "user"
+                  ? "mt-2 max-h-64 overflow-auto rounded bg-primary-foreground/10 p-2 text-xs text-primary-foreground whitespace-pre-wrap break-words"
+                  : "mt-2 max-h-64 overflow-auto rounded bg-slate-900 p-2 text-xs text-slate-100 whitespace-pre-wrap break-words"
+              }
+            >
+              {logAttachment.fullText}
+            </pre>
+          )}
+        </div>
+      )}
+    </div>
+  );
+});
 
 function getLanguage(path: string): string {
   const ext = path.split(".").pop() ?? "";
@@ -141,6 +195,9 @@ export function ChatPanel({
     return stored !== "false";
   });
   const [expandedLogMessageId, setExpandedLogMessageId] = useState<string | null>(null);
+  const handleToggleLogMessage = useCallback((messageId: string) => {
+    setExpandedLogMessageId((id) => (id === messageId ? null : messageId));
+  }, []);
 
   const runDebugFromLog = useCallback(
     async (wsId: string, logText: string, options?: { userMessageContent?: string; logAttachment?: LogAttachment }) => {
@@ -900,42 +957,15 @@ export function ChatPanel({
           </div>
         )}
         {messages.map((m) => (
-          <div
+          <ChatMessageItem
             key={m.id}
-            className={`rounded-lg px-3 py-2 text-sm ${
-              m.role === "user"
-                ? "ml-4 bg-primary text-primary-foreground"
-                : "mr-4 bg-muted"
-            }`}
-          >
-            <div className="whitespace-pre-wrap break-words">{m.content}</div>
-            {m.logAttachment && (
-              <div className="mt-1.5 text-xs">
-                <button
-                  type="button"
-                  onClick={() => setExpandedLogMessageId((id) => (id === m.id ? null : m.id))}
-                  className={
-                    m.role === "user"
-                      ? "rounded bg-primary-foreground/20 px-2 py-1 hover:bg-primary-foreground/30 text-primary-foreground"
-                      : "rounded bg-slate-800 px-2 py-1 hover:bg-slate-700 text-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600"
-                  }
-                >
-                  🖥 {m.logAttachment.source ?? "log"} ({m.logAttachment.lineCount} lines) – {expandedLogMessageId === m.id ? "Hide" : "View"}
-                </button>
-                {expandedLogMessageId === m.id && (
-                  <pre
-                    className={
-                      m.role === "user"
-                        ? "mt-2 max-h-64 overflow-auto rounded bg-primary-foreground/10 p-2 text-xs text-primary-foreground whitespace-pre-wrap break-words"
-                        : "mt-2 max-h-64 overflow-auto rounded bg-slate-900 p-2 text-xs text-slate-100 whitespace-pre-wrap break-words"
-                    }
-                  >
-                    {m.logAttachment.fullText}
-                  </pre>
-                )}
-              </div>
-            )}
-          </div>
+            id={m.id}
+            role={m.role}
+            content={m.content}
+            logAttachment={m.logAttachment}
+            isExpanded={expandedLogMessageId === m.id}
+            onToggleLog={handleToggleLogMessage}
+          />
         ))}
         {loading && (
           <div className="mr-4 flex items-center gap-2 rounded-lg bg-muted px-3 py-2 text-sm text-muted-foreground">

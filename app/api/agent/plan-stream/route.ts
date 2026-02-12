@@ -20,6 +20,9 @@ import { applyEnvRouting } from "@/lib/llm/task-routing";
 import { validateToolName, validateToolInput } from "@/services/tools/registry";
 import { agentPlanStreamBodySchema } from "@/lib/validation/schemas";
 import { validateBody, validateAgentPlanOutput } from "@/lib/validation";
+import { logger, logAgentStarted, logAgentCompleted, getRequestId } from "@/lib/logger";
+import { captureException } from "@/lib/sentry";
+import { recordAgentPlanDuration } from "@/lib/metrics";
 
 // Same system prompt as plan route, but with instruction to emit reasoning messages
 const PLAN_SYSTEM = `You are an intelligent coding agent planner. Your job is to understand the user's request, analyze the codebase, and create a plan that accomplishes the task.
@@ -175,6 +178,8 @@ export async function POST(request: Request) {
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
+      const planStart = Date.now();
+      let planError: Error | null = null;
       let eventMeta: { modelId?: string; modelLabel?: string; modelGroupId?: string; modelRole?: "planner" | "coder" | "reviewer" } = {};
       const emit = (event: AgentEvent) => {
         if (Object.keys(eventMeta).length > 0) {
@@ -183,7 +188,16 @@ export async function POST(request: Request) {
         emitEvent(controller, encoder, event);
       };
 
+      const requestId = getRequestId(request);
       try {
+        logAgentStarted({
+          phase: "plan",
+          workspaceId,
+          userId: user.id,
+          instruction,
+          scopeMode: body.scopeMode,
+          requestId,
+        });
         applyEnvRouting();
         emit(createAgentEvent('status', 'Agent started planning...'));
 
@@ -1320,8 +1334,9 @@ export async function POST(request: Request) {
         })}\n\n`);
         safeClose(controller);
       } catch (e) {
-        const errorMsg = e instanceof Error ? e.message : "Planning failed";
-        const errorStack = e instanceof Error ? e.stack : undefined;
+        planError = e instanceof Error ? e : new Error(String(e));
+        const errorMsg = planError.message;
+        const errorStack = planError.stack;
         
         // Emit detailed error information
         emit(createAgentEvent('status', `Error: ${errorMsg}`));
@@ -1329,9 +1344,10 @@ export async function POST(request: Request) {
         
         // Log additional context if available
         if (errorStack) {
-          console.error("Plan generation error stack:", errorStack);
+          logger.error({ event: "plan_error_stack", error: errorStack });
         }
-        console.error("Plan generation error:", e);
+        logger.error({ event: "plan_generation_error", error: errorMsg, workspaceId, userId: user.id });
+        captureException(planError, { workspaceId, operation: "agent_plan", userId: user.id });
         
         // Try to send error details in the response
         safeEnqueue(controller, encoder, `data: ${JSON.stringify({ 
@@ -1341,6 +1357,18 @@ export async function POST(request: Request) {
         })}\n\n`);
         
         safeClose(controller);
+      } finally {
+        const durationMs = Date.now() - planStart;
+        recordAgentPlanDuration(durationMs);
+        logAgentCompleted({
+          phase: "plan",
+          workspaceId,
+          userId: user.id,
+          durationMs,
+          success: !planError,
+          error: planError?.message,
+          requestId,
+        });
       }
     },
   });

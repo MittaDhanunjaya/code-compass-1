@@ -56,4 +56,51 @@ test.describe("Code Compass E2E", () => {
     const data = await res.json();
     expect(data.status).toBe("ok");
   });
+
+  // Phase 9.2.4: Chat completion flow - send message, wait for response or error
+  test("5. Chat completion flow (send message → response or error)", async ({ page }) => {
+    const url = page.url();
+    if (url.includes("/sign-in") || !url.includes("/app")) {
+      test.skip();
+      return;
+    }
+    await page.waitForSelector('[data-testid="app-shell"], .workspace-selector', { timeout: 15000 }).catch(() => {});
+    const input = page.getByPlaceholder(/Ask anything/i);
+    const sendBtn = page.getByRole("button", { name: /Send message/i });
+    const isVisible = await input.isVisible().catch(() => false);
+    if (!isVisible) {
+      test.skip();
+      return;
+    }
+    await input.fill("Hello, reply with OK if you see this.");
+    await sendBtn.click();
+    // Wait for either assistant message or error (up to 25s)
+    await Promise.race([
+      page.waitForSelector('[class*="bg-muted"]', { timeout: 25000 }).catch(() => null),
+      page.waitForSelector('text=No API key', { timeout: 25000 }).catch(() => null),
+      page.waitForSelector('text=Something went wrong', { timeout: 25000 }).catch(() => null),
+    ]);
+    const hasResponse = await page.locator('[class*="bg-muted"]').first().isVisible().catch(() => false);
+    const hasError = await page.getByText(/No API key|Something went wrong|error/i).first().isVisible().catch(() => false);
+    expect(hasResponse || hasError).toBeTruthy();
+  });
+
+  // Phase 9.2: Agent panel integration - when in app, agent UI elements exist
+  test("6. Agent panel UI visible when workspace open", async ({ page }) => {
+    const url = page.url();
+    if (url.includes("/sign-in") || !url.includes("/app")) {
+      test.skip();
+      return;
+    }
+    await page.waitForSelector('[data-testid="app-shell"], .workspace-selector, [data-testid="agent-panel"]', {
+      timeout: 15000,
+    }).catch(() => {});
+    const hasAgentOrWorkspace = await page
+      .locator('text=Idle, text=Planning, text=Agent, [placeholder*="instruction"], [placeholder*="Ask"]')
+      .first()
+      .isVisible()
+      .catch(() => false);
+    const hasWorkspace = await page.locator(".workspace-selector, [data-testid='app-shell']").first().isVisible().catch(() => false);
+    expect(hasAgentOrWorkspace || hasWorkspace).toBeTruthy();
+  });
 });

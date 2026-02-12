@@ -6,6 +6,7 @@
 
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireAuth, requireWorkspaceAccess, withAuthResponse } from "@/lib/auth/require-auth";
 import { chunkFileEnhanced } from "@/lib/indexing/enhanced-chunker";
 import { hashContent } from "@/lib/indexing/chunker";
 import { decrypt } from "@/lib/encrypt";
@@ -16,12 +17,16 @@ import { generateEmbeddingsParallel } from "@/lib/indexing/parallel-embeddings";
 import { logError, createStructuredError } from "@/lib/utils/error-handler";
 
 export async function POST(request: Request) {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  let user: { id: string };
+  let supabase: Awaited<ReturnType<typeof createClient>>;
+  try {
+    const auth = await requireAuth(request);
+    user = auth.user;
+    supabase = auth.supabase;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   let body: {
@@ -46,15 +51,12 @@ export async function POST(request: Request) {
     );
   }
 
-  // Verify workspace access
-  const { data: workspace } = await supabase
-    .from("workspaces")
-    .select("id")
-    .eq("id", workspaceId)
-    .single();
-
-  if (!workspace) {
-    return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
+  try {
+    await requireWorkspaceAccess(request, workspaceId, supabase);
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   // Start background indexing (don't await)

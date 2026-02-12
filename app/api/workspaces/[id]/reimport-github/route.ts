@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireWorkspaceAccess, withAuthResponse } from "@/lib/auth/require-auth";
 import { cloneRepo, cloneRepoWithToken, walkRepo, removeClone } from "@/lib/github-import";
 import { decrypt } from "@/lib/encrypt";
+import { logger } from "@/lib/logger";
 
 type RouteParams = { params: Promise<{ id: string }> };
 
@@ -11,23 +13,25 @@ type RouteParams = { params: Promise<{ id: string }> };
  * Uses OAuth token for private repos. Keeps clone on disk for v2 sync.
  */
 export async function POST(
-  _request: Request,
+  request: Request,
   { params }: RouteParams
 ) {
   const { id: workspaceId } = await params;
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  let user: { id: string };
+  try {
+    const auth = await requireWorkspaceAccess(request, workspaceId, supabase);
+    user = auth.user;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   const { data: workspace, error: fetchError } = await supabase
     .from("workspaces")
     .select("id, github_repo_url, github_default_branch, github_owner, github_repo, github_is_private")
     .eq("id", workspaceId)
-    .eq("owner_id", user.id)
     .single();
 
   if (fetchError || !workspace) {
@@ -90,7 +94,9 @@ export async function POST(
     }
     files = await walkRepo(repoRoot);
   } catch (e) {
-    await removeClone(workspaceId).catch(() => {});
+    await removeClone(workspaceId).catch((err) => {
+      logger.warn({ event: "remove_clone_failed", workspaceId, error: err instanceof Error ? err.message : String(err) });
+    });
     return NextResponse.json(
       { error: e instanceof Error ? e.message : "Clone failed" },
       { status: 500 }

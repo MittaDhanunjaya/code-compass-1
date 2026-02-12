@@ -12,7 +12,7 @@ export async function GET(request: Request) {
   let user: { id: string };
   let supabase: Awaited<ReturnType<typeof createClient>>;
   try {
-    const auth = await requireAuth();
+    const auth = await requireAuth(request);
     user = auth.user;
     supabase = auth.supabase;
   } catch (e) {
@@ -36,7 +36,7 @@ export async function POST(request: Request) {
   let user: { id: string };
   let supabase: Awaited<ReturnType<typeof createClient>>;
   try {
-    const auth = await requireAuth();
+    const auth = await requireAuth(request);
     user = auth.user;
     supabase = auth.supabase;
   } catch (e) {

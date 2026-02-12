@@ -1,11 +1,11 @@
 /**
  * Centralized auth for API routes.
- * Use requireAuth(request) for routes that support dev bypass (agent, execute-stream, debug-from-log).
- * Use requireAuth() for all other protected routes.
+ * Phase 7.1.2: Returns user-friendly "Please re-authenticate" for 401.
  */
 
 import { createClient } from "@/lib/supabase/server";
 import { getDevBypassUser, getDevBypassConfigHint } from "@/lib/auth-dev-bypass";
+import { getUserFriendlyMessage, classifyError } from "@/lib/errors";
 
 export class AuthError extends Error {
   constructor(
@@ -52,14 +52,62 @@ export async function requireAuth(request?: Request): Promise<AuthResult> {
 
 /**
  * Wrap a route handler to catch AuthError and return the correct HTTP response.
- * Usage: return withAuthResponse(await requireAuth(request));
+ * Phase 7.1.2: Uses user-friendly message for 401.
  */
 export function withAuthResponse(error: unknown): Response | null {
   if (error instanceof AuthError) {
-    return new Response(JSON.stringify({ error: error.message }), {
+    const category = classifyError(error.statusCode);
+    const message =
+      category === "auth"
+        ? getUserFriendlyMessage("auth")
+        : error.message;
+    return new Response(JSON.stringify({ error: message }), {
       status: error.statusCode,
       headers: { "Content-Type": "application/json" },
     });
   }
   return null;
+}
+
+/**
+ * Require authenticated user with workspace access (owner or member).
+ * Returns { user, supabase } or throws AuthError(401) / AuthError(403).
+ */
+export async function requireWorkspaceAccess(
+  request: Request | undefined,
+  workspaceId: string,
+  supabase: Awaited<ReturnType<typeof createClient>>
+): Promise<AuthResult> {
+  const auth = await requireAuth(request);
+  const { data: workspace } = await supabase
+    .from("workspaces")
+    .select("id")
+    .eq("id", workspaceId)
+    .single();
+
+  if (!workspace) {
+    throw new AuthError(404, "Workspace not found");
+  }
+
+  const { data: member } = await supabase
+    .from("workspace_members")
+    .select("user_id")
+    .eq("workspace_id", workspaceId)
+    .eq("user_id", auth.user.id)
+    .maybeSingle();
+
+  const { data: ws } = await supabase
+    .from("workspaces")
+    .select("owner_id")
+    .eq("id", workspaceId)
+    .single();
+
+  const isOwner = (ws as { owner_id?: string } | null)?.owner_id === auth.user.id;
+  const isMember = !!member;
+
+  if (!isOwner && !isMember) {
+    throw new AuthError(403, "Forbidden");
+  }
+
+  return auth;
 }

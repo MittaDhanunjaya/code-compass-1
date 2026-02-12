@@ -1,10 +1,17 @@
 /**
- * Phase 4.3.5: Sentry-compatible error boundary.
- * When SENTRY_DSN is set, captures errors. Otherwise logs to console.
+ * Phase 4.3.5 & 12.3: Sentry-compatible error tracking.
+ * When SENTRY_DSN is set, captures errors with extra context (workspaceId, operation).
  * Add @sentry/nextjs for full integration: npm install @sentry/nextjs
  */
 
-let sentryCapture: ((error: Error, context?: Record<string, unknown>) => void) | null = null;
+export type CaptureContext = Record<string, unknown> & {
+  workspaceId?: string;
+  operation?: string;
+  userId?: string;
+  requestId?: string;
+};
+
+let sentryCapture: ((error: Error, context?: CaptureContext) => void) | null = null;
 
 async function initSentry(): Promise<void> {
   if (sentryCapture) return;
@@ -31,10 +38,11 @@ async function initSentry(): Promise<void> {
 /**
  * Capture an exception for observability.
  * Call from catch blocks or error boundaries.
+ * Phase 12.3.2: Include workspaceId, operation in context when available.
  */
 export async function captureException(
   error: unknown,
-  context?: Record<string, unknown>
+  context?: CaptureContext
 ): Promise<void> {
   await initSentry();
   const err = error instanceof Error ? error : new Error(String(error));
@@ -47,7 +55,7 @@ export async function captureException(
  * Sync version for use in error boundaries (e.g. React error boundary).
  * Fire-and-forget; does not block.
  */
-export function captureExceptionSync(error: unknown, context?: Record<string, unknown>): void {
+export function captureExceptionSync(error: unknown, context?: CaptureContext): void {
   initSentry().then(() => {
     const err = error instanceof Error ? error : new Error(String(error));
     if (sentryCapture) sentryCapture(err, context);

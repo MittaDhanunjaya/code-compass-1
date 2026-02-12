@@ -17,8 +17,13 @@ import {
   incrementWorkspaceTokenUsage,
 } from "@/lib/token-budget";
 
-/** Default timeout for non-streaming calls (ms). */
-const DEFAULT_TIMEOUT_MS = 120_000;
+import { AGENT_CONFIG } from "@/lib/config/constants";
+import { logger } from "@/lib/logger";
+import { recordLLMLatency } from "@/lib/metrics";
+import { getOrSetWithMeta } from "@/lib/cache";
+
+/** Default timeout for non-streaming calls (ms). Phase 6.2: Uses AGENT_CONFIG. */
+const DEFAULT_TIMEOUT_MS = AGENT_CONFIG.TIMEOUT_MS;
 
 export type RouterInvokeInput = Omit<InvokeChatInput, "apiKey" | "providerId" | "model"> & {
   /** Override task-based routing when set. */
@@ -35,6 +40,8 @@ export type RouterInvokeInput = Omit<InvokeChatInput, "apiKey" | "providerId" | 
   workspaceId?: string;
   /** Phase 4.2.1: When provided with userId, enforces daily token budget. */
   supabase?: SupabaseClient;
+  /** Phase 6.1.2: Optional cache key. When set, LLM response is cached (TTL 1h). */
+  cacheKey?: string;
 };
 
 export type RouterInvokeOutput = InvokeChatOutput & {
@@ -42,7 +49,7 @@ export type RouterInvokeOutput = InvokeChatOutput & {
 };
 
 /**
- * Log token usage in a structured format for observability.
+ * Log token usage in a structured format for observability. Phase 12.1–12.2.
  */
 function logTokenUsage(
   opts: {
@@ -57,7 +64,8 @@ function logTokenUsage(
   }
 ): void {
   if (process.env.NODE_ENV === "test") return;
-  const payload = {
+  recordLLMLatency(opts.latencyMs);
+  logger.info({
     event: "llm_token_usage",
     task: opts.task,
     providerId: opts.providerId,
@@ -69,9 +77,7 @@ function logTokenUsage(
     requestId: opts.requestId,
     userId: opts.userId,
     workspaceId: opts.workspaceId,
-    timestamp: new Date().toISOString(),
-  };
-  console.log(JSON.stringify(payload));
+  });
 }
 
 /**
@@ -136,8 +142,8 @@ export async function invokeChat(input: RouterInvokeInput): Promise<RouterInvoke
   const defaultMaxTokens = 8192; // Phase 4.2.2: Per-request cap
   const maxTokens = input.maxTokens ?? defaultMaxTokens;
 
-  try {
-    const result = await Promise.race([
+  const doInvoke = () =>
+    Promise.race([
       invokeChatInternal({
         ...rest,
         apiKey: input.apiKey,
@@ -150,38 +156,53 @@ export async function invokeChat(input: RouterInvokeInput): Promise<RouterInvoke
       timeoutPromise,
     ]);
 
-    // Log token usage
-    logTokenUsage({
-      task,
-      providerId: result.providerId,
-      model: result.model,
-      usage: result.usage,
-      requestId,
-      userId,
-      workspaceId,
-      latencyMs: result.latencyMs,
-    });
+  try {
+    let result: Awaited<ReturnType<typeof doInvoke>>;
+    let fromCache = false;
+    if (input.cacheKey) {
+      const { value, cached } = await getOrSetWithMeta(
+        `llm:${input.cacheKey}`,
+        3600000, // 1h TTL
+        doInvoke,
+        { serialize: (v) => JSON.stringify(v), deserialize: (s) => JSON.parse(s) as Awaited<ReturnType<typeof doInvoke>> }
+      );
+      result = value;
+      fromCache = cached;
+    } else {
+      result = await doInvoke();
+    }
 
-    // Phase 4.2.1 & 4.2.3: Increment token usage (user + workspace)
-    if (supabase && result.usage?.totalTokens) {
-      if (userId) await incrementTokenUsage(supabase, userId, result.usage.totalTokens);
-      if (workspaceId) await incrementWorkspaceTokenUsage(supabase, workspaceId, result.usage.totalTokens);
+    // Log token usage (skip increment when cached)
+    if (!fromCache) {
+        logTokenUsage({
+        task,
+        providerId: result.providerId,
+        model: result.model,
+        usage: result.usage,
+        requestId,
+        userId,
+        workspaceId,
+        latencyMs: result.latencyMs,
+      });
+
+      // Phase 4.2.1 & 4.2.3: Increment token usage (user + workspace)
+      if (supabase && result.usage?.totalTokens) {
+        if (userId) await incrementTokenUsage(supabase, userId, result.usage.totalTokens);
+        if (workspaceId) await incrementWorkspaceTokenUsage(supabase, workspaceId, result.usage.totalTokens);
+      }
     }
 
     return { ...result, requestId };
   } catch (e) {
     if (process.env.NODE_ENV !== "test") {
-      console.error(
-        JSON.stringify({
-          event: "llm_router_error",
-          task,
-          providerId,
-          requestId,
-          userId,
-          error: e instanceof Error ? e.message : String(e),
-          timestamp: new Date().toISOString(),
-        })
-      );
+      logger.error({
+        event: "llm_router_error",
+        task,
+        providerId,
+        requestId,
+        userId,
+        error: e instanceof Error ? e.message : String(e),
+      });
     }
     throw e;
   }
@@ -219,15 +240,12 @@ export async function invokeChatWithFallback(
       const { isFallbackableError } = await import("./rate-limit");
       if (!isFallbackableError(e) || c === last) throw e;
       if (process.env.NODE_ENV !== "test") {
-        console.warn(
-          JSON.stringify({
-            event: "llm_router_fallback",
-            task,
-            from: c.providerId,
-            error: e instanceof Error ? e.message : String(e),
-            timestamp: new Date().toISOString(),
-          })
-        );
+        logger.warn({
+          event: "llm_router_fallback",
+          task,
+          from: c.providerId,
+          error: e instanceof Error ? e.message : String(e),
+        });
       }
     }
   }

@@ -12,6 +12,7 @@ import type { SearchResult } from "@/lib/indexing/types";
 import { detectErrorLogKind } from "@/lib/agent/error-log-utils";
 import { loadRules, formatRulesForPrompt } from "@/lib/rules";
 import { loadChatHistory, saveChatMessage } from "@/lib/chat-memory";
+import { logger } from "@/lib/logger";
 import { safeEnqueue, safeClose, shouldStopStream, STREAM_UPSTREAM_TIMEOUT_MS } from "@/lib/stream-utils";
 
 export type ChatCompletionInput = {
@@ -235,8 +236,12 @@ export async function chatCompletion(input: ChatCompletionInput): Promise<ChatCo
   if (workspaceId) {
     const lastUserContent = typeof lastMessage?.content === "string" ? lastMessage.content : "";
     const rt = runType ?? "chat";
-    await saveChatMessage(supabase, workspaceId, userId, "user", lastUserContent, { runType: rt }).catch(() => {});
-    await saveChatMessage(supabase, workspaceId, userId, "assistant", content, { runType: rt }).catch(() => {});
+    try {
+      await saveChatMessage(supabase, workspaceId, userId, "user", lastUserContent, { runType: rt });
+      await saveChatMessage(supabase, workspaceId, userId, "assistant", content, { runType: rt });
+    } catch (e) {
+      logger.warn({ event: "save_chat_history_failed", workspaceId, userId, error: e instanceof Error ? e.message : String(e) });
+    }
   }
 
   const kind = detectErrorLogKind(typeof lastMessage?.content === "string" ? lastMessage.content : "");

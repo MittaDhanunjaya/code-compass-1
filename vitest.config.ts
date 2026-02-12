@@ -16,12 +16,13 @@ export default defineConfig({
       reporter: ["text", "json", "html"],
       include: ["lib/**/*.ts", "app/api/**/*.ts", "services/**/*.ts"],
       exclude: ["**/*.test.ts", "**/*.d.ts", "**/node_modules/**"],
-      // Phase 3.4.7: Start at 4%, aim for 50% over time
+      // Phase 9.1.4: Raised to 10% after adding chain-of-thought, errors, scope, retry-handler tests.
+      // Target 70% for core logic (Phase 9); incremental improvements.
       thresholds: {
-        lines: 4,
-        functions: 4,
-        branches: 4,
-        statements: 4,
+        lines: 10,
+        functions: 10,
+        branches: 7,
+        statements: 10,
       },
     },
   },

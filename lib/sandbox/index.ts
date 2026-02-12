@@ -8,6 +8,7 @@ import type { FileEditStep } from "@/lib/agent/types";
 import { applyEdit } from "@/lib/agent/diff-engine";
 import { beautifyCode } from "@/lib/utils/code-beautifier";
 import { getLintCommands, getTestCommands, getRunCommands, detectStack } from "./stack-commands";
+import { recordFileOpDuration } from "@/lib/metrics";
 import { existsSync, readdirSync, readFileSync } from "fs";
 import { mkdir, writeFile } from "fs/promises";
 import { join, dirname, resolve } from "path";
@@ -121,6 +122,7 @@ export async function applyEditsToSandbox(
   filesEdited: string[];
   conflicts: { path: string; message: string }[];
 }> {
+  const start = Date.now();
   const filesEdited: string[] = [];
   const conflicts: { path: string; message: string }[] = [];
 
@@ -213,6 +215,7 @@ export async function applyEditsToSandbox(
     }
   }
 
+  recordFileOpDuration("applyEditsToSandbox", Date.now() - start, `${edits.length} files`);
   return { filesEdited, conflicts };
 }
 
@@ -256,6 +259,7 @@ export async function promoteSandboxToWorkspace(
 
   const filesEdited: string[] = [];
   const conflicts: { path: string; message: string }[] = [];
+  const editHistoryBatch: { path: string; oldContent: string; newContent: string }[] = [];
 
   // Apply each sandbox file to workspace (with conflict detection)
   for (const sandboxFile of sandboxFiles) {
@@ -273,7 +277,7 @@ export async function promoteSandboxToWorkspace(
       // New file: insert
       // Ensure content is beautified before promoting to workspace
       const beautifiedContent = beautifyCode(sandboxFile.content || "", path);
-      
+
       const { error: insertError } = await supabase
         .from("workspace_files")
         .insert({
@@ -289,6 +293,7 @@ export async function promoteSandboxToWorkspace(
         });
       } else {
         filesEdited.push(path);
+        editHistoryBatch.push({ path, oldContent: "", newContent: beautifiedContent });
       }
       continue;
     }
@@ -319,7 +324,18 @@ export async function promoteSandboxToWorkspace(
       });
     } else {
       filesEdited.push(path);
+      editHistoryBatch.push({
+        path,
+        oldContent: (workspaceFile.content as string) ?? "",
+        newContent: beautifiedSandboxContent,
+      });
     }
+  }
+
+  // Phase 7.3: Record edit history for undo/redo
+  if (editHistoryBatch.length > 0) {
+    const { pushEditBatch } = await import("@/lib/edit-history");
+    pushEditBatch(workspaceId, editHistoryBatch);
   }
 
   // Mark sandbox as promoted
@@ -346,7 +362,7 @@ export async function syncSandboxToDisk(
   supabase: SupabaseClient,
   sandboxRunId: string
 ): Promise<void> {
-
+  const start = Date.now();
   const sandboxDir = getSandboxDir(sandboxRunId);
 
   const { data: files, error } = await supabase
@@ -370,6 +386,8 @@ export async function syncSandboxToDisk(
     const beautifiedContent = beautifyCode(file.content || "", file.path);
     await writeFile(filePath, beautifiedContent, "utf-8");
   }
+
+  recordFileOpDuration("syncSandboxToDisk", Date.now() - start, `${files?.length ?? 0} files`);
 }
 
 /**

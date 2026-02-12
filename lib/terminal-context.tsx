@@ -4,6 +4,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useMemo,
   useState,
   type ReactNode,
 } from "react";
@@ -147,19 +148,33 @@ export function TerminalProvider({
     );
   }, []);
 
-  const value: TerminalContextValue = {
-    terminals,
-    activeTerminalId: activeTerminal?.id ?? null,
-    activeTerminal,
-    addTerminal,
-    removeTerminal,
-    setActiveTerminal,
-    addLog,
-    clearLogs,
-    setTerminalExecuting,
-    addTerminalHistory,
-    workspaceId,
-  };
+  const value = useMemo<TerminalContextValue>(
+    () => ({
+      terminals,
+      activeTerminalId: activeTerminal?.id ?? null,
+      activeTerminal,
+      addTerminal,
+      removeTerminal,
+      setActiveTerminal,
+      addLog,
+      clearLogs,
+      setTerminalExecuting,
+      addTerminalHistory,
+      workspaceId,
+    }),
+    [
+      terminals,
+      activeTerminal,
+      addTerminal,
+      removeTerminal,
+      setActiveTerminal,
+      addLog,
+      clearLogs,
+      setTerminalExecuting,
+      addTerminalHistory,
+      workspaceId,
+    ]
+  );
 
   return (
     <TerminalContext.Provider value={value}>{children}</TerminalContext.Provider>

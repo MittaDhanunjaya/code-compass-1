@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireWorkspaceAccess, withAuthResponse } from "@/lib/auth/require-auth";
 import { getCloneRoot, syncWorkspaceFilesToRepo, getGitStatus } from "@/lib/github-import";
 import { existsSync } from "fs";
 
@@ -9,21 +10,21 @@ type RouteParams = { params: Promise<{ id: string }> };
  * GET /api/workspaces/[id]/git/status
  * Syncs workspace_files to disk, then returns git status (modified/added/deleted).
  */
-export async function GET(_request: Request, { params }: RouteParams) {
+export async function GET(request: Request, { params }: RouteParams) {
   const { id: workspaceId } = await params;
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  try {
+    await requireWorkspaceAccess(request, workspaceId, supabase);
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   const { data: workspace, error: fetchError } = await supabase
     .from("workspaces")
     .select("id, github_owner, github_repo, github_current_branch")
     .eq("id", workspaceId)
-    .eq("owner_id", user.id)
     .single();
 
   if (fetchError || !workspace) {

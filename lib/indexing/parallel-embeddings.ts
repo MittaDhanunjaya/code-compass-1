@@ -1,10 +1,13 @@
 /**
  * Parallel embedding generation with batching and rate limiting.
- * Improves indexing speed by processing multiple chunks concurrently.
+ * Phase 6.1.1: Cache embeddings by content hash (server-only; avoids client bundle).
  */
 
 import type { ProviderId } from "@/lib/llm/providers";
 import { getProvider } from "@/lib/llm/providers";
+import { getOrSet, hashForCache } from "@/lib/cache";
+
+const EMBEDDING_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 export type EmbeddingBatch = {
   texts: string[];
@@ -53,7 +56,16 @@ export async function generateEmbeddingsParallel(
 
     const batchPromises = concurrentBatches.map(async (batch, batchIndex) => {
       try {
-        const embeddings = await embeddingsFn(batch, apiKey);
+        const cacheKey = `embed:${providerId}:${hashForCache(...batch)}`;
+        const embeddings = await getOrSet(
+          cacheKey,
+          EMBEDDING_CACHE_TTL_MS,
+          () => embeddingsFn(batch, apiKey),
+          {
+            serialize: (v) => JSON.stringify(v),
+            deserialize: (s) => JSON.parse(s) as number[][],
+          }
+        );
         return { batchIndex: i + batchIndex, embeddings, error: null };
       } catch (error) {
         return {

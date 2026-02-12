@@ -1,9 +1,11 @@
 /**
  * Zod schemas for API request validation.
  * Phase 3.1: Input validation for high-value routes.
+ * Phase 10.3: Instruction max length, path sanitization.
  */
 
 import { z } from "zod";
+import { sanitizePath } from "./sanitize-path";
 
 const PROVIDERS = ["openrouter", "openai", "gemini", "perplexity", "ollama", "lmstudio"] as const;
 const providerIdSchema = z.enum(PROVIDERS);
@@ -27,14 +29,19 @@ const chatContextSchema = z
   .nullable();
 
 // --- Agent plan step schemas ---
-const fileEditStepSchema = z.object({
-  type: z.literal("file_edit"),
-  path: z.string().min(1, "path is required"),
-  oldContent: z.string().optional(),
-  newContent: z.string(),
-  description: z.string().optional(),
-  source: z.literal("debug-from-log").optional(),
-});
+const fileEditStepSchema = z
+  .object({
+    type: z.literal("file_edit"),
+    path: z.string().min(1, "path is required"),
+    oldContent: z.string().optional(),
+    newContent: z.string(),
+    description: z.string().optional(),
+    source: z.literal("debug-from-log").optional(),
+  })
+  .superRefine((s, ctx) => {
+    const r = sanitizePath(s.path);
+    if (!r.ok) ctx.addIssue({ code: z.ZodIssueCode.custom, message: r.error, path: ["path"] });
+  });
 
 const commandStepSchema = z.object({
   type: z.literal("command"),
@@ -57,9 +64,14 @@ export const agentPlanOutputSchema = agentPlanSchema;
 
 // --- API route body schemas ---
 
+const INSTRUCTION_MAX = 5000;
+
 /** /api/agent/plan-stream */
 export const agentPlanStreamBodySchema = z.object({
-  instruction: z.string().transform((s) => s.trim()).pipe(z.string().min(1, "instruction is required")),
+  instruction: z
+    .string()
+    .transform((s) => s.trim())
+    .pipe(z.string().min(1, "instruction is required").max(INSTRUCTION_MAX, "instruction too long")),
   workspaceId: z.string().uuid().optional(),
   provider: providerIdSchema.optional(),
   model: z.string().optional(),
@@ -98,7 +110,10 @@ const composerScopeSchema = z.enum(["current_file", "current_folder", "workspace
 
 export const composerPlanBodySchema = z.object({
   workspaceId: z.string().uuid().optional(),
-  instruction: z.string().transform((s) => s.trim()).pipe(z.string().min(1, "instruction is required")),
+  instruction: z
+    .string()
+    .transform((s) => s.trim())
+    .pipe(z.string().min(1, "instruction is required").max(INSTRUCTION_MAX, "instruction too long")),
   scope: composerScopeSchema.optional(),
   scopeMode: scopeModeSchema.optional(),
   currentFilePath: z.string().optional().nullable(),
@@ -197,11 +212,42 @@ export const workspacesUpdateBodySchema = z.object({
 });
 
 /** POST /api/index/update */
-export const indexUpdateBodySchema = z.object({
-  workspaceId: z.string().uuid(),
-  filePaths: z.array(z.string()),
-  provider: providerIdSchema.optional(),
-  generateEmbeddings: z.boolean().optional(),
+export const indexUpdateBodySchema = z
+  .object({
+    workspaceId: z.string().uuid(),
+    filePaths: z.array(z.string()),
+    provider: providerIdSchema.optional(),
+    generateEmbeddings: z.boolean().optional(),
+  })
+  .superRefine((data, ctx) => {
+    const bad = data.filePaths.find((p) => !sanitizePath(p.trim()).ok);
+    if (bad) {
+      const r = sanitizePath(bad.trim());
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: r.ok ? "Invalid path" : r.error, path: ["filePaths"] });
+    }
+  });
+
+/** LLM output: /api/pr/analyze response structure. */
+export const prAnalyzeOutputSchema = z.object({
+  summary: z.string().optional(),
+  risks: z.array(z.string()).optional(),
+  suggestions: z.array(z.string()).optional(),
+}).transform((d) => ({
+  summary: d.summary ?? "",
+  risks: Array.isArray(d.risks) ? d.risks : [],
+  suggestions: Array.isArray(d.suggestions) ? d.suggestions : [],
+}));
+
+/** LLM output: debug-from-log parsed structure. */
+export const debugFromLogOutputSchema = z.object({
+  suspectedRootCause: z.string().nullable().optional(),
+  explanation: z.string().nullable().optional(),
+  edits: z.array(z.object({
+    path: z.string().optional(),
+    description: z.string().optional(),
+    oldContent: z.string().optional(),
+    newContent: z.string().optional(),
+  })).optional(),
 });
 
 /** POST /api/feedback */

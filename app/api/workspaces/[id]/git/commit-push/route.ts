@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireWorkspaceAccess, withAuthResponse } from "@/lib/auth/require-auth";
 import {
   getCloneRoot,
   syncWorkspaceFilesToRepo,
@@ -17,11 +18,14 @@ type RouteParams = { params: Promise<{ id: string }> };
 export async function POST(request: Request, { params }: RouteParams) {
   const { id: workspaceId } = await params;
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  let user: { id: string };
+  try {
+    const auth = await requireWorkspaceAccess(request, workspaceId, supabase);
+    user = auth.user;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   let body: { message?: string };
@@ -36,7 +40,6 @@ export async function POST(request: Request, { params }: RouteParams) {
     .from("workspaces")
     .select("id, github_owner, github_repo, github_current_branch, github_default_branch")
     .eq("id", workspaceId)
-    .eq("owner_id", user.id)
     .single();
 
   if (fetchError || !workspace) {

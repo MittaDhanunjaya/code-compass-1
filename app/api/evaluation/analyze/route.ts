@@ -7,11 +7,11 @@ import { validateAnalyzeResult } from "@/lib/validation";
  * GET /api/evaluation/analyze
  * Returns aggregated stats for debug-from-log (and sandbox) runs to refine prompts and planning.
  */
-export async function GET() {
+export async function GET(request: Request) {
   let user: { id: string };
   let supabase: Awaited<ReturnType<typeof import("@/lib/supabase/server").createClient>>;
   try {
-    const auth = await requireAuth();
+    const auth = await requireAuth(request);
     user = auth.user;
     supabase = auth.supabase;
   } catch (e) {

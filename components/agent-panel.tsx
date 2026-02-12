@@ -25,6 +25,9 @@ import {
   AgentReviewQueue,
 } from "@/components/agent";
 import type { LogAttachment } from "@/lib/chat/log-utils";
+import { useAgentPlan } from "@/hooks/useAgentPlan";
+import { useAgentExecute } from "@/hooks/useAgentExecute";
+import { useUndoRedo } from "@/hooks/useUndoRedo";
 
 type AgentPhase = "idle" | "loading_plan" | "plan_ready" | "executing" | "done";
 
@@ -54,6 +57,7 @@ type AgentPanelProps = {
 
 export function AgentPanel({ workspaceId }: AgentPanelProps) {
   const { getTab, updateContent, openFile, setActiveTab } = useEditor();
+  const { canUndo, canRedo, undo, redo, refetch: refetchUndoRedo } = useUndoRedo(workspaceId, updateContent);
   const { addLog } = useTerminal();
   const workspaceLabel = useWorkspaceLabel(workspaceId);
   const [instruction, setInstruction] = useState("");
@@ -341,6 +345,26 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
     };
   }, [phase]);
 
+  // Phase 7.3: Undo/Redo keyboard shortcuts (only when agent result visible and focus not in input)
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (phase !== "done" || !executeResult) return;
+      const target = e.target as HTMLElement;
+      if (target?.closest?.("input, textarea, [contenteditable]")) return;
+      if ((e.metaKey || e.ctrlKey) && e.key === "z") {
+        if (e.shiftKey && canRedo) {
+          e.preventDefault();
+          redo();
+        } else if (!e.shiftKey && canUndo) {
+          e.preventDefault();
+          undo();
+        }
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [phase, executeResult, canUndo, canRedo, undo, redo]);
+
   const fetchFileList = useCallback(async (): Promise<string[]> => {
     if (!workspaceId) return [];
     const res = await fetch(`/api/workspaces/${workspaceId}/files`);
@@ -348,6 +372,48 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
     const data = await res.json();
     return Array.isArray(data) ? data.map((f: { path: string }) => f.path) : [];
   }, [workspaceId]);
+
+  const { startPlan: startPlanFromHook, rejectPlan: rejectPlanFromHook } = useAgentPlan({
+    workspaceId,
+    instruction,
+    provider,
+    model,
+    modelSelection,
+    scopeMode,
+    fetchFileList,
+    onPlan: setPlan,
+    onPhase: setPhase,
+    onError: setError,
+    setAgentEvents,
+    setRunSummary,
+    setPlanContextUsed,
+    setRunScope,
+    setPlanUsage,
+    setModelFallbackBanner,
+    lastActivityRef,
+    abortControllerRef,
+    stuckTimeoutAbortRef,
+    onAutoRetry: (startPlanFn) => {
+      const delayMs = 3000;
+      let remaining = Math.ceil(delayMs / 1000);
+      setAutoRetryIn(remaining);
+      const intervalId = setInterval(() => {
+        remaining -= 1;
+        setAutoRetryIn((r) => (r != null && r > 0 ? r - 1 : null));
+      }, 1000);
+      autoRetryIntervalRef.current = intervalId;
+      autoRetryTimeoutRef.current = window.setTimeout(() => {
+        if (autoRetryIntervalRef.current) {
+          clearInterval(autoRetryIntervalRef.current);
+          autoRetryIntervalRef.current = null;
+        }
+        autoRetryTimeoutRef.current = null;
+        setAutoRetryIn(null);
+        setError(null);
+        startPlanFn();
+      }, delayMs);
+    },
+  });
 
   const startPlan = useCallback(async () => {
     const hasLog = !!logAttachment;
@@ -374,659 +440,35 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
     }
 
     if (!instruction.trim()) return;
-    setError(null);
-    setPlanUsage(null);
-    setPlanContextUsed(null);
-    setRunScope(null);
-    setAgentEvents([]);
-    setRunSummary(null);
-    setModelFallbackBanner(null);
-    setPhase("loading_plan");
-    
-    const abortController = new AbortController();
-    abortControllerRef.current = abortController;
-    
-    try {
-      const fileList = await fetchFileList();
-      const res = await fetch("/api/agent/plan-stream", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          instruction: instruction.trim(),
-          workspaceId,
-          ...(modelSelection.type === "model"
-            ? { modelId: modelSelection.modelId }
-            : modelSelection.type === "group"
-              ? { modelGroupId: modelSelection.modelGroupId }
-              : { provider, model: provider === "openrouter" ? model : undefined }),
-          fileList,
-          useIndex: true,
-          scopeMode: scopeMode ?? "normal",
-        }),
-        signal: abortController.signal,
-      });
+    await startPlanFromHook();
+  }, [instruction, workspaceId, phase, logAttachment, useDebugForLogs, startPlanFromHook]);
 
-      if (!res.ok) {
-        const errorData = await res.json().catch(() => ({ error: "Plan failed" }));
-        throw new Error(errorData.error || "Plan failed");
-      }
+  const rejectPlan = rejectPlanFromHook;
 
-      const reader = res.body?.getReader();
-      const decoder = new TextDecoder();
-      if (!reader) throw new Error("No response body");
-
-      let buffer = "";
-      let finalPlan: AgentPlan | null = null;
-      let finalUsage: { prompt_tokens?: number; completion_tokens?: number } | null = null;
-      let finalModelFallback: { from: string; to: string } | undefined;
-      let finalAvailableFreeModels: { id: string; label: string }[] | undefined;
-      let lastStatusMessage: string | null = null;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (value) lastActivityRef.current = Date.now();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          if (line.startsWith("data: ")) {
-            try {
-              const data = JSON.parse(line.slice(6));
-              if (data.type === "plan") {
-                finalPlan = data.plan;
-                finalUsage = data.usage;
-                if (data.modelFallback && typeof data.modelFallback === "object" && data.modelFallback.from && data.modelFallback.to) {
-                  finalModelFallback = { from: data.modelFallback.from, to: data.modelFallback.to };
-                }
-                if (Array.isArray(data.availableFreeModels) && data.availableFreeModels.length > 0) {
-                  finalAvailableFreeModels = data.availableFreeModels.map((m: { id?: string; label?: string }) => ({ id: m?.id ?? "", label: m?.label ?? m?.id ?? "" })).filter((m: { id: string }) => m.id);
-                }
-                if (data.contextUsed && Array.isArray(data.contextUsed.filePaths)) {
-                  setPlanContextUsed(data.contextUsed.filePaths);
-                }
-                if (data.scope && typeof data.scope.fileCount === "number") {
-                  setRunScope({ fileCount: data.scope.fileCount, approxLinesChanged: data.scope.approxLinesChanged ?? 0 });
-                }
-              } else if (data.type === "error") {
-                // Handle error events from the stream
-                lastStatusMessage = data.error || data.message || "Unknown error";
-                setAgentEvents((prev) => [...prev, {
-                  id: `${Date.now()}`,
-                  type: "status",
-                  message: lastStatusMessage ?? "Unknown error",
-                  createdAt: new Date().toISOString(),
-                }]);
-              } else if (data.id && data.type && data.message) {
-                const event = data as AgentEvent;
-                if (event.type === "status" && typeof event.message === "string" && (event.message.startsWith("Error:") || event.message.includes("valid") || event.message.includes("JSON"))) {
-                  lastStatusMessage = event.message;
-                }
-                setAgentEvents((prev) => [...prev, event]);
-                
-                // Update run summary aggregates
-                setRunSummary((prev) => {
-                  const summary = prev || {
-                    editedFiles: new Set<string>(),
-                    filesSkippedDueToConflict: new Set<string>(),
-                    commandsRun: [],
-                    reasoningCount: 0,
-                    toolCallCount: 0,
-                    toolResultCount: 0,
-                    statusCount: 0,
-                    isComplete: false,
-                    wasCancelled: false,
-                  };
-                  
-                  // Count by type
-                  if (event.type === "reasoning") summary.reasoningCount++;
-                  else if (event.type === "tool_call") summary.toolCallCount++;
-                  else if (event.type === "tool_result") summary.toolResultCount++;
-                  else if (event.type === "status") summary.statusCount++;
-                  
-                  // Scope/scopeMode from status events
-                  if (event.type === "status" && event.meta?.scope && typeof event.meta.scope.fileCount === "number") {
-                    summary.scope = { fileCount: event.meta.scope.fileCount, approxLinesChanged: event.meta.scope.approxLinesChanged ?? 0 };
-                  }
-                  if (event.type === "status" && event.meta?.scopeMode) summary.scopeMode = event.meta.scopeMode as ScopeMode;
-                  if (event.type === "status" && event.meta?.retried !== undefined) summary.retried = event.meta.retried;
-                  if (event.type === "status" && event.meta?.retryReason) summary.retryReason = event.meta.retryReason;
-                  if (event.type === "status" && event.meta?.attempt1) summary.attempt1 = event.meta.attempt1;
-                  if (event.type === "status" && event.meta?.attempt2) summary.attempt2 = event.meta.attempt2;
-                  
-                  // Track edited files (from tool_result events with filePath)
-                  if (event.type === "tool_result" && event.meta?.filePath) {
-                    summary.editedFiles.add(event.meta.filePath);
-                  }
-                  
-                  // Track commands (from tool_call events with command)
-                  if (event.type === "tool_call" && event.meta?.command) {
-                    if (!summary.commandsRun.includes(event.meta.command)) {
-                      summary.commandsRun.push(event.meta.command);
-                    }
-                  }
-                  
-                  return { ...summary };
-                });
-              }
-            } catch {
-              // Skip invalid JSON
-            }
-          }
-        }
-      }
-
-      // Validate plan structure before setting it
-      if (finalPlan && finalPlan.steps && Array.isArray(finalPlan.steps) && finalPlan.steps.length > 0) {
-        // Validate that steps have required fields
-        const validSteps: PlanStep[] = [];
-        const invalidSteps: Array<{ index: number; step: PlanStep; reason: string }> = [];
-        
-        finalPlan.steps.forEach((step: PlanStep, index: number) => {
-          if (!step || typeof step !== "object") {
-            invalidSteps.push({ index, step, reason: "Step is not an object" });
-            return;
-          }
-          
-          if (step.type === "file_edit") {
-            if (!step.path || typeof step.path !== "string" || step.path.trim() === "") {
-              invalidSteps.push({ index, step, reason: `Missing or empty 'path' field. Step has: ${JSON.stringify(Object.keys(step))}` });
-              return;
-            }
-            if (!step.newContent || typeof step.newContent !== "string") {
-              invalidSteps.push({ index, step, reason: `Missing or invalid 'newContent' field` });
-              return;
-            }
-            validSteps.push(step as FileEditStep);
-          } else if (step.type === "command") {
-            if (!step.command || typeof step.command !== "string" || step.command.trim() === "") {
-              invalidSteps.push({ index, step, reason: `Missing or empty 'command' field. Step has: ${JSON.stringify(Object.keys(step))}` });
-              return;
-            }
-            validSteps.push(step as CommandStep);
-          } else {
-            const stepType = (step as { type?: string }).type;
-            invalidSteps.push({ index, step, reason: `Unknown step type: ${stepType || "undefined"}` });
-          }
-        });
-        
-        if (validSteps.length === 0) {
-          const errorDetails = invalidSteps.length > 0
-            ? `\n\nInvalid steps details:\n${invalidSteps.map(({ index, reason, step }) => 
-                `  Step ${index + 1}: ${reason}\n    Step keys: [${step && typeof step === "object" ? Object.keys(step).join(", ") : "N/A"}]\n    Step data: ${JSON.stringify(step, null, 2).slice(0, 400)}`
-              ).join("\n\n")}`
-            : "";
-          const fullPlanPreview = JSON.stringify(finalPlan, null, 2).slice(0, 800);
-          throw new Error(`Plan has no valid steps. All ${finalPlan.steps.length} step(s) are missing required fields.${errorDetails}\n\nFull plan preview:\n${fullPlanPreview}`);
-        }
-        
-        // Log invalid steps but continue with valid ones
-        if (invalidSteps.length > 0) {
-          console.warn(`Plan has ${invalidSteps.length} invalid step(s) out of ${finalPlan.steps.length} total:`, invalidSteps);
-        }
-        
-        // Use validated steps
-        const validatedPlan: AgentPlan = {
-          ...finalPlan,
-          steps: validSteps,
-        };
-        
-        setPlan(validatedPlan);
-        if (finalModelFallback) {
-          setModelFallbackBanner({
-            from: finalModelFallback.from,
-            to: finalModelFallback.to,
-            availableFreeModels: finalAvailableFreeModels ?? [],
-          });
-        } else {
-          setModelFallbackBanner(null);
-        }
-        if (finalUsage) {
-          const u = finalUsage as {
-            inputTokens?: number;
-            outputTokens?: number;
-            totalTokens?: number;
-          };
-          const parts: string[] = [];
-          if (u.totalTokens != null) {
-            parts.push(`Total: ${u.totalTokens.toLocaleString()} tokens`);
-          }
-          if (u.inputTokens != null && u.outputTokens != null) {
-            parts.push(`Input: ${u.inputTokens.toLocaleString()} | Output: ${u.outputTokens.toLocaleString()}`);
-          } else {
-            if (u.inputTokens != null) parts.push(`Input: ${u.inputTokens.toLocaleString()}`);
-            if (u.outputTokens != null) parts.push(`Output: ${u.outputTokens.toLocaleString()}`);
-          }
-          if (provider === "openai" && u.inputTokens != null && u.outputTokens != null) {
-            const inputCost = (u.inputTokens / 1_000_000) * 0.15;
-            const outputCost = (u.outputTokens / 1_000_000) * 0.6;
-            const totalCost = inputCost + outputCost;
-            if (totalCost > 0.0001) {
-              parts.push(`Est. cost: $${totalCost.toFixed(4)}`);
-            }
-          }
-          if (parts.length > 0) {
-            setPlanUsage(parts.join(" • "));
-          }
-        }
-        setPhase("plan_ready");
-      } else {
-        if (finalPlan && (!finalPlan.steps || finalPlan.steps.length === 0)) {
-          throw new Error("Empty plan returned: The agent couldn't generate any steps. Try:\n- Including specific file paths in your error description\n- Being more explicit about what needs to be fixed\n- Checking if the files mentioned in errors exist in the workspace");
-        }
-        const detail = lastStatusMessage ?? "Check the activity feed above for details.";
-        throw new Error(`Empty plan returned: The agent didn't return a valid plan. ${detail}`);
-      }
-    } catch (e) {
-      if (e instanceof Error && e.name === "AbortError") {
-        if (stuckTimeoutAbortRef.current) {
-          stuckTimeoutAbortRef.current = false;
-          setError("Request timed out. The model may have stalled. Try again.");
-          setPhase("idle");
-          return;
-        }
-        const cancelEvent: AgentEvent = {
-          id: `${Date.now()}`,
-          type: "status",
-          message: "Run cancelled by user",
-          createdAt: new Date().toISOString(),
-        };
-        setAgentEvents((prev) => [...prev, cancelEvent]);
-        setRunSummary((prev) => prev ? { ...prev, isComplete: true, wasCancelled: true } : {
-          editedFiles: new Set<string>(),
-          filesSkippedDueToConflict: new Set<string>(),
-          commandsRun: [],
-          reasoningCount: 0,
-          toolCallCount: 0,
-          toolResultCount: 0,
-          statusCount: 1,
-          isComplete: true,
-          wasCancelled: true,
-        });
-        setPhase("idle");
-        return;
-      }
-      const errorMsg = e instanceof Error ? e.message : "Plan failed";
-      const isRetryable =
-        /empty plan returned|no valid steps|returned no steps|maximum call stack size exceeded|missing required fields/i.test(errorMsg);
-
-      if (/failed to fetch|network error|load failed|network request failed/i.test(errorMsg)) {
-        setError("Connection lost. Check your network and try again.");
-      } else if (errorMsg.includes("No API key configured")) {
-        // Enhanced error message with helpful links
-        if (errorMsg.includes("OpenRouter") || errorMsg.includes("openrouter")) {
-          setError(`No API key configured. Get a free OpenRouter key at https://openrouter.ai/keys and add it in Settings → API Keys.`);
-        } else if (errorMsg.includes("Recommended")) {
-          // Use the improved error message from backend
-          setError(errorMsg);
-        } else {
-          setError(`${errorMsg} Add an API key in Settings → API Keys. Recommended: OpenRouter (free models) or Gemini (free tier).`);
-        }
-      } else {
-        let msg = errorMsg.includes(PROVIDER_LABELS[provider]) ? errorMsg : `${PROVIDER_LABELS[provider]}: ${errorMsg}`;
-        if (errorMsg.toLowerCase().includes("not a valid model") || errorMsg.includes("invalid model")) {
-          msg += " If you use an OpenAI key, switch the Provider dropdown above to \"OpenAI\".";
-        }
-        setError(msg);
-      }
-      setPhase("idle");
-
-      // Auto-retry once for model/plan failures (empty plan, stack overflow, etc.)
-      if (isRetryable && autoRetryCountRef.current < 1) {
-        autoRetryCountRef.current = 1;
-        const delayMs = 3000;
-        let remaining = Math.ceil(delayMs / 1000);
-        setAutoRetryIn(remaining);
-        const intervalId = setInterval(() => {
-          remaining -= 1;
-          setAutoRetryIn((r) => (r != null && r > 0 ? r - 1 : null));
-        }, 1000);
-        autoRetryIntervalRef.current = intervalId;
-        autoRetryTimeoutRef.current = window.setTimeout(() => {
-          if (autoRetryIntervalRef.current) {
-            clearInterval(autoRetryIntervalRef.current);
-            autoRetryIntervalRef.current = null;
-          }
-          autoRetryTimeoutRef.current = null;
-          setAutoRetryIn(null);
-          setError(null);
-          startPlan();
-        }, delayMs);
-      }
-    } finally {
-      abortControllerRef.current = null;
-    }
-  }, [instruction, workspaceId, provider, model, modelSelection, phase, fetchFileList, logAttachment, useDebugForLogs]);
-
-  const rejectPlan = useCallback(() => {
-    setPlan(null);
-    setPhase("idle");
-    setError(null);
-    setModelFallbackBanner(null);
-  }, []);
-
-  const doExecute = useCallback(
-    async (confirmedProtectedPaths?: string[], skipProtected?: boolean, confirmedAggressive?: boolean) => {
-      if (!plan || !workspaceId) return;
-      setError(null);
-      setAgentEvents([]);
-      setRunSummary(null); // Reset summary for new execution
-      setPhase("executing");
-      
-      const abortController = new AbortController();
-      abortControllerRef.current = abortController;
-      
-      try {
-        const res = await fetch("/api/agent/execute-stream", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            workspaceId,
-            plan,
-            ...(modelSelection.type === "model"
-              ? { modelId: modelSelection.modelId }
-              : modelSelection.type === "group"
-                ? { modelGroupId: modelSelection.modelGroupId }
-                : { provider, model: provider === "openrouter" ? model : undefined }),
-            confirmedProtectedPaths: confirmedProtectedPaths ?? undefined,
-            skipProtected: skipProtected === true,
-            scopeMode: scopeMode ?? "normal",
-            confirmedAggressive: confirmedAggressive === true,
-          }),
-          signal: abortController.signal,
-        });
-
-        if (!res.ok) {
-          const errorData = await res.json().catch(() => ({ error: "Execute failed" }));
-          throw new Error(errorData.error || "Execute failed");
-        }
-
-        const reader = res.body?.getReader();
-        const decoder = new TextDecoder();
-        if (!reader) throw new Error("No response body");
-
-        let buffer = "";
-        let finalResult: AgentExecuteResult | null = null;
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (value) {
-            lastActivityRef.current = Date.now();
-            buffer += decoder.decode(value, { stream: true });
-          }
-          
-          // Process complete lines (ending with \n)
-          const lines = buffer.split("\n");
-          // Keep the last incomplete line in buffer
-          buffer = lines.pop() || "";
-
-          for (const line of lines) {
-            if (line.trim() && line.startsWith("data: ")) {
-              try {
-                const jsonStr = line.slice(6).trim();
-                if (!jsonStr) continue;
-                
-                const data = JSON.parse(jsonStr);
-                if (data.type === "result") {
-                  finalResult = data.result;
-                } else if (data.type === "needProtectedConfirmation") {
-                  setProtectedPathsList(data.protectedPaths || []);
-                  setProtectedConfirmOpen(true);
-                  setPhase("plan_ready");
-                  abortControllerRef.current = null;
-                  return;
-                } else if (data.type === "needAggressiveConfirm") {
-                  setAggressiveConfirmOpen(true);
-                  setPhase("plan_ready");
-                  abortControllerRef.current = null;
-                  return;
-                } else if (data.id && data.type && data.message) {
-                  // AgentEvent - track for summary
-                  const event = data as AgentEvent;
-                  setAgentEvents((prev) => [...prev, event]);
-                  
-                  // Update run summary aggregates
-                  setRunSummary((prev) => {
-                    const summary = prev || {
-                      editedFiles: new Set<string>(),
-                      filesSkippedDueToConflict: new Set<string>(),
-                      commandsRun: [],
-                      reasoningCount: 0,
-                      toolCallCount: 0,
-                      toolResultCount: 0,
-                      statusCount: 0,
-                      isComplete: false,
-                      wasCancelled: false,
-                    };
-                    
-                    // Count by type
-                    if (event.type === "reasoning") summary.reasoningCount++;
-                    else if (event.type === "tool_call") summary.toolCallCount++;
-                    else if (event.type === "tool_result") summary.toolResultCount++;
-                    else if (event.type === "status") summary.statusCount++;
-                    
-                    // Track edited files vs skipped (conflict) from tool_result with filePath
-                    if (event.type === "tool_result" && event.meta?.filePath) {
-                      if (event.meta.conflict) {
-                        summary.filesSkippedDueToConflict.add(event.meta.filePath);
-                      } else {
-                        summary.editedFiles.add(event.meta.filePath);
-                      }
-                    }
-                    
-                    // Track commands (from tool_call events with command)
-                    if (event.type === "tool_call" && event.meta?.command) {
-                      if (!summary.commandsRun.includes(event.meta.command)) {
-                        summary.commandsRun.push(event.meta.command);
-                      }
-                    }
-                    
-                    // Scope/scopeMode/retry from status events
-                    if (event.type === "status" && event.meta?.scope && typeof event.meta.scope.fileCount === "number") {
-                      summary.scope = { fileCount: event.meta.scope.fileCount, approxLinesChanged: event.meta.scope.approxLinesChanged ?? 0 };
-                    }
-                    if (event.type === "status" && event.meta?.scopeMode) summary.scopeMode = event.meta.scopeMode as ScopeMode;
-                    if (event.type === "status" && event.meta?.retried !== undefined) summary.retried = event.meta.retried;
-                    if (event.type === "status" && event.meta?.retryReason) summary.retryReason = event.meta.retryReason;
-                    if (event.type === "status" && event.meta?.attempt1) summary.attempt1 = event.meta.attempt1;
-                    if (event.type === "status" && event.meta?.attempt2) summary.attempt2 = event.meta.attempt2;
-                    
-                    // Check for completion status
-                    if (event.type === "status" && (
-                      event.message.toLowerCase().includes("complete") ||
-                      event.message.toLowerCase().includes("finished") ||
-                      event.message.toLowerCase().includes("done")
-                    )) {
-                      summary.isComplete = true;
-                    }
-                    
-                    return { ...summary };
-                  });
-                }
-              } catch (e) {
-                // Skip invalid JSON - log for debugging
-                console.warn("Failed to parse SSE line:", line.slice(0, 100), e);
-              }
-            }
-          }
-          
-          if (done) {
-            // Process any remaining buffer when stream ends
-            if (buffer.trim() && buffer.startsWith("data: ")) {
-              try {
-                const jsonStr = buffer.slice(6).trim();
-                if (jsonStr) {
-                  const data = JSON.parse(jsonStr);
-                  if (data.type === "result") {
-                    finalResult = data.result;
-                  } else if (data.id && data.type && data.message) {
-                    const event = data as AgentEvent;
-                    setAgentEvents((prev) => [...prev, event]);
-                    
-                    // Update summary for final event
-                    setRunSummary((prev) => {
-                      if (!prev) return null;
-                      const summary = { ...prev };
-                      if (event.type === "reasoning") summary.reasoningCount++;
-                      else if (event.type === "tool_call") summary.toolCallCount++;
-                      else if (event.type === "tool_result") {
-                        summary.toolResultCount++;
-                        if (event.meta?.filePath) {
-                          if (event.meta.conflict) summary.filesSkippedDueToConflict.add(event.meta.filePath);
-                          else summary.editedFiles.add(event.meta.filePath);
-                        }
-                      }
-                      else if (event.type === "status") summary.statusCount++;
-                      return summary;
-                    });
-                  }
-                }
-              } catch (e) {
-                console.warn("Failed to parse final buffer:", buffer.slice(0, 200), e);
-              }
-            }
-            break;
-          }
-        }
-
-        if (!finalResult) {
-          // Log what we received for debugging
-          console.error("No result received. Events:", agentEvents.length, "Last events:", agentEvents.slice(-3));
-          console.error("Remaining buffer:", buffer.slice(0, 500));
-          throw new Error("No result received from execution stream. Check console for details.");
-        }
-
-        setExecuteResult(finalResult);
-        const pr = (finalResult as { pendingReview?: { fileEdits: { path: string }[] } }).pendingReview;
-        if (pr?.fileEdits?.length) {
-          setAgentReviewAccepted(new Set(pr.fileEdits.map((e) => e.path)));
-        }
-        
-        // Mark execution as complete; merge filesSkippedDueToConflict from result if present
-        const skippedFromResult = (finalResult as { filesSkippedDueToConflict?: string[] }).filesSkippedDueToConflict;
-        setRunSummary((prev) => {
-          if (!prev) return null;
-          const next = { ...prev, isComplete: true };
-          if (Array.isArray(skippedFromResult) && skippedFromResult.length > 0) {
-            next.filesSkippedDueToConflict = new Set([...prev.filesSkippedDueToConflict, ...skippedFromResult]);
-          }
-          return next;
-        });
-
-        // Log to terminal
-        const logEntries = finalResult.log ?? [];
-        for (const entry of logEntries) {
-          if (entry.type === "info") {
-            addLog({ type: "info", content: entry.message || "", command: undefined });
-          } else if (entry.type === "command") {
-            addLog({ type: "command", content: `$ ${entry.command}`, command: entry.command });
-            if (entry.commandStatusSummary) {
-              addLog({
-                type: entry.commandStatus === "success" ? "info" : "error",
-                content: `[Status: ${entry.commandStatusSummary}]`,
-                command: entry.command,
-              });
-            }
-            const message = entry.message || "";
-            const lines = message.split("\n");
-            let inStdout = false;
-            let inStderr = false;
-            let stdoutContent = "";
-            let stderrContent = "";
-            for (const line of lines) {
-              if (line.startsWith("stdout: ")) {
-                inStdout = true;
-                inStderr = false;
-                stdoutContent = line.substring(8);
-              } else if (line.startsWith("stderr: ")) {
-                inStdout = false;
-                inStderr = true;
-                stderrContent = line.substring(8);
-              } else if (inStdout) {
-                stdoutContent += (stdoutContent ? "\n" : "") + line;
-              } else if (inStderr) {
-                stderrContent += (stderrContent ? "\n" : "") + line;
-              } else if (line.trim()) {
-                addLog({
-                  type: entry.status === "ok" ? "info" : "error",
-                  content: line,
-                  command: entry.command,
-                });
-              }
-            }
-            if (stdoutContent) addLog({ type: "output", content: stdoutContent, command: entry.command });
-            if (stderrContent) addLog({ type: "error", content: stderrContent, command: entry.command });
-            if (entry.autoFixAttempted && entry.secondRunSummary) {
-              addLog({
-                type: entry.secondRunStatus === "success" ? "info" : "error",
-                content: `[Auto-fix second run: ${entry.secondRunSummary}]`,
-                command: entry.command,
-              });
-            }
-          }
-        }
-        if (logEntries.length > 0) {
-          window.dispatchEvent(new CustomEvent("code-compass-show-terminal"));
-        }
-
-        // Update files
-        for (const path of finalResult.filesEdited ?? []) {
-          const fileRes = await fetch(`/api/workspaces/${workspaceId}/files?path=${encodeURIComponent(path)}`);
-          if (fileRes.ok) {
-            const fileData = await fileRes.json();
-            const content = fileData.content ?? "";
-            const tab = getTab(path);
-            if (tab) updateContent(path, content);
-            else openFile(path, content);
-          }
-        }
-
-        setPhase("done");
-        window.dispatchEvent(new CustomEvent("refresh-file-tree"));
-      } catch (e) {
-        if (e instanceof Error && e.name === "AbortError") {
-          if (stuckTimeoutAbortRef.current) {
-            stuckTimeoutAbortRef.current = false;
-            setError("Request timed out. The model may have stalled. Try Rerun to try again.");
-            setPhase("plan_ready");
-            return;
-          }
-          const cancelEvent: AgentEvent = {
-            id: `${Date.now()}`,
-            type: "status",
-            message: "Run cancelled by user",
-            createdAt: new Date().toISOString(),
-          };
-          setAgentEvents((prev) => [...prev, cancelEvent]);
-          setRunSummary((prev) => prev ? { ...prev, isComplete: true, wasCancelled: true } : {
-            editedFiles: new Set<string>(),
-            filesSkippedDueToConflict: new Set<string>(),
-            commandsRun: [],
-            reasoningCount: 0,
-            toolCallCount: 0,
-            toolResultCount: 0,
-            statusCount: 1,
-            isComplete: true,
-            wasCancelled: true,
-          });
-          setPhase("plan_ready");
-          return;
-        }
-        const errMsg = e instanceof Error ? e.message : "Execute failed";
-        if (/failed to fetch|network error|load failed|network request failed/i.test(errMsg)) {
-          setError("Connection lost during run. Check your network and try again.");
-        } else {
-          setError(errMsg);
-        }
-        setPhase("plan_ready");
-      } finally {
-        abortControllerRef.current = null;
-      }
-    },
-    [plan, workspaceId, provider, model, modelSelection, getTab, updateContent, openFile, addLog]
-  );
+  const { doExecute } = useAgentExecute({
+    workspaceId,
+    plan,
+    modelSelection,
+    provider,
+    model,
+    scopeMode,
+    setPhase,
+    setError,
+    setAgentEvents,
+    setRunSummary,
+    setExecuteResult,
+    setAgentReviewAccepted,
+    setProtectedPathsList,
+    setProtectedConfirmOpen,
+    setAggressiveConfirmOpen,
+    abortControllerRef,
+    stuckTimeoutAbortRef,
+    lastActivityRef,
+    addLog,
+    getTab,
+    updateContent,
+    openFile: (path, content) => openFile(path, content ?? ""),
+  });
 
   const approveAndExecute = useCallback(async () => {
     if (!plan || !workspaceId || phase !== "plan_ready") return;
@@ -1339,6 +781,11 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
             agentReviewAccepted={agentReviewAccepted}
             agentReviewApplying={agentReviewApplying}
             showAgentFeedback={showAgentFeedback}
+            canUndo={canUndo}
+            canRedo={canRedo}
+            onUndo={undo}
+            onRedo={redo}
+            onEditsApplied={refetchUndoRedo}
             onOpenFile={(path, content) => openFile(path, content ?? "")}
             onUpdateContent={updateContent}
             onSetExecuteResult={setExecuteResult}
