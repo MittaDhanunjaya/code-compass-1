@@ -4,7 +4,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { Send, Loader2, Sparkles, Check, ChevronDown, ChevronRight, GitPullRequest } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Dialog,
@@ -21,7 +20,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useEditor } from "@/lib/editor-context";
 import { useWorkspaceLabel } from "@/lib/use-workspace-label";
-import { PROVIDERS, PROVIDER_LABELS, OPENROUTER_FREE_MODELS, type ProviderId, type OpenRouterModelId } from "@/lib/llm/providers";
+import { PROVIDERS, PROVIDER_LABELS, OPENROUTER_FREE_MODELS, type ProviderId } from "@/lib/llm/providers";
 import { AgentPanel } from "@/components/agent-panel";
 import { ComposerPanel } from "@/components/composer-panel";
 import type { FileEditStep } from "@/lib/agent/types";
@@ -94,7 +93,7 @@ export function ChatPanel({
   const [debugSummary, setDebugSummary] = useState<string | null>(null);
   const [debugRootCause, setDebugRootCause] = useState<string | null>(null);
   const [debugReviewSteps, setDebugReviewSteps] = useState<DebugReviewStep[]>([]);
-  const [debugSandboxChecks, setDebugSandboxChecks] = useState<{ lint: { passed: boolean; logs: string }; tests: { passed: boolean; logs: string } } | null>(null);
+  const [debugSandboxChecks, setDebugSandboxChecks] = useState<import("@/lib/sandbox").SandboxCheckResult | null>(null);
   const [debugSelectedPaths, setDebugSelectedPaths] = useState<Set<string>>(new Set());
   const [debugExpandedPath, setDebugExpandedPath] = useState<string | null>(null);
   const [debugApplying, setDebugApplying] = useState(false);
@@ -310,7 +309,7 @@ export function ChatPanel({
   // Handle CMD+K actions
   useEffect(() => {
     const handleCmdKAction = (e: CustomEvent<{ action: string; selection: string; filePath: string }>) => {
-      const { action, selection, filePath } = e.detail;
+      const { action, selection } = e.detail;
       let prompt = "";
       
       switch (action) {
@@ -656,17 +655,18 @@ export function ChatPanel({
         setNoWorkspaceErrorLogNote(true);
       }
       if (!res.ok) {
-        const errorMsg = data.error || `Request failed: ${res.status}`;
+        const errorMsg = typeof data.error === "string" ? data.error : (data.error as { message?: string })?.message ?? `Request failed: ${res.status}`;
         if (errorMsg.includes("No API key configured") && provider === "openrouter") {
           throw new Error(`OpenRouter: No API key configured. Click 'Get free key' in API Keys settings to set it up.`);
         }
         throw new Error(`${PROVIDER_LABELS[provider]}: ${errorMsg}`);
       }
       if (data.error) {
-        if (data.error.includes("No API key configured") && provider === "openrouter") {
+        const errStr = typeof data.error === "string" ? data.error : String((data.error as { message?: string })?.message ?? data.error);
+        if (errStr.includes("No API key configured") && provider === "openrouter") {
           throw new Error(`OpenRouter: No API key configured. Click 'Get free key' in API Keys settings to set it up.`);
         }
-        throw new Error(`${PROVIDER_LABELS[provider]}: ${data.error}`);
+        throw new Error(`${PROVIDER_LABELS[provider]}: ${errStr}`);
       }
       if (data.usage) {
         const u = data.usage as {
@@ -697,10 +697,11 @@ export function ChatPanel({
           setUsageText(parts.join(" • "));
         }
       }
-      if (data.contextUsed && Array.isArray(data.contextUsed.filePaths)) {
+      const ctx = data.contextUsed as { filePaths?: string[]; rulesIncluded?: boolean } | undefined;
+      if (ctx && Array.isArray(ctx.filePaths)) {
         setLastContextUsed({
-          filePaths: data.contextUsed.filePaths,
-          rulesIncluded: !!data.contextUsed.rulesIncluded,
+          filePaths: ctx.filePaths,
+          rulesIncluded: !!ctx.rulesIncluded,
         });
       }
       let assistantContent = data.content as string;

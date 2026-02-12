@@ -1,19 +1,25 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
+import { checkRateLimit, getRateLimitIdentifier } from "@/lib/api-rate-limit";
+import { getDevBypassUser } from "@/lib/auth-dev-bypass";
 import { getProvider, getModelForProvider, OPENROUTER_FREE_MODELS, PROVIDERS, PROVIDER_LABELS, type ProviderId } from "@/lib/llm/providers";
 import { isRateLimitError } from "@/lib/llm/rate-limit";
-import type { AgentPlan } from "@/lib/agent/types";
+import type { AgentPlan, FileEditStep, CommandStep, PlanStep } from "@/lib/agent/types";
 import type { ScopeMode } from "@/lib/agent/types";
 import { computeRunScope, applyScopeCaps } from "@/lib/agent/scope";
 import { createAgentEvent, formatStreamEvent, type AgentEvent } from "@/lib/agent-events";
 import { detectErrorLogKind } from "@/lib/agent/error-log-utils";
-import { safeClose, safeEnqueue } from "@/lib/stream-utils";
+import { safeClose, safeEnqueue, shouldStopStream, STREAM_UPSTREAM_TIMEOUT_MS } from "@/lib/stream-utils";
 import { resolveWorkspaceId } from "@/lib/workspaces/active-workspace";
 import { loadRules, formatRulesForPrompt } from "@/lib/rules";
 import { buildIntelligentContext, formatIntelligentContext } from "@/lib/indexing/intelligent-context";
 import { learnCodebasePatterns, formatLearnedPatterns } from "@/lib/indexing/pattern-learning";
 import { multiStepReasoning } from "@/lib/agent/chain-of-thought";
 import { applyEnvRouting } from "@/lib/llm/task-routing";
+import { validateToolName, validateToolInput } from "@/services/tools/registry";
+import { agentPlanStreamBodySchema } from "@/lib/validation/schemas";
+import { validateBody, validateAgentPlanOutput } from "@/lib/validation";
 
 // Same system prompt as plan route, but with instruction to emit reasoning messages
 const PLAN_SYSTEM = `You are an intelligent coding agent planner. Your job is to understand the user's request, analyze the codebase, and create a plan that accomplishes the task.
@@ -118,36 +124,29 @@ function emitEvent(controller: ReadableStreamDefaultController, encoder: TextEnc
 }
 
 export async function POST(request: Request) {
-  const supabase = await createClient();
-  const { getDevBypassUser, getDevBypassConfigHint } = await import("@/lib/auth-dev-bypass");
-  const devUser = getDevBypassUser(request);
-  let user: { id: string } | null = devUser;
-  if (!user) {
-    const { data } = await supabase.auth.getUser();
-    user = data?.user ?? null;
+  let user: { id: string };
+  let supabase: Awaited<ReturnType<typeof createClient>>;
+  try {
+    const auth = await requireAuth(request);
+    user = auth.user;
+    supabase = auth.supabase;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
-  if (!user) {
-    const hint = getDevBypassConfigHint(request);
+
+  const rl = await checkRateLimit(getRateLimitIdentifier(request, user.id), "agent-plan-stream", 30);
+  if (!rl.ok) {
     return NextResponse.json(
-      { error: hint ?? "Unauthorized" },
-      { status: hint ? 400 : 401 }
+      { error: "Too many requests. Try again later.", retryAfter: rl.retryAfter },
+      { status: 429, headers: { "Retry-After": String(rl.retryAfter ?? 60) } }
     );
   }
 
-  let body: {
-    instruction?: string;
-    workspaceId?: string;
-    provider?: ProviderId;
-    model?: string;
-    modelId?: string;
-    modelGroupId?: string;
-    fileList?: string[];
-    fileContents?: Record<string, string>;
-    useIndex?: boolean;
-    scopeMode?: ScopeMode;
-  };
+  let rawBody: unknown;
   try {
-    body = await request.json();
+    rawBody = await request.json();
   } catch {
     return NextResponse.json(
       { error: "Invalid JSON body" },
@@ -155,14 +154,16 @@ export async function POST(request: Request) {
     );
   }
 
-  const instruction = (body.instruction ?? "").trim();
-  if (!instruction) {
+  const validation = validateBody(agentPlanStreamBodySchema, rawBody);
+  if (!validation.success) {
     return NextResponse.json(
-      { error: "instruction is required" },
+      { error: validation.error },
       { status: 400 }
     );
   }
+  const body = validation.data;
 
+  const instruction = body.instruction;
   const workspaceId = await resolveWorkspaceId(supabase, user.id, body.workspaceId);
   if (!workspaceId) {
     return NextResponse.json(
@@ -209,7 +210,7 @@ export async function POST(request: Request) {
               modelLabel: "OpenRouter (dev)",
               providerId: "openrouter" as ProviderId,
               modelSlug: "openrouter/free",
-              apiKey: process.env.DEV_OPENROUTER_API_KEY,
+              apiKey: devKey,
             }];
           }
         }
@@ -254,16 +255,17 @@ export async function POST(request: Request) {
         let userContent = `Instruction: ${instruction}`;
         
         // Index search
-        let indexedFiles: any[] = [];
+        let indexedFiles: { path: string; line?: number; preview?: string }[] = [];
         if (body.useIndex && workspaceId) {
-          emit(createAgentEvent('tool_call', 'Searching codebase index...', { toolName: 'search_index' }));
+          validateToolName("search_index");
           try {
             const searchTerms = instruction
               .split(/\s+/)
               .filter((w) => w.length > 3 && !/^(the|and|or|for|with|from)$/i.test(w))
               .slice(0, 5)
               .join(" ");
-            
+            validateToolInput("search_index", { query: searchTerms, workspaceId, limit: 15 });
+            emit(createAgentEvent('tool_call', 'Searching codebase index...', { toolName: 'search_index' }));
             if (searchTerms) {
               // Use semantic search API for better results
               const origin = request.headers.get("origin") || "http://localhost:3000";
@@ -271,12 +273,12 @@ export async function POST(request: Request) {
                 `${origin}/api/search?query=${encodeURIComponent(searchTerms)}&workspaceId=${workspaceId}&limit=15&semantic=true`
               );
               
-              let chunks: any[] = [];
+              let chunks: { file_path?: string; content?: string }[] = [];
               if (searchRes.ok) {
                 const searchData = await searchRes.json();
                 // Fetch full chunk content for results
                 if (searchData.results && searchData.results.length > 0) {
-                  const paths = [...new Set(searchData.results.map((r: any) => r.path))];
+                  const paths = [...new Set((searchData.results as { path?: string }[]).map((r) => r.path).filter(Boolean))];
                   const { data: fullChunks } = await supabase
                     .from("code_chunks")
                     .select("file_path, content, symbols, chunk_index")
@@ -330,7 +332,7 @@ export async function POST(request: Request) {
               }
             }
             emit(createAgentEvent('tool_result', `Found ${indexedFiles.length} relevant files in index`, { toolName: 'search_index' }));
-          } catch (e) {
+          } catch {
             emit(createAgentEvent('tool_result', 'Index search failed, continuing without it', { toolName: 'search_index' }));
           }
         }
@@ -344,7 +346,7 @@ export async function POST(request: Request) {
         const errorPatterns = [
           /(?:File|file|at)\s+["']?([^\s"']+\.(?:py|js|ts|tsx|jsx|java|rb|go|rs|cpp|c|h))["']?\s*(?:,\s*line\s+(\d+)|:\d+)/gi,
           /(?:in|at)\s+([^\s"']+\.(?:py|js|ts|tsx|jsx|java|rb|go|rs|cpp|c|h))(?:\s*:\s*(\d+))?/gi,
-          /Traceback.*?File\s+["']([^"']+)["'].*?line\s+(\d+)/gis,
+          /Traceback[\s\S]*?File\s+["']([^"']+)["'][\s\S]*?line\s+(\d+)/gi,
           /Error.*?([^\s"']+\.(?:py|js|ts|tsx|jsx))(?:\s*:\s*(\d+))?/gi,
         ];
         
@@ -472,11 +474,17 @@ export async function POST(request: Request) {
         }
 
         if (body.fileContents && Object.keys(body.fileContents).length > 0) {
+          validateToolName("read_file");
           emit(createAgentEvent('reasoning', `Reading ${Object.keys(body.fileContents).length} file(s)...`));
           userContent += "\n\nRelevant file contents (path -> content):\n";
           for (const [path, content] of Object.entries(body.fileContents)) {
+            try {
+              validateToolInput("read_file", { path });
+            } catch {
+              continue; // Skip invalid paths
+            }
             emit(createAgentEvent('tool_call', `Reading file ${path}`, { toolName: 'read_file', filePath: path }));
-            userContent += `\n--- ${path} ---\n${content.slice(0, 8000)}\n`;
+            userContent += `\n--- ${path} ---\n${String(content).slice(0, 8000)}\n`;
           }
         }
 
@@ -485,7 +493,7 @@ export async function POST(request: Request) {
         const provider = getProvider(providerId);
         const freeModelIds = OPENROUTER_FREE_MODELS.map((m) => m.id);
         const modelsToTry: string[] =
-          providerId === "openrouter" && resolvedModel && freeModelIds.includes(resolvedModel)
+          providerId === "openrouter" && resolvedModel && (freeModelIds as readonly string[]).includes(resolvedModel)
             ? [...freeModelIds]
             : resolvedModel
               ? [resolvedModel]
@@ -557,7 +565,7 @@ export async function POST(request: Request) {
               }
               if (reasoningResult.plan) {
                 const cotPlan = reasoningResult.plan;
-                const hasStringSteps = Array.isArray(cotPlan.steps) && cotPlan.steps.length > 0 && cotPlan.steps.every((s: any) => typeof s === "string");
+                const hasStringSteps = Array.isArray(cotPlan.steps) && cotPlan.steps.length > 0 && cotPlan.steps.every((s: unknown) => typeof s === "string");
                 if (hasStringSteps) {
                   emit(createAgentEvent('reasoning', `Reasoning returned text descriptions instead of step objects; using direct planning instead.`));
                   plan = null;
@@ -579,7 +587,7 @@ export async function POST(request: Request) {
         let raw = "";
         let buffer = "";
         let lastEmitTime = Date.now();
-        let usage: any = null;
+        let usage: { inputTokens?: number; outputTokens?: number } | null = null;
         
         if (!plan) {
           // Validate API key before attempting to call provider
@@ -598,6 +606,7 @@ export async function POST(request: Request) {
             raw = "";
             buffer = "";
             lastEmitTime = Date.now();
+            const streamStartTime = Date.now();
             usage = null;
             try {
             for await (const chunk of provider.stream(
@@ -608,6 +617,7 @@ export async function POST(request: Request) {
             apiKey,
             { model: tryModel, temperature: 0 }
           )) {
+            if (shouldStopStream(request, streamStartTime, STREAM_UPSTREAM_TIMEOUT_MS)) break;
             raw += chunk;
             buffer += chunk;
             
@@ -659,7 +669,7 @@ export async function POST(request: Request) {
               
               if (toEmit) {
                 // Clean up markdown code blocks
-                let cleaned = toEmit
+                const cleaned = toEmit
                   .replace(/^```json\s*/i, "")
                   .replace(/^```\s*/, "")
                   .replace(/\s*```$/, "")
@@ -716,7 +726,7 @@ export async function POST(request: Request) {
                   { model: tryModel }
                 );
                 raw = fallback.content;
-                usage = fallback.usage;
+                usage = fallback.usage ?? null;
                 modelUsed = tryModel;
                 streamDone = true;
               } catch (fallbackError) {
@@ -781,7 +791,7 @@ export async function POST(request: Request) {
           
           // First, try to parse JSON using robust parser (handles code blocks, single quotes, all providers)
           const { parseJSONRobust } = await import("@/lib/utils/json-parser");
-          const { logError } = await import("@/lib/utils/error-handler");
+          const { logError, createStructuredError } = await import("@/lib/utils/error-handler");
           
           let parseResult: { success: boolean; data: AgentPlan | null; error?: string; raw?: string };
           try {
@@ -830,10 +840,16 @@ export async function POST(request: Request) {
             }
           }
           
-          // If we successfully parsed JSON, use it
+          // If we successfully parsed JSON, validate schema and use it
           if (parseResult.success && parseResult.data) {
-            plan = parseResult.data;
-          } else {
+            const schemaValidation = validateAgentPlanOutput(parseResult.data);
+            if (schemaValidation.success) {
+              plan = schemaValidation.data;
+            } else {
+              parseResult = { success: false, data: null, error: schemaValidation.error, raw: parseResult.raw };
+            }
+          }
+          if (!plan) {
             // Only now check if it looks like code (and no JSON was found)
             const looksLikeCode = (
               trimmed.includes("margin:") ||
@@ -888,9 +904,12 @@ export async function POST(request: Request) {
                 const toParse = jsonMatch ? jsonMatch[0] : retryRaw;
                 if (toParse) {
                   const retryResult = parseJSONRobust<AgentPlan>(toParse, ["steps"]);
-                  if (retryResult.success && retryResult.data?.steps?.length) {
-                    plan = retryResult.data;
-                    emit(createAgentEvent('reasoning', 'Retry succeeded: got valid JSON plan.'));
+                  if (retryResult.success && retryResult.data) {
+                    const schemaCheck = validateAgentPlanOutput(retryResult.data);
+                    if (schemaCheck.success && schemaCheck.data.steps?.length) {
+                      plan = schemaCheck.data;
+                      emit(createAgentEvent('reasoning', 'Retry succeeded: got valid JSON plan.'));
+                    }
                   }
                 }
               } catch (retryErr) {
@@ -900,9 +919,12 @@ export async function POST(request: Request) {
 
             if (!plan) {
               logError(
-                `Plan JSON parse failed: ${parseResult.error}`,
-                { category: "parsing", severity: "high" },
-                { raw: parseResult.raw || trimmed.slice(0, 500), originalLength: trimmed.length }
+                createStructuredError(
+                  `Plan JSON parse failed: ${parseResult.error}`,
+                  "parsing",
+                  "high",
+                  { raw: parseResult.raw || trimmed.slice(0, 500), originalLength: trimmed.length }
+                )
               );
               emit(createAgentEvent('status', `Error: Failed to parse JSON plan. ${parseResult.error}`));
               emit(createAgentEvent('reasoning', `Parse error: ${parseResult.error}. Raw preview (first 500 chars): ${parseResult.raw || trimmed.slice(0, 500)}`));
@@ -931,9 +953,12 @@ export async function POST(request: Request) {
             if (retryRaw) {
               const { parseJSONRobust } = await import("@/lib/utils/json-parser");
               const retryResult = parseJSONRobust<AgentPlan>(retryRaw, ["steps"]);
-              if (retryResult.success && retryResult.data?.steps && Array.isArray(retryResult.data.steps) && retryResult.data.steps.length > 0) {
-                plan = retryResult.data;
-                emit(createAgentEvent('reasoning', `Retry succeeded: got ${plan.steps.length} step(s).`));
+              if (retryResult.success && retryResult.data) {
+                const schemaCheck = validateAgentPlanOutput(retryResult.data);
+                if (schemaCheck.success && schemaCheck.data.steps?.length) {
+                  plan = schemaCheck.data;
+                  emit(createAgentEvent('reasoning', `Retry succeeded: got ${plan.steps.length} step(s).`));
+                }
               }
             }
           } catch (retryErr) {
@@ -947,15 +972,15 @@ export async function POST(request: Request) {
           const steps = Array.isArray(p.steps) ? p.steps : [];
           const scriptUsed = new Set<string>();
           for (const s of steps) {
-            if (s?.type === "command" && typeof (s as any).command === "string") {
-              const m = (s as any).command.trim().match(/^npm\s+run\s+(\S+)/);
+            if (s?.type === "command" && typeof (s as CommandStep).command === "string") {
+              const m = (s as CommandStep).command.trim().match(/^npm\s+run\s+(\S+)/);
               if (m) scriptUsed.add(m[1]);
             }
           }
           if (scriptUsed.size === 0) return [];
           const packageJsonContent = steps
-            .filter((s: any) => s?.type === "file_edit" && (s.path === "package.json" || s.path?.endsWith("/package.json")))
-            .map((s: any) => (s.newContent || ""))
+            .filter((s: PlanStep): s is FileEditStep => s?.type === "file_edit" && (s.path === "package.json" || s.path?.endsWith("/package.json")))
+            .map((s) => (s.newContent || ""))
             .join("\n");
           const missing: string[] = [];
           for (const script of scriptUsed) {
@@ -988,11 +1013,14 @@ export async function POST(request: Request) {
               if (toParse) {
                 const { parseJSONRobust } = await import("@/lib/utils/json-parser");
                 const retryResult = parseJSONRobust<AgentPlan>(toParse, ["steps"]);
-                if (retryResult.success && retryResult.data?.steps?.length) {
-                  const stillMissing = missingNpmScripts(retryResult.data);
-                  if (stillMissing.length === 0) {
-                    plan = retryResult.data;
-                    emit(createAgentEvent('reasoning', `Plan corrected: package.json now defines required script(s).`));
+                if (retryResult.success && retryResult.data) {
+                  const schemaCheck = validateAgentPlanOutput(retryResult.data);
+                  if (schemaCheck.success && schemaCheck.data.steps?.length) {
+                    const stillMissing = missingNpmScripts(schemaCheck.data);
+                    if (stillMissing.length === 0) {
+                      plan = schemaCheck.data;
+                      emit(createAgentEvent('reasoning', `Plan corrected: package.json now defines required script(s).`));
+                    }
                   }
                 }
               }
@@ -1009,11 +1037,12 @@ export async function POST(request: Request) {
                 test: "vitest run",
               };
               try {
-                const pkgIdx = plan.steps.findIndex((st: any) => st?.type === "file_edit" && (st.path === "package.json" || st.path?.endsWith("/package.json")));
+                const pkgIdx = plan.steps.findIndex((st): st is FileEditStep => st?.type === "file_edit" && (st.path === "package.json" || st.path?.endsWith("/package.json")));
                 let pkg: Record<string, unknown>;
-                if (pkgIdx >= 0 && (plan.steps[pkgIdx] as any).newContent) {
+                const pkgStep = pkgIdx >= 0 ? (plan.steps[pkgIdx] as FileEditStep) : null;
+                if (pkgStep?.newContent) {
                   try {
-                    pkg = JSON.parse((plan.steps[pkgIdx] as any).newContent);
+                    pkg = JSON.parse(pkgStep.newContent);
                   } catch {
                     pkg = { name: "app", version: "1.0.0" };
                   }
@@ -1030,20 +1059,20 @@ export async function POST(request: Request) {
                 if (!pkg || typeof pkg !== "object") pkg = { name: "app", version: "1.0.0" };
                 if (!pkg.name) pkg.name = "app";
                 if (!pkg.version) pkg.version = "1.0.0";
-                const scripts = (pkg.scripts && typeof pkg.scripts === "object") ? { ...pkg.scripts } : {};
+                const scripts: Record<string, string> = (pkg.scripts && typeof pkg.scripts === "object") ? { ...(pkg.scripts as Record<string, string>) } : {};
                 for (const s of stillMissing) {
                   const cmd = defaultScripts[s as keyof typeof defaultScripts] || "echo 'Add script'";
                   scripts[s] = scripts[s] || cmd;
                   if (s === "dev" && cmd.startsWith("next ") && (!pkg.dependencies || !(pkg.dependencies as Record<string, string>).next)) {
-                    const deps = (pkg.dependencies && typeof pkg.dependencies === "object") ? { ...pkg.dependencies } : {};
+                    const deps: Record<string, string> = (pkg.dependencies && typeof pkg.dependencies === "object") ? { ...(pkg.dependencies as Record<string, string>) } : {};
                     deps.next = deps.next || "^14.0.0";
                     pkg.dependencies = deps;
                   }
                 }
                 pkg.scripts = scripts;
                 const newContent = JSON.stringify(pkg, null, 2);
-                if (pkgIdx >= 0) {
-                  (plan.steps[pkgIdx] as any).newContent = newContent;
+                if (pkgIdx >= 0 && pkgStep) {
+                  pkgStep.newContent = newContent;
                   emit(createAgentEvent('reasoning', `Patched package.json step to add scripts: ${stillMissing.join(", ")}`));
                 } else {
                   plan.steps.unshift({ type: "file_edit" as const, path: "package.json", newContent, description: `Add scripts: ${stillMissing.join(", ")}` });
@@ -1082,7 +1111,7 @@ export async function POST(request: Request) {
         }
         
         // Check if steps are strings (descriptions) instead of objects - common LLM mistake
-        const allStepsAreStrings = plan.steps.length > 0 && plan.steps.every((s: any) => typeof s === "string");
+        const allStepsAreStrings = plan.steps.length > 0 && plan.steps.every((s: unknown) => typeof s === "string");
         if (allStepsAreStrings && apiKey) {
           emit(createAgentEvent('status', 'Steps were plain text; retrying with hint for proper step objects...'));
           const hint = "\n\n[System: Your previous response had \"steps\" as an array of STRINGS (e.g. [\"Create file X\", \"Run npm install\"]). WRONG. Each step MUST be an OBJECT: {\"type\": \"file_edit\", \"path\": \"...\", \"newContent\": \"...\"} or {\"type\": \"command\", \"command\": \"...\"}. Output ONLY valid JSON with step objects.]";
@@ -1102,17 +1131,19 @@ export async function POST(request: Request) {
             if (toParse) {
               const { parseJSONRobust } = await import("@/lib/utils/json-parser");
               const retryResult = parseJSONRobust<AgentPlan>(toParse, ["steps"]);
-              const hasObjectSteps = retryResult.success && Array.isArray(retryResult.data?.steps) && retryResult.data.steps.length > 0 && retryResult.data.steps.every((s: any) => s && typeof s === "object");
-              if (hasObjectSteps) {
-                plan = retryResult.data;
-                emit(createAgentEvent('reasoning', 'Retry succeeded: got proper step objects.'));
+              if (retryResult.success && retryResult.data) {
+                const schemaCheck = validateAgentPlanOutput(retryResult.data);
+                if (schemaCheck.success && schemaCheck.data.steps?.length) {
+                  plan = schemaCheck.data;
+                  emit(createAgentEvent('reasoning', 'Retry succeeded: got proper step objects.'));
+                }
               }
             }
           } catch (retryErr) {
             console.warn("String-steps retry failed:", retryErr);
           }
         }
-        if (allStepsAreStrings && (!plan || plan.steps.some((s: any) => typeof s === "string"))) {
+        if (allStepsAreStrings && (!plan || plan.steps.some((s: unknown) => typeof s === "string"))) {
           emit(createAgentEvent('status', 'Error: Plan steps are plain text descriptions instead of step objects.'));
           emit(createAgentEvent('reasoning', 'Each step must be an OBJECT with type, path/newContent or command.'));
           safeClose(controller);
@@ -1120,8 +1151,12 @@ export async function POST(request: Request) {
         }
         
         // Validate that steps have required fields
-        const invalidSteps: Array<{ index: number; step: any; reason: string }> = [];
-        plan.steps.forEach((step: any, index: number) => {
+        if (!plan) {
+          safeClose(controller);
+          return;
+        }
+        const invalidSteps: Array<{ index: number; step: unknown; reason: string }> = [];
+        plan.steps.forEach((step: PlanStep, index: number) => {
           if (!step || typeof step !== "object") {
             invalidSteps.push({ 
               index, 
@@ -1168,16 +1203,17 @@ export async function POST(request: Request) {
               });
             }
           } else {
+            const stepType = (step as { type?: string }).type;
             invalidSteps.push({ 
               index, 
               step, 
-              reason: `Unknown step type: "${step.type}". Expected "file_edit" or "command". Step keys: [${stepKeys.join(", ")}]. Step data: ${stepPreview}` 
+              reason: `Unknown step type: "${stepType}". Expected "file_edit" or "command". Step keys: [${stepKeys.join(", ")}]. Step data: ${stepPreview}` 
             });
           }
         });
         
         // Filter out invalid steps
-        const validSteps = plan.steps.filter((step: any, index: number) => {
+        const validSteps = plan.steps.filter((step: PlanStep, index: number) => {
           return !invalidSteps.some(inv => inv.index === index);
         });
         
@@ -1215,7 +1251,7 @@ export async function POST(request: Request) {
           if (/^docs\//i.test(p) || /\.(md|mdx|txt)$/i.test(p)) return true;
           return false;
         };
-        const fileEditPaths = plan.steps.filter((s: any) => s.type === "file_edit").map((s: any) => (s.path || "").trim());
+        const fileEditPaths = plan.steps.filter((s): s is FileEditStep => s.type === "file_edit").map((s) => (s.path || "").trim());
         const hasNonDocsEdit = fileEditPaths.some((p: string) => !isDocsOnlyPath(p));
         if (looksLikeErrorFix && fileEditPaths.length > 0 && !hasNonDocsEdit) {
           emit(createAgentEvent('status', 'Warning: This looks like an error fix but the plan only touches documentation (e.g. README, .md). The fix should change code or config. Try rephrasing or ask to "fix the code" explicitly.'));
@@ -1233,7 +1269,7 @@ export async function POST(request: Request) {
           emit(createAgentEvent('status', capMessage, { scopeMode }));
         }
 
-        const fileEditSteps = plan.steps.filter((s: any) => s.type === "file_edit");
+        const fileEditSteps = plan.steps.filter((s): s is FileEditStep => s.type === "file_edit");
         const scope = computeRunScope(fileEditSteps);
         const modeLabel = scopeMode === "conservative" ? "Conservative" : scopeMode === "aggressive" ? "Aggressive" : "Normal";
         emit(createAgentEvent('status', `Planned changes: ${scope.fileCount} file(s), ≈${scope.approxLinesChanged} lines (mode: ${modeLabel}).`, {
@@ -1267,7 +1303,7 @@ export async function POST(request: Request) {
           ...(body.fileContents ? Object.keys(body.fileContents) : []),
         ])];
 
-        const fileEditStepsForScope = plan.steps.filter((s: any) => s.type === "file_edit");
+        const fileEditStepsForScope = plan.steps.filter((s): s is FileEditStep => s.type === "file_edit");
         const finalScope = computeRunScope(fileEditStepsForScope);
 
         // Send the plan as a final event (include model info for free-model fallback UI)

@@ -1,15 +1,20 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
 import { executeCommandInWorkspace } from "@/lib/agent/execute-command-server";
 import { resolveWorkspaceId } from "@/lib/workspaces/active-workspace";
 
 export async function POST(request: Request) {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  let user: { id: string };
+  let supabase: Awaited<ReturnType<typeof createClient>>;
+  try {
+    const auth = await requireAuth();
+    user = auth.user;
+    supabase = auth.supabase;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   let body: { workspaceId?: string; command?: string };

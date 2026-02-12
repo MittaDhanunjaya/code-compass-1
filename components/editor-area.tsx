@@ -1,5 +1,6 @@
 "use client";
 
+import type * as Monaco from "monaco-editor";
 import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { GitCompare, Save, Terminal, ArrowRight, List, Pencil } from "lucide-react";
@@ -455,7 +456,7 @@ export function EditorArea() {
           const fileData = await fileRes.json();
           content = fileData.content ?? "";
         }
-        fullEdits.push({ path: filePath, content: applyRenameEditsToContent(content, fileEdits) });
+        fullEdits.push({ path: filePath, content: applyRenameEditsToContent(content ?? "", fileEdits) });
       }
       const applyRes = await fetch(`/api/workspaces/${workspaceId}/agent/apply-edits`, {
         method: "POST",
@@ -729,25 +730,25 @@ export function EditorArea() {
                     id: "editor-action-explain",
                     label: "Explain",
                     contextMenuGroupId: "ai",
-                    run: () => window.dispatchEvent(new CustomEvent("open-cmd-k", { detail: { action: "explain" } })),
+                    run: () => { window.dispatchEvent(new CustomEvent("open-cmd-k", { detail: { action: "explain" } })); },
                   });
                   editor.addAction({
                     id: "editor-action-refactor",
                     label: "Refactor",
                     contextMenuGroupId: "ai",
-                    run: () => window.dispatchEvent(new CustomEvent("open-cmd-k", { detail: { action: "refactor" } })),
+                    run: () => { window.dispatchEvent(new CustomEvent("open-cmd-k", { detail: { action: "refactor" } })); },
                   });
                   editor.addAction({
                     id: "editor-action-add-tests",
                     label: "Add tests",
                     contextMenuGroupId: "ai",
-                    run: () => window.dispatchEvent(new CustomEvent("open-cmd-k", { detail: { action: "test" } })),
+                    run: () => { window.dispatchEvent(new CustomEvent("open-cmd-k", { detail: { action: "test" } })); },
                   });
                   editor.addAction({
                     id: "editor-action-fix-error",
                     label: "Fix error",
                     contextMenuGroupId: "ai",
-                    run: () => window.dispatchEvent(new CustomEvent("open-cmd-k", { detail: { action: "fix" } })),
+                    run: () => { window.dispatchEvent(new CustomEvent("open-cmd-k", { detail: { action: "fix" } })); },
                   });
                   editor.addAction({
                     id: "editor-action-fix-diagnostics",
@@ -832,7 +833,7 @@ export function EditorArea() {
                     {
                       displayName: "AIForge Tab",
                       debounceDelayMs: TAB_COMPLETION_DEBOUNCE_MS,
-                      provideInlineCompletions: async (model, position, _context, token) => {
+                      provideInlineCompletions: async (model: Monaco.editor.ITextModel, position: Monaco.Position, _context: Monaco.languages.InlineCompletionContext, token: Monaco.CancellationToken) => {
                         const ctx = tabCompletionContextRef.current;
                         if (!ctx.workspaceId) return { items: [] };
                         const lineCount = model.getLineCount();

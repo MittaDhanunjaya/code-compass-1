@@ -37,7 +37,7 @@ function createMockSupabase(overrides: {
 
   const supabaseFull = {
     from: fromImpl,
-  } as any;
+  } as import("@supabase/supabase-js").SupabaseClient;
 
   return { supabase: supabaseFull, userState, workspaceFetch, upsertError };
 }

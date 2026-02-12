@@ -33,7 +33,7 @@ export async function PATCH(
     updated_at: new Date().toISOString(),
   };
   if (typeof body.enabled === "boolean") updates.enabled = body.enabled;
-  if (body.aliasLabel !== undefined) updates.alias_label = String(body.aliasLabel).trim() || null;
+  if (body.aliasLabel !== undefined) updates.alias_label = String(body.aliasLabel).trim() || undefined;
 
   const { data, error } = await supabase
     .from("user_models")

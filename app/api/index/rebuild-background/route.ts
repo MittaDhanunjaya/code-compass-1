@@ -9,11 +9,11 @@ import { createClient } from "@/lib/supabase/server";
 import { chunkFileEnhanced } from "@/lib/indexing/enhanced-chunker";
 import { hashContent } from "@/lib/indexing/chunker";
 import { decrypt } from "@/lib/encrypt";
-import { getProvider, type ProviderId } from "@/lib/llm/providers";
+import type { ProviderId } from "@/lib/llm/providers";
 import { supportsEmbeddings } from "@/lib/llm/embeddings";
 import { buildMerkleTree, getMerkleRoot, serializeMerkleTree } from "@/lib/indexing/merkle";
 import { generateEmbeddingsParallel } from "@/lib/indexing/parallel-embeddings";
-import { logError } from "@/lib/utils/error-handler";
+import { logError, createStructuredError } from "@/lib/utils/error-handler";
 
 export async function POST(request: Request) {
   const supabase = await createClient();
@@ -61,9 +61,7 @@ export async function POST(request: Request) {
   indexWorkspaceBackground(supabase, workspaceId, user.id, body.provider ?? "openrouter", body.generateEmbeddings !== false)
     .catch((error) => {
       logError(
-        "Background indexing failed",
-        { category: "execution", severity: "high" },
-        { workspaceId, error }
+        createStructuredError("Background indexing failed", "execution", "high", { workspaceId, error })
       );
     });
 
@@ -79,7 +77,7 @@ export async function POST(request: Request) {
  * Background indexing worker.
  */
 async function indexWorkspaceBackground(
-  supabase: any,
+  supabase: Awaited<ReturnType<typeof createClient>>,
   workspaceId: string,
   userId: string,
   providerId: ProviderId,
@@ -146,7 +144,6 @@ async function indexWorkspaceBackground(
       .delete()
       .eq("workspace_id", workspaceId);
 
-    let totalChunks = 0;
     let indexedFiles = 0;
     const totalFiles = files?.length || 0;
 
@@ -157,7 +154,7 @@ async function indexWorkspaceBackground(
 
       // Process batch in parallel
       await Promise.all(
-        batch.map(async (file: any) => {
+        batch.map(async (file: { path: string; content?: string | null }) => {
           const path = file.path;
           const content = file.content ?? "";
 
@@ -183,9 +180,12 @@ async function indexWorkspaceBackground(
               );
             } catch (error) {
               logError(
-                `Failed to generate embeddings for ${path}`,
-                { category: "api", severity: "medium" },
-                { error, filePath: path }
+                createStructuredError(
+                  `Failed to generate embeddings for ${path}`,
+                  "api",
+                  "medium",
+                  { error, filePath: path }
+                )
               );
             }
           }
@@ -204,7 +204,6 @@ async function indexWorkspaceBackground(
               embedding,
             });
 
-            totalChunks++;
           }
 
           // Update metadata
@@ -234,7 +233,7 @@ async function indexWorkspaceBackground(
     // Update Merkle tree
     if (files && files.length > 0) {
       const merkleTree = buildMerkleTree(
-        files.map((f: any) => ({ path: f.path, content: f.content ?? "" }))
+        files.map((f: { path: string; content?: string | null }) => ({ path: f.path, content: f.content ?? "" }))
       );
       const merkleRoot = getMerkleRoot(merkleTree);
       const merkleTreeJson = serializeMerkleTree(merkleTree);

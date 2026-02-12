@@ -19,15 +19,15 @@ export type CodeChunk = {
 };
 
 const CHUNK_SIZE_LINES = 100; // Simple: chunk every 100 lines
-const MAX_CHUNK_SIZE = 5000; // Max characters per chunk
+const _MAX_CHUNK_SIZE = 5000; // Max characters per chunk
 
 /**
  * Extract symbols (functions, classes, exports) from TS/JS code.
  */
 export function extractSymbols(content: string, filePath: string): SymbolInfo[] {
   const symbols: SymbolInfo[] = [];
-  const lines = content.split("\n");
-  const isTS = filePath.endsWith(".ts") || filePath.endsWith(".tsx");
+  const _lines = content.split("\n");
+  const _isTS = filePath.endsWith(".ts") || filePath.endsWith(".tsx");
 
   // Match function declarations: function name(...) or const name = (...) =>
   const functionRegex = /^(export\s+)?(async\s+)?function\s+(\w+)\s*\(/gm;

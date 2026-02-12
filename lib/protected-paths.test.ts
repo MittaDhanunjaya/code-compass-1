@@ -7,7 +7,6 @@ import {
   getProtectedPaths,
   checkOverEdit,
   OVER_EDIT_RATIO_THRESHOLD,
-  DEFAULT_PROTECTED_PATTERNS,
 } from "./protected-paths";
 
 describe("isProtectedPath", () => {

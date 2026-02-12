@@ -55,7 +55,7 @@ class SimpleCache<T> {
 
 // Cache instances
 export const tabCompletionCache = new SimpleCache<string>(500); // 500 entries, 30s TTL
-export const searchCache = new SimpleCache<{ results: any[]; count: number }>(200); // 200 entries, 5min TTL
+export const searchCache = new SimpleCache<{ results: unknown[]; count: number }>(200); // 200 entries, 5min TTL
 export const embeddingCache = new SimpleCache<number[][]>(100); // 100 entries, 1hr TTL
 
 /**

@@ -66,7 +66,7 @@ export default function WorkspaceSettingsPage() {
 }
 
 function TabLink({
-  id,
+  id: _id,
   label,
   icon,
   active,

@@ -66,6 +66,6 @@ describe("JSON Parser - Position 237 Error Fix", () => {
     const result = parseJSONRobust(json, ["steps"]);
     expect(result.success).toBe(true);
     expect(result.data).toHaveProperty("steps");
-    expect((result.data as any).steps.length).toBeGreaterThan(0);
+    expect((result.data as { steps: unknown[] }).steps.length).toBeGreaterThan(0);
   });
 });

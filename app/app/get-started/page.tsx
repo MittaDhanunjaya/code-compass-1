@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Check, ChevronRight, Key, FolderOpen, Command } from "lucide-react";
+import { ChevronRight, Key, FolderOpen, Command } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
 export default function GetStartedPage() {

@@ -44,7 +44,7 @@ export async function PATCH(
     updated_at: new Date().toISOString(),
   };
   if (body.label !== undefined) updates.label = String(body.label).trim();
-  if (body.description !== undefined) updates.description = String(body.description).trim() || null;
+  if (body.description !== undefined) updates.description = String(body.description).trim() || undefined;
 
   if (Object.keys(updates).length > 1) {
     const { error } = await supabase

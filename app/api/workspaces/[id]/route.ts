@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { workspacesUpdateBodySchema } from "@/lib/validation/schemas";
+import { validateBody } from "@/lib/validation";
 
 type RouteParams = { params: Promise<{ id: string }> };
 
@@ -38,17 +40,19 @@ export async function GET(
         .eq("id", id)
         .eq("owner_id", user.id)
         .single();
-      data = retry2.data;
+      data = retry2.data as typeof data;
       error = retry2.error;
       if (data) {
         // Add defaults for missing columns
-        (data as any).safe_edit_mode = true;
-        (data as any).github_repo_url = null;
-        (data as any).github_default_branch = null;
-        (data as any).github_owner = null;
-        (data as any).github_repo = null;
-        (data as any).github_is_private = null;
-        (data as any).github_current_branch = null;
+        Object.assign(data, {
+          safe_edit_mode: true,
+          github_repo_url: null,
+          github_default_branch: null,
+          github_owner: null,
+          github_repo: null,
+          github_is_private: null,
+          github_current_branch: null,
+        });
       }
     } else {
       // Try without github_current_branch first
@@ -67,20 +71,21 @@ export async function GET(
           .eq("id", id)
           .eq("owner_id", user.id)
           .single();
-        data = retry2.data;
+        data = retry2.data as typeof data;
         error = retry2.error;
         if (data) {
-          // Add defaults for missing columns
-          (data as any).safe_edit_mode = true;
-          (data as any).github_repo_url = null;
-          (data as any).github_default_branch = null;
-          (data as any).github_owner = null;
-          (data as any).github_repo = null;
-          (data as any).github_is_private = null;
-          (data as any).github_current_branch = null;
+          Object.assign(data, {
+            safe_edit_mode: true,
+            github_repo_url: null,
+            github_default_branch: null,
+            github_owner: null,
+            github_repo: null,
+            github_is_private: null,
+            github_current_branch: null,
+          });
         }
       } else {
-        data = retry1.data;
+        data = retry1.data as typeof data;
         error = retry1.error;
         if (data) {
           data.github_current_branch = null;
@@ -107,15 +112,18 @@ export async function GET(
     if (minimalRetry.error || !minimalRetry.data) {
       return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
     }
-    data = minimalRetry.data;
-    // Add defaults
-    (data as any).safe_edit_mode = true;
-    (data as any).github_repo_url = null;
-    (data as any).github_default_branch = null;
-    (data as any).github_owner = null;
-    (data as any).github_repo = null;
-    (data as any).github_is_private = null;
-    (data as any).github_current_branch = null;
+    data = minimalRetry.data as typeof data;
+    if (data) {
+      Object.assign(data, {
+        safe_edit_mode: true,
+        github_repo_url: null,
+        github_default_branch: null,
+        github_owner: null,
+        github_repo: null,
+        github_is_private: null,
+        github_current_branch: null,
+      });
+    }
   }
 
   if (!data) {
@@ -138,15 +146,21 @@ export async function PATCH(
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  let body: { name?: string; safe_edit_mode?: boolean };
+  let rawBody: unknown;
   try {
-    body = await request.json();
+    rawBody = await request.json();
   } catch {
     return NextResponse.json(
       { error: "Invalid JSON body" },
       { status: 400 }
     );
   }
+
+  const validation = validateBody(workspacesUpdateBodySchema, rawBody);
+  if (!validation.success) {
+    return NextResponse.json({ error: validation.error }, { status: 400 });
+  }
+  const body = validation.data;
 
   const updates: { name?: string; safe_edit_mode?: boolean; updated_at: string } = {
     updated_at: new Date().toISOString(),
@@ -181,7 +195,7 @@ export async function PATCH(
       .eq("id", id)
       .eq("owner_id", user.id)
       .single();
-    data = retry.data;
+    data = retry.data as typeof data;
     error = retry.error;
     if (data) {
       data.github_current_branch = null;

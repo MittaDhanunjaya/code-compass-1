@@ -21,7 +21,7 @@ export type ParseResult<T> = {
  * - Unescaped quotes in strings
  * - Single quotes instead of double quotes
  */
-export function parseJSONRobust<T = any>(
+export function parseJSONRobust<T = unknown>(
   content: string,
   expectedKeys?: string[]
 ): ParseResult<T> {
@@ -99,7 +99,7 @@ export function parseJSONRobust<T = any>(
     // No JSON found at all - try one more time with single-quote normalized content (Perplexity etc.)
     const normalized = fixSingleQuotes(content.trim().replace(/^\uFEFF/, ""));
     const retry = parseJSONRobust(normalized, expectedKeys);
-    if (retry.success) return retry;
+    if (retry.success) return retry as ParseResult<T>;
     return {
       success: false,
       data: null,
@@ -157,7 +157,7 @@ export function parseJSONRobust<T = any>(
         data: parsed as T,
         raw: cleanedAgain.slice(0, 500),
       };
-    } catch (secondError) {
+    } catch (_secondError) {
       // Try fixing missing commas and control characters
       try {
         let fixed = fixMissingCommas(jsonStr);
@@ -193,8 +193,8 @@ function extractBalancedJSON(content: string, startIdx: number): string | null {
   let stringChar: '"' | "'" | null = null; // which quote opened the string
   let escapeNext = false;
   const isArray = content[startIdx] === "[";
-  const openChar = isArray ? "[" : "{";
-  const closeChar = isArray ? "]" : "}";
+  const _openChar = isArray ? "[" : "{";
+  const _closeChar = isArray ? "]" : "}";
 
   for (let i = startIdx; i < content.length; i++) {
     const char = content[i];
@@ -680,7 +680,7 @@ function fixMissingCommas(jsonStr: string): string {
 /**
  * Extract multiple JSON objects from content.
  */
-export function extractMultipleJSON<T = any>(content: string): T[] {
+export function extractMultipleJSON<T = unknown>(content: string): T[] {
   const results: T[] = [];
   let startIdx = 0;
   

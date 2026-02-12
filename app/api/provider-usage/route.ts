@@ -33,7 +33,7 @@ async function getOpenAIUsage(apiKey: string): Promise<UsageSummary> {
       };
     }
     const data = await res.json();
-    const total = (data as any)?.total_usage;
+    const total = (data as { total_usage?: number })?.total_usage;
     const detail =
       typeof total === "number"
         ? `Approx. usage in last 24h: ${total} units (see OpenAI dashboard for details).`

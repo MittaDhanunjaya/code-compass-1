@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { Download, FolderOpen, Github, GitBranch, GitPullRequest, MoreHorizontal, Pencil, Plus, RefreshCw, Settings, Shield, Trash2 } from "lucide-react";
 import { KeyboardShortcutsPanel } from "@/components/keyboard-shortcuts-panel";
@@ -98,7 +98,7 @@ export function WorkspaceSelector() {
   const [testsFailingForWorkspace, setTestsFailingForWorkspace] = useState<string | null>(null);
   const [savingSafeEdit, setSavingSafeEdit] = useState(false);
   const [resyncing, setResyncing] = useState(false);
-  const [supportsFolderPicker] = useState(() => typeof window !== "undefined" && typeof (window as any).showDirectoryPicker === "function");
+  const [supportsFolderPicker] = useState(() => typeof window !== "undefined" && typeof (window as Window & { showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker === "function");
   const [localFolderWorkspaceId, setLocalFolderWorkspaceId] = useState<string | null>(null);
   const lastLocalFolderRef = useRef<{ workspaceId: string; handle: FileSystemDirectoryHandle } | null>(null);
 
@@ -198,12 +198,14 @@ export function WorkspaceSelector() {
 
   async function handlePickLocalFolder() {
     setError(null);
-    if (typeof (window as any).showDirectoryPicker === "function") {
+    if (typeof (window as Window & { showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker === "function") {
       try {
-        const dir = await (window as any).showDirectoryPicker();
+        const dir = await (window as unknown as { showDirectoryPicker: () => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker();
         const files: Array<{ path: string; content: string }> = [];
-        async function walk(handle: any, prefix: string) {
-          for await (const [name, entry] of handle.entries()) {
+        async function walk(handle: FileSystemDirectoryHandle | FileSystemFileHandle, prefix: string) {
+          if (handle.kind !== "directory") return;
+          const dirHandle = handle as unknown as { entries(): AsyncIterableIterator<[string, FileSystemFileHandle | FileSystemDirectoryHandle]> };
+          for await (const [name, entry] of dirHandle.entries()) {
             const path = prefix ? `${prefix}/${name}` : name;
             if (entry.kind === "file") {
               try {
@@ -238,7 +240,8 @@ export function WorkspaceSelector() {
     try {
       const files: Array<{ path: string; content: string }> = [];
       async function walk(handle: FileSystemDirectoryHandle, prefix: string) {
-        for await (const [name, entry] of handle.entries()) {
+        const dirHandle = handle as unknown as { entries(): AsyncIterableIterator<[string, FileSystemFileHandle | FileSystemDirectoryHandle]> };
+        for await (const [name, entry] of dirHandle.entries()) {
           const path = prefix ? `${prefix}/${name}` : name;
           if (entry.kind === "file") {
             try {
@@ -579,7 +582,7 @@ export function WorkspaceSelector() {
             >
               <FolderOpen className="h-4 w-4 shrink-0" />
               {ws.github_repo_url && (
-                <Github className="h-3.5 w-3.5 shrink-0 text-muted-foreground" title="Linked to GitHub" />
+                <span title="Linked to GitHub"><Github className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /></span>
               )}
               <span className="truncate">{ws.name}</span>
             </button>
@@ -777,7 +780,7 @@ export function WorkspaceSelector() {
                       Or upload a folder (one-time):{" "}
                       <input
                         type="file"
-                        {...({ webkitdirectory: "", directory: "" } as any)}
+                        {...({ webkitdirectory: "", directory: "" } as React.HTMLAttributes<HTMLInputElement>)}
                         multiple
                         className="text-xs"
                         onChange={async (e) => {
@@ -786,7 +789,7 @@ export function WorkspaceSelector() {
                           const files: Array<{ path: string; content: string }> = [];
                           for (let i = 0; i < Math.min(fileList.length, 500); i++) {
                             const f = fileList[i];
-                            const path = (f as any).webkitRelativePath?.replace(/^[^/]+\//, "") || f.name;
+                            const path = (f as File & { webkitRelativePath?: string }).webkitRelativePath?.replace(/^[^/]+\//, "") || f.name;
                             try {
                               const content = await f.text();
                               files.push({ path, content: content.slice(0, 500_000) });
@@ -811,7 +814,7 @@ export function WorkspaceSelector() {
                     <p className="text-xs font-medium text-muted-foreground">Upload folder</p>
                     <input
                       type="file"
-                      {...({ webkitdirectory: "", directory: "" } as any)}
+                      {...({ webkitdirectory: "", directory: "" } as React.HTMLAttributes<HTMLInputElement>)}
                       multiple
                       className="block w-full text-xs"
                       onChange={async (e) => {
@@ -820,7 +823,7 @@ export function WorkspaceSelector() {
                         const files: Array<{ path: string; content: string }> = [];
                         for (let i = 0; i < Math.min(fileList.length, 500); i++) {
                           const f = fileList[i];
-                          const path = (f as any).webkitRelativePath?.replace(/^[^/]+\//, "") || f.name;
+                          const path = (f as File & { webkitRelativePath?: string }).webkitRelativePath?.replace(/^[^/]+\//, "") || f.name;
                           try {
                             const content = await f.text();
                             files.push({ path, content: content.slice(0, 500_000) });

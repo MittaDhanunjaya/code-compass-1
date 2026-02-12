@@ -2,21 +2,32 @@
  * Debug endpoint to check API key status
  * GET /api/debug/provider-keys
  * Returns which providers have keys configured (without exposing the keys)
+ *
+ * RESTRICTIONS: Blocked in production. Requires admin role. Never returns or logs secrets.
  */
 
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { decrypt } from "@/lib/encrypt";
-import { PROVIDERS, PROVIDER_LABELS, type ProviderId } from "@/lib/llm/providers";
+import { isAdmin } from "@/lib/auth/admin";
+import { PROVIDERS } from "@/lib/llm/providers";
 
 export async function GET() {
+  if (process.env.NODE_ENV !== "development") {
+    return NextResponse.json({ error: "Not Found" }, { status: 404 });
+  }
+
   const supabase = await createClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();
-  
+
   if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  if (!isAdmin(user.id)) {
+    return NextResponse.json({ error: "Forbidden: Admin access required" }, { status: 403 });
   }
 
   const results: Record<string, {
@@ -58,8 +69,8 @@ export async function GET() {
     try {
       decrypt(keyRow.key_encrypted);
       canDecrypt = true;
-    } catch (e) {
-      decryptError = e instanceof Error ? e.message : String(e);
+    } catch {
+      decryptError = "decrypt failed";
     }
 
     results[provider] = {
@@ -73,7 +84,7 @@ export async function GET() {
   return NextResponse.json({
     userId: user.id,
     encryptionKeySet: !!process.env.ENCRYPTION_KEY,
-    encryptionKeyLength: process.env.ENCRYPTION_KEY?.length || 0,
+    encryptionKeyLength: process.env.ENCRYPTION_KEY?.length ?? 0,
     providers: results,
   });
 }

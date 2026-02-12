@@ -3,24 +3,36 @@
  * Used by the GitHub Action template so teams can integrate Code Compass into CI.
  *
  * Auth: When CODE_COMPASS_CI_TOKEN is set, require Authorization: Bearer <token>.
+ *       When not set, require Supabase user auth (same as other protected routes).
  * Workspace: workspaceId via query (?workspaceId=) or X-Workspace-Id header.
  * Body: { logText: string }. Returns { suspectedRootCause, explanation, edits } (no apply).
  */
 
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
 import { runDebugFromLog } from "@/lib/debug-from-log-core";
 
 export async function POST(request: Request) {
   const workspaceId =
     request.headers.get("x-workspace-id") ??
     new URL(request.url).searchParams.get("workspaceId");
-  const auth = request.headers.get("authorization");
-  const token = auth?.startsWith("Bearer ") ? auth.slice(7) : null;
+  const authHeader = request.headers.get("authorization");
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
 
   const ciToken = process.env.CODE_COMPASS_CI_TOKEN;
-  if (ciToken && token !== ciToken) {
-    return NextResponse.json({ error: "Invalid CI token" }, { status: 401 });
+  if (ciToken) {
+    if (token !== ciToken) {
+      return NextResponse.json({ error: "Invalid CI token" }, { status: 401 });
+    }
+  } else {
+    try {
+      await requireAuth();
+    } catch (e) {
+      const res = withAuthResponse(e);
+      if (res) return res;
+      throw e;
+    }
   }
 
   if (!workspaceId || typeof workspaceId !== "string" || !workspaceId.trim()) {

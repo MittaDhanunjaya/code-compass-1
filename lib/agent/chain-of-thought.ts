@@ -94,11 +94,14 @@ Think through this problem step by step. Break it down into logical reasoning st
 
   if (!parseResult.success) {
     // Log error but don't throw - return empty reasoning
-    const { logError } = await import("../utils/error-handler");
+    const { logError, createStructuredError } = await import("../utils/error-handler");
     logError(
-      `Chain-of-thought JSON parsing failed: ${parseResult.error}`,
-      { category: "parsing", severity: "medium" },
-      { raw: parseResult.raw }
+      createStructuredError(
+        `Chain-of-thought JSON parsing failed: ${parseResult.error}`,
+        "parsing",
+        "medium",
+        { raw: parseResult.raw }
+      )
     );
 
     return {
@@ -126,7 +129,7 @@ export async function multiStepReasoning(
     providerId: ProviderId;
     model?: string;
   },
-  maxSteps: number = 5
+  _maxSteps: number = 5
 ): Promise<{
   reasoning: ChainOfThought;
   plan: AgentPlan | null;

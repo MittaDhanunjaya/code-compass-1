@@ -6,8 +6,8 @@
 
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { getProvider, getModelForProvider, PROVIDERS, type ProviderId } from "@/lib/llm/providers";
-import { invokeChat } from "@/lib/llm/invoke";
+import { getModelForProvider, PROVIDERS, type ProviderId } from "@/lib/llm/providers";
+import { invokeChat } from "@/lib/llm/router";
 import { resolveWorkspaceId } from "@/lib/workspaces/active-workspace";
 import { decrypt } from "@/lib/encrypt";
 
@@ -86,13 +86,21 @@ export async function POST(request: Request) {
       providerId: resolvedProvider,
       model: modelOpt,
       task: "review",
+      userId: user.id,
+      workspaceId: workspaceId ?? undefined,
+      supabase,
     });
     content = response?.content ?? "";
   } catch (e) {
+    const err = e as Error & { statusCode?: number; retryAfter?: number };
+    const status = err.statusCode === 429 ? 429 : 502;
     console.error("PR analyze error:", e);
+    const headers: Record<string, string> = {};
+    if (status === 429 && err.retryAfter)
+      headers["Retry-After"] = String(err.retryAfter);
     return NextResponse.json(
-      { error: e instanceof Error ? e.message : "Analysis failed" },
-      { status: 502 }
+      { error: err instanceof Error ? err.message : "Analysis failed" },
+      { status, headers }
     );
   }
 

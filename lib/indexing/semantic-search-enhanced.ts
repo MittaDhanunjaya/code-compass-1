@@ -4,8 +4,8 @@
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { buildFileDependencyGraph, findSymbolReferences } from "./symbol-graph";
-import { getProvider, type ProviderId } from "@/lib/llm/providers";
+import { buildFileDependencyGraph, findSymbolReferences, type SymbolReference } from "./symbol-graph";
+import { type ProviderId } from "@/lib/llm/providers";
 import { supportsEmbeddings, generateEmbeddings } from "@/lib/llm/embeddings";
 import { decrypt } from "@/lib/encrypt";
 
@@ -33,8 +33,6 @@ export async function enhancedSemanticSearch(
   userId: string,
   limit: number = 10
 ): Promise<EnhancedSearchResult[]> {
-  const results: EnhancedSearchResult[] = [];
-  
   // Step 1: Get API key for embeddings
   let apiKey: string | null = null;
   let providerId: ProviderId = "openrouter";
@@ -69,7 +67,7 @@ export async function enhancedSemanticSearch(
   }
 
   // Step 2: Vector similarity search (if embeddings available)
-  let vectorResults: any[] = [];
+  let vectorResults: Array<{ file_path: string; chunk_index?: number; content?: string; similarity?: number; symbols?: Array<{ name?: string }> }> = [];
   if (apiKey && supportsEmbeddings(providerId)) {
     try {
       const queryEmbeddings = await generateEmbeddings([query], apiKey, providerId);
@@ -98,7 +96,7 @@ export async function enhancedSemanticSearch(
   const dependencyGraph = await buildFileDependencyGraph(supabase, workspaceId);
 
   // Step 5: Find symbol references if query mentions symbols
-  const symbolReferencesMap = new Map<string, any[]>();
+  const symbolReferencesMap = new Map<string, SymbolReference[]>();
   for (const symbol of potentialSymbols) {
     const refs = await findSymbolReferences(supabase, workspaceId, symbol);
     if (refs.length > 0) {
@@ -127,7 +125,7 @@ export async function enhancedSemanticSearch(
         preview: preview.slice(0, 500),
         relevanceScore: score,
         reason: "Semantic similarity to query",
-        relatedSymbols: (chunk.symbols || []).map((s: any) => s.name).slice(0, 5),
+        relatedSymbols: (chunk.symbols || []).map((s) => s.name).filter((n): n is string => typeof n === "string").slice(0, 5),
       });
     }
   }

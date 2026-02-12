@@ -4,7 +4,6 @@
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { buildFileDependencyGraph } from "./symbol-graph";
 
 export type CodebasePattern = {
   type: "import_pattern" | "naming_convention" | "file_structure" | "config_pattern";

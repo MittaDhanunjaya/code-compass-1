@@ -77,7 +77,7 @@ export async function GET(_request: Request, { params }: RouteParams) {
     .substring(0, 50);
 
   // Return ZIP file as download
-  return new NextResponse(zipBuffer, {
+  return new NextResponse(new Uint8Array(zipBuffer), {
     headers: {
       "Content-Type": "application/zip",
       "Content-Disposition": `attachment; filename="${safeName}-${workspaceId.substring(0, 8)}.zip"`,

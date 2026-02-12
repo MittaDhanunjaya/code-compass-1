@@ -18,11 +18,10 @@ export type FileContext = {
  */
 export function extractImports(content: string, language: string): string[] {
   const imports: string[] = [];
-  
+  let match: RegExpExecArray | null;
   if (language === "typescript" || language === "javascript" || language === "tsx" || language === "jsx") {
     // ES6 imports: import ... from "..."
     const es6ImportRegex = /import\s+(?:(?:\{[^}]*\}|\*\s+as\s+\w+|\w+)(?:\s*,\s*(?:\{[^}]*\}|\*\s+as\s+\w+|\w+))*\s+from\s+)?["']([^"']+)["']/g;
-    let match;
     while ((match = es6ImportRegex.exec(content)) !== null) {
       if (match[1]) imports.push(match[1]);
     }

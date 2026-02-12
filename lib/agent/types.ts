@@ -69,6 +69,19 @@ export type AgentLogEntry = {
   statusLine?: string;
 };
 
+/** Sandbox check result (lint, tests, run). */
+export type SandboxCheckItem = {
+  status: "passed" | "failed" | "skipped" | "not_configured";
+  logs?: string;
+};
+
+/** Pending review file edit. */
+export type PendingReviewEdit = {
+  path: string;
+  originalContent?: string;
+  newContent: string;
+};
+
 /** Result of running the agent execution loop. */
 export type AgentExecuteResult = {
   log: AgentLogEntry[];
@@ -76,6 +89,14 @@ export type AgentExecuteResult = {
   filesEdited: string[];
   /** File paths where edit was skipped due to conflict (file changed since planning). */
   filesSkippedDueToConflict?: string[];
+  /** Sandbox check results (lint, tests, run). */
+  sandboxChecks?: {
+    lint?: SandboxCheckItem;
+    tests?: SandboxCheckItem;
+    run?: SandboxCheckItem & { port?: number };
+  };
+  /** Pending review edits (applied after user accepts). */
+  pendingReview?: { fileEdits?: PendingReviewEdit[] };
 };
 
 /** Scope mode for planning: limits how many files/lines can be changed. */

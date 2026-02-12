@@ -117,7 +117,7 @@ function isCommandAllowed(command: string): { allowed: boolean; reason?: string 
   }
   
   const parts = trimmed.split(/\s+/);
-  let baseCommand = parts[0].toLowerCase();
+  const baseCommand = parts[0].toLowerCase();
 
   // Allow a very narrow, safe form of `source` for virtualenv activation only.
   if (baseCommand === "source") {
@@ -175,7 +175,7 @@ function getWorkspaceDir(workspaceId: string): string {
 }
 
 async function syncWorkspaceToDisk(
-  supabase: ReturnType<typeof createClient>,
+  supabase: Awaited<ReturnType<typeof createClient>>,
   workspaceId: string
 ): Promise<void> {
   const workspaceDir = getWorkspaceDir(workspaceId);
@@ -320,7 +320,7 @@ export async function executeCommand(
     // Handle venv/bin/... and .venv/bin/... paths
     const venvPathMatch = program.match(/^(\.?\.?\/?)(venv|\.venv)\/bin\/(.+)$/i);
     if (venvPathMatch) {
-      const prefix = venvPathMatch[1];
+      const _prefix = venvPathMatch[1];
       const venvName = venvPathMatch[2];
       const executable = venvPathMatch[3];
       const venvPath = join(cwd, `${venvName}/bin/${executable}`);
@@ -445,7 +445,7 @@ export async function executeCommand(
  * Caller must ensure auth and workspace access.
  */
 export async function executeCommandInWorkspace(
-  supabase: ReturnType<typeof createClient>,
+  supabase: Awaited<ReturnType<typeof createClient>>,
   workspaceId: string,
   command: string,
   abortSignal?: AbortSignal

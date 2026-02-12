@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { decrypt } from "@/lib/encrypt";
 import { getModelForProvider, PROVIDERS, PROVIDER_LABELS, type ProviderId } from "@/lib/llm/providers";
-import { invokeChat } from "@/lib/llm/invoke";
+import { invokeChat } from "@/lib/llm/router";
 import { getModelForTask, applyEnvRouting } from "@/lib/llm/task-routing";
 import { getPreferredModel } from "@/lib/llm/ab-stats";
 import { loadRules, formatRulesForPrompt } from "@/lib/rules";
@@ -148,6 +148,9 @@ Return ONLY the complete new file content (no markdown, no explanation).`;
       providerId,
       model: modelOpt,
       task: "inline_edit",
+      userId: user.id,
+      workspaceId,
+      supabase,
     });
 
     let newContent = typeof content === "string" ? content.trim() : "";
@@ -168,9 +171,14 @@ Return ONLY the complete new file content (no markdown, no explanation).`;
       newContent,
     });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "Inline edit failed";
+    const err = e as Error & { statusCode?: number; retryAfter?: number };
+    const status = err.statusCode === 429 ? 429 : 502;
+    const msg = err instanceof Error ? err.message : "Inline edit failed";
     console.error("[POST /api/inline-edit]", e);
     const userMsg = msg.length > 200 ? msg.slice(0, 200) + "…" : msg;
-    return NextResponse.json({ error: userMsg }, { status: 502 });
+    const headers: Record<string, string> = {};
+    if (status === 429 && err.retryAfter)
+      headers["Retry-After"] = String(err.retryAfter);
+    return NextResponse.json({ error: userMsg }, { status, headers });
   }
 }

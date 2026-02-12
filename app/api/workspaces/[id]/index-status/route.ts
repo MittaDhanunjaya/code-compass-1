@@ -31,9 +31,9 @@ export async function GET(_request: Request, { params }: RouteParams) {
     );
   }
 
-  const status = (workspace as any).indexing_status ?? "idle";
-  const progress = (workspace as any).indexing_progress ?? 0;
-  const fileCount = (workspace as any).indexing_file_count ?? 0;
+  const status = (workspace as { indexing_status?: string }).indexing_status ?? "idle";
+  const progress = (workspace as { indexing_progress?: number }).indexing_progress ?? 0;
+  const fileCount = (workspace as { indexing_file_count?: number }).indexing_file_count ?? 0;
 
   return NextResponse.json({ status, progress, fileCount });
 }

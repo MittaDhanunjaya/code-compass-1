@@ -30,6 +30,8 @@ export interface AgentEvent {
     };
     /** Planned run scope (file count, approx lines). */
     scope?: { fileCount: number; approxLinesChanged: number };
+    /** Step count for plan complete event. */
+    stepCount?: number;
     /** Scope mode used for this run. */
     scopeMode?: "conservative" | "normal" | "aggressive";
     /** Debug-from-log retry. */
@@ -61,7 +63,19 @@ export function createAgentEvent(
 /**
  * Stream event format: each line is a JSON object
  * Format: "data: <JSON>\n\n"
+ * 3.3.5: Never emit malformed JSON - validate before emitting.
  */
 export function formatStreamEvent(event: AgentEvent): string {
-  return `data: ${JSON.stringify(event)}\n\n`;
+  try {
+    const json = JSON.stringify(event);
+    return `data: ${json}\n\n`;
+  } catch {
+    // Fallback: emit minimal valid event with error indicator
+    return `data: ${JSON.stringify({
+      id: `${Date.now()}-fallback`,
+      type: "status" as const,
+      message: "Event serialization error",
+      createdAt: new Date().toISOString(),
+    })}\n\n`;
+  }
 }

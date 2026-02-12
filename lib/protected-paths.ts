@@ -101,7 +101,7 @@ export type OverEditCheck = {
 export function checkOverEdit(
   fileLength: number,
   oldContentLength: number,
-  newContentLength: number
+  _newContentLength: number
 ): { overEdit: boolean; replacedRatio: number } {
   if (fileLength <= 0) return { overEdit: false, replacedRatio: 0 };
   const replacedRatio = oldContentLength / fileLength;

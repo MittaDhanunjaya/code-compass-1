@@ -35,7 +35,7 @@ Guidelines:
 - Output ONLY the JSON object.`;
 
 const LAST_LINES = 150; // Increased for better context
-const MAX_RETRY_ATTEMPTS = 5; // Maximum number of self-debug attempts
+const _MAX_RETRY_ATTEMPTS = 5; // Maximum number of self-debug attempts
 
 export type SelfDebugContext = {
   command: string;

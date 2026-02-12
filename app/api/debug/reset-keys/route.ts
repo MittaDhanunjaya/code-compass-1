@@ -2,23 +2,34 @@
  * Utility endpoint to help reset API keys when encryption key changes
  * POST /api/debug/reset-keys
  * Body: { provider: string, apiKey: string }
- * 
+ *
  * This will re-encrypt and save the key with the current ENCRYPTION_KEY
+ *
+ * RESTRICTIONS: Blocked in production. Requires admin role. Never logs the apiKey.
  */
 
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { encrypt } from "@/lib/encrypt";
+import { isAdmin } from "@/lib/auth/admin";
 import type { ProviderId } from "@/lib/llm/providers";
 
 export async function POST(request: Request) {
+  if (process.env.NODE_ENV !== "development") {
+    return NextResponse.json({ error: "Not Found" }, { status: 404 });
+  }
+
   const supabase = await createClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();
-  
+
   if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  if (!isAdmin(user.id)) {
+    return NextResponse.json({ error: "Forbidden: Admin access required" }, { status: 403 });
   }
 
   let body: { provider?: string; apiKey?: string };
@@ -40,7 +51,7 @@ export async function POST(request: Request) {
 
   try {
     const keyEncrypted = encrypt(apiKey);
-    
+
     const { error } = await supabase.from("provider_keys").upsert(
       {
         user_id: user.id,
@@ -58,9 +69,9 @@ export async function POST(request: Request) {
       );
     }
 
-    return NextResponse.json({ 
+    return NextResponse.json({
       success: true,
-      message: `Key for ${provider} has been re-encrypted and saved successfully.`
+      message: `Key for ${provider} has been re-encrypted and saved successfully.`,
     });
   } catch (e) {
     return NextResponse.json(

@@ -31,6 +31,7 @@ export type FileDependencies = {
  */
 export function extractImportsFromCode(content: string, filePath: string): string[] {
   const imports: string[] = [];
+  let match: RegExpExecArray | null;
   const ext = filePath.split(".").pop()?.toLowerCase() || "";
   const isTS = ext === "ts" || ext === "tsx";
   const isJS = ext === "js" || ext === "jsx";
@@ -39,7 +40,6 @@ export function extractImportsFromCode(content: string, filePath: string): strin
   if (isTS || isJS) {
     // ES6 imports: import ... from "path"
     const es6ImportRegex = /import\s+(?:(?:\{[^}]*\}|\*\s+as\s+\w+|\w+)(?:\s*,\s*(?:\{[^}]*\}|\*\s+as\s+\w+|\w+))*\s+from\s+)?["']([^"']+)["']/g;
-    let match;
     while ((match = es6ImportRegex.exec(content)) !== null) {
       if (match[1] && !match[1].startsWith(".") && !match[1].startsWith("/")) {
         // External package
@@ -84,7 +84,7 @@ export async function findSymbolReferences(
 
   if (!chunks) return [];
 
-  const references: SymbolReference[] = [];
+  const _references: SymbolReference[] = [];
   const symbolMap = new Map<string, SymbolReference>();
 
   for (const chunk of chunks) {
@@ -124,7 +124,7 @@ export async function findSymbolReferences(
 
       if (!isDefinition) {
         // Add to all symbol definitions of this name
-        for (const [key, ref] of symbolMap.entries()) {
+        for (const [_key, ref] of symbolMap.entries()) {
           if (ref.symbolName === symbolName) {
             ref.references.push({
               filePath: chunk.file_path,

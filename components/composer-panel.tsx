@@ -240,7 +240,8 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
           setPlanSummary(null);
           setSelectedPaths(new Set());
         } else {
-          const editedSet = new Set(data.filesEdited ?? []);
+          const filesEdited = Array.isArray(data.filesEdited) ? data.filesEdited.filter((p: unknown): p is string => typeof p === "string") : [];
+          const editedSet = new Set<string>(filesEdited);
           setStepsWithContent((prev) => prev.filter((s) => !editedSet.has(s.path)));
           setSelectedPaths((prev) => {
             const next = new Set(prev);
@@ -488,7 +489,7 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
               </Button>
             </div>
             <div className="space-y-1">
-              {stepsWithContent.map((step, index) => (
+              {stepsWithContent.map((step, _index) => (
                 <div
                   key={step.path}
                   className="rounded-lg border border-border bg-muted/20 overflow-hidden"

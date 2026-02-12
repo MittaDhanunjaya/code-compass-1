@@ -17,7 +17,7 @@ export interface StructuredError {
   category: ErrorCategory;
   severity: ErrorSeverity;
   code?: string;
-  details?: Record<string, any>;
+  details?: Record<string, unknown>;
   stack?: string;
   recoverable: boolean;
   timestamp: number;
@@ -30,7 +30,7 @@ export function createStructuredError(
   error: Error | string,
   category: ErrorCategory = "unknown",
   severity: ErrorSeverity = "medium",
-  details?: Record<string, any>
+  details?: Record<string, unknown>
 ): StructuredError {
   const message = error instanceof Error ? error.message : error;
   const stack = error instanceof Error ? error.stack : undefined;
@@ -51,7 +51,7 @@ export function createStructuredError(
  */
 export function logError(
   error: StructuredError | Error | string,
-  context?: Record<string, any>
+  context?: Record<string, unknown>
 ): StructuredError {
   const structured =
     typeof error === "string" || error instanceof Error
@@ -86,18 +86,20 @@ export function logError(
 export async function handleErrorWithRecovery<T>(
   operation: () => Promise<T>,
   recovery: (error: StructuredError) => Promise<T | null>,
-  context?: Record<string, any>
+  context?: Record<string, unknown>
 ): Promise<T | null> {
   try {
     return await operation();
   } catch (error) {
-    const structured = logError(error, context);
+    const err = error instanceof Error ? error : new Error(String(error));
+    const structured = logError(err, context);
     
     if (structured.recoverable && recovery) {
       try {
         return await recovery(structured);
       } catch (recoveryError) {
-        logError(recoveryError, { ...context, recoveryFailed: true });
+        const recErr = recoveryError instanceof Error ? recoveryError : new Error(String(recoveryError));
+        logError(recErr, { ...context, recoveryFailed: true });
         return null;
       }
     }

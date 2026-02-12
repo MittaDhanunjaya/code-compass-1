@@ -177,7 +177,8 @@ export function CmdKOverlay({ workspaceId, onAction }: CmdKOverlayProps) {
       } catch (err) {
         clearTimeout(timeoutId);
         const msg = err instanceof Error ? err.message : "Request failed";
-        window.dispatchEvent(new CustomEvent("cmd-k-error", { detail: { message: err.name === "AbortError" ? "Request timed out. Try again or use Chat." : msg } }));
+        const isAbort = err instanceof Error && err.name === "AbortError";
+        window.dispatchEvent(new CustomEvent("cmd-k-error", { detail: { message: isAbort ? "Request timed out. Try again or use Chat." : msg } }));
         fallbackToChat(action, selectedText, activeTab.path);
       } finally {
         setInlineLoading(false);

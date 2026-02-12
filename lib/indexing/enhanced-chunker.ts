@@ -21,7 +21,7 @@ export async function extractSymbolsEnhanced(content: string, filePath: string):
     if (astSymbols.length > 0) {
       return astSymbols;
     }
-  } catch (error) {
+  } catch (_error) {
     // Fall through to regex
   }
 

@@ -1,13 +1,13 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { decrypt } from "@/lib/encrypt";
-import { getProvider, getModelForProvider, PROVIDERS, type ProviderId } from "@/lib/llm/providers";
-import type { AgentPlan, AgentLogEntry, AgentExecuteResult } from "@/lib/agent/types";
+import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
+import { checkRateLimit, getRateLimitIdentifier } from "@/lib/api-rate-limit";
+import { getModelForProvider, type ProviderId } from "@/lib/llm/providers";
+import type { AgentLogEntry, AgentExecuteResult, FileEditStep } from "@/lib/agent/types";
 import { applyEdit } from "@/lib/agent/diff-engine";
 import { executeCommandInWorkspace, executeCommand } from "@/lib/agent/execute-command-server";
 import { classifyCommandKind, classifyCommandResult } from "@/lib/agent/command-classify";
 import { proposeFixSteps, buildTails } from "@/lib/agent/self-debug";
-import { extractPortFromError, findAvailablePort } from "@/lib/agent/port-utils";
 import { buildIntelligentContext } from "@/lib/indexing/intelligent-context";
 import { getProtectedPaths } from "@/lib/protected-paths";
 import { checkEditGuardrail, getGuardrailMode } from "@/lib/agent/guardrails";
@@ -16,16 +16,18 @@ import { resolveWorkspaceId } from "@/lib/workspaces/active-workspace";
 import {
   createSandboxFromWorkspace,
   applyEditsToSandbox,
-  promoteSandboxToWorkspace,
   runSandboxChecks,
   syncSandboxToDisk,
-  getSandboxDir,
+  type SandboxCheckResult,
   type SandboxSource,
 } from "@/lib/sandbox";
 import { beautifyCode } from "@/lib/utils/code-beautifier";
-import { safeEnqueue, safeClose } from "@/lib/stream-utils";
+import { safeEnqueue, safeClose, shouldStopStream, STREAM_UPSTREAM_TIMEOUT_MS } from "@/lib/stream-utils";
+import { validateToolName, validateToolInput } from "@/services/tools/registry";
+import { agentExecuteStreamBodySchema } from "@/lib/validation/schemas";
+import { validateBody } from "@/lib/validation";
 
-function commandKindToActionLabel(kind: "setup" | "test" | "other"): string {
+function commandKindToActionLabel(kind: "setup" | "test" | "other"): import("@/lib/agent/types").LogActionLabel {
   if (kind === "setup") return "CMD-SETUP";
   if (kind === "test") return "CMD-TEST";
   return "CMD-OTHER";
@@ -57,21 +59,29 @@ function emitEvent(
 }
 
 export async function POST(request: Request) {
-  const supabase = await createClient();
-  const { getDevBypassUser } = await import("@/lib/auth-dev-bypass");
-  const devUser = getDevBypassUser(request);
-  let user: { id: string } | null = devUser;
-  if (!user) {
-    const { data } = await supabase.auth.getUser();
-    user = data?.user ?? null;
-  }
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  let user: { id: string };
+  let supabase: Awaited<ReturnType<typeof createClient>>;
+  try {
+    const auth = await requireAuth(request);
+    user = auth.user;
+    supabase = auth.supabase;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
-  let body: { workspaceId?: string; plan?: AgentPlan; provider?: ProviderId; model?: string; modelId?: string; modelGroupId?: string; confirmedProtectedPaths?: string[]; skipProtected?: boolean; scopeMode?: "conservative" | "normal" | "aggressive"; confirmedAggressive?: boolean };
+  const rl = await checkRateLimit(getRateLimitIdentifier(request, user.id), "agent-execute-stream", 30);
+  if (!rl.ok) {
+    return NextResponse.json(
+      { error: "Too many requests. Try again later.", retryAfter: rl.retryAfter },
+      { status: 429, headers: { "Retry-After": String(rl.retryAfter ?? 60) } }
+    );
+  }
+
+  let rawBody: unknown;
   try {
-    body = await request.json();
+    rawBody = await request.json();
   } catch {
     return NextResponse.json(
       { error: "Invalid JSON body" },
@@ -79,15 +89,23 @@ export async function POST(request: Request) {
     );
   }
 
+  const validation = validateBody(agentExecuteStreamBodySchema, rawBody);
+  if (!validation.success) {
+    return NextResponse.json(
+      { error: validation.error },
+      { status: 400 }
+    );
+  }
+  const body = validation.data;
+
   const plan = body.plan;
-  const requestedProvider = (body.provider ?? "openrouter") as ProviderId;
   const confirmedProtectedPaths = new Set((body.confirmedProtectedPaths ?? []).map((p) => p.trim()).filter(Boolean));
   const skipProtected = body.skipProtected === true;
 
   const workspaceId = await resolveWorkspaceId(supabase, user.id, body.workspaceId);
-  if (!workspaceId || !plan?.steps?.length) {
+  if (!workspaceId) {
     return NextResponse.json(
-      { error: !workspaceId ? "No active workspace selected" : "plan with steps is required" },
+      { error: "No active workspace selected" },
       { status: 400 }
     );
   }
@@ -155,7 +173,7 @@ export async function POST(request: Request) {
         }
 
         // Default to safe mode if column doesn't exist
-        const safeEditMode = (workspace as any).safe_edit_mode !== false;
+        const safeEditMode = (workspace as { safe_edit_mode?: boolean }).safe_edit_mode !== false;
         const scopeMode = body.scopeMode ?? "normal";
         const confirmedAggressive = body.confirmedAggressive === true;
         if (scopeMode === "aggressive" && safeEditMode && !confirmedAggressive) {
@@ -196,7 +214,6 @@ export async function POST(request: Request) {
 
         // Separate file_edit steps from command steps for sandbox processing
         const fileEditSteps = plan.steps.filter((s): s is typeof s & { type: "file_edit" } => s.type === "file_edit");
-        const commandSteps = plan.steps.filter((s): s is typeof s & { type: "command" } => s.type === "command");
 
         // Guardrails: filter steps that exceed large-replace ratio or line-delta threshold
         const guardrailMode = getGuardrailMode();
@@ -234,7 +251,7 @@ export async function POST(request: Request) {
 
         let sandboxRunId: string | null = null;
         let sandboxChecksPassed = false;
-        let sandboxCheckResults: { lint: { passed: boolean; logs: string }; tests: { passed: boolean; logs: string } } | null = null;
+        let sandboxCheckResults: SandboxCheckResult | null = null;
         let pendingReview: { fileEdits: { path: string; originalContent: string; newContent: string }[] } | null = null;
 
         // Process file edits through sandbox if any exist
@@ -262,6 +279,20 @@ export async function POST(request: Request) {
             for (let i = 0; i < fileEditSteps.length; i++) {
               const step = fileEditSteps[i];
               const path = step.path.trim();
+
+              // 3.2.2: Validate tool input against registry schema
+              try {
+                validateToolInput<{ path: string; oldContent?: string; newContent: string }>("edit_file", {
+                  path: step.path,
+                  oldContent: step.oldContent,
+                  newContent: step.newContent,
+                });
+              } catch (validationErr) {
+                const msg = validationErr instanceof Error ? validationErr.message : "Invalid edit_file input";
+                safeEmit(createAgentEvent("tool_result", `Skipped (invalid): ${path} — ${msg}`, { toolName: "edit_file", filePath: path, stepIndex: i }));
+                log.push({ stepIndex: i, type: "file_edit", status: "error", message: msg, path, actionLabel: "EDIT", statusLine: `Skipped: ${path}` });
+                continue;
+              }
 
               if (skippedByGuardrail.has(path)) {
                 safeEmit(createAgentEvent("tool_result", `Skipped (large edit guardrail): ${path}`, {
@@ -342,6 +373,7 @@ export async function POST(request: Request) {
             }
 
             // Run sandbox checks (lint/tests)
+            validateToolName("run_command");
             safeEmit( createAgentEvent('status', 'Running lint in sandbox...'));
             safeEmit( createAgentEvent('tool_call', 'Running lint check', {
               toolName: 'run_command',
@@ -552,19 +584,6 @@ export async function POST(request: Request) {
                     statusLine: `Test check failed`,
                   });
                 }
-                
-                // Log any conflicts during promotion
-                for (const conflict of promoteResult.conflicts) {
-                  log.push({
-                    stepIndex: -1,
-                    type: "file_edit",
-                    status: "error",
-                    message: conflict.message,
-                    path: conflict.path,
-                    actionLabel: "EDIT",
-                    statusLine: `Promotion conflict: ${conflict.path}`,
-                  });
-                }
               }
             }
           } catch (sandboxError) {
@@ -602,7 +621,9 @@ export async function POST(request: Request) {
         };
 
         // Process command steps (file_edit steps were already processed through sandbox)
+        const execStartTime = Date.now();
         for (let i = 0; i < plan.steps.length; i++) {
+          if (shouldStopStream(request, execStartTime, STREAM_UPSTREAM_TIMEOUT_MS)) break;
           const step = plan.steps[i];
 
           // Skip file_edit steps - they were already processed through sandbox above
@@ -610,178 +631,16 @@ export async function POST(request: Request) {
             continue;
           }
 
-          if (false) { // Removed old file_edit handling
-            const path = step.path.trim();
-            if (skipProtected && protectedSet.has(path)) {
-              safeEmit( createAgentEvent('tool_result', `Skipped protected file: ${path}`, {
-                toolName: 'edit_file',
-                filePath: path,
-                stepIndex: i,
-              }));
-              log.push({
-                stepIndex: i,
-                type: "file_edit",
-                status: "ok",
-                message: `Skipped (protected): ${path}`,
-                path,
-                actionLabel: "EDIT",
-                statusLine: `Skipped protected file: ${path}`,
-              });
+          if (step.type === "command") {
+            // 3.2.2: Validate tool input against registry schema
+            try {
+              validateToolInput<{ command: string; cwd?: string }>("run_command", { command: step.command });
+            } catch (validationErr) {
+              const msg = validationErr instanceof Error ? validationErr.message : "Invalid run_command input";
+              safeEmit(createAgentEvent("tool_result", `Skipped: ${step.command} — ${msg}`, { toolName: "run_command", command: step.command, stepIndex: i }));
+              log.push({ stepIndex: i, type: "command", status: "error", message: msg, command: step.command, actionLabel: "CMD-OTHER", statusLine: `Skipped: ${msg}` });
               continue;
             }
-            safeEmit( createAgentEvent('tool_call', `Editing file ${path}`, {
-              toolName: 'edit_file',
-              filePath: path,
-              stepIndex: i,
-            }));
-
-            // Re-read current content immediately before apply to avoid applying against stale state
-            const { data: fileRow } = await supabase
-              .from("workspace_files")
-              .select("content")
-              .eq("workspace_id", workspaceId)
-              .eq("path", path)
-              .single();
-
-            if (!fileRow) {
-              // Beautify code before writing (convert \n to actual newlines, etc.)
-              const beautifiedContent = beautifyCode(step.newContent, path);
-              
-              const { error: insertError } = await supabase
-                .from("workspace_files")
-                .insert({
-                  workspace_id: workspaceId,
-                  path,
-                  content: beautifiedContent,
-                });
-
-              if (insertError) {
-                safeEmit( createAgentEvent('tool_result', `Failed to create ${path}: ${insertError.message}`, {
-                  toolName: 'edit_file',
-                  filePath: path,
-                  stepIndex: i,
-                }));
-                log.push({
-                  stepIndex: i,
-                  type: "file_edit",
-                  status: "error",
-                  message: insertError.message,
-                  path,
-                  actionLabel: "EDIT",
-                  statusLine: `Error creating ${path}: ${insertError.message}`,
-                });
-              } else {
-                if (!filesEdited.includes(path)) filesEdited.push(path);
-                safeEmit( createAgentEvent('tool_result', `Created ${path}`, {
-                  toolName: 'edit_file',
-                  filePath: path,
-                  stepIndex: i,
-                }));
-                log.push({
-                  stepIndex: i,
-                  type: "file_edit",
-                  status: "ok",
-                  message: step.description ?? `Created ${path}`,
-                  path,
-                  actionLabel: "EDIT",
-                  statusLine: `Created ${path}`,
-                });
-              }
-              continue;
-            }
-
-            const currentContent = fileRow.content ?? "";
-            // Beautify new content before applying edit (convert \n to actual newlines, etc.)
-            const beautifiedNewContent = beautifyCode(step.newContent, path);
-            
-            // IMPORTANT: Don't beautify oldContent directly - it needs to match the actual file content
-            // The oldContent from the plan might have escaped newlines, but the actual file
-            // content in the database might already be beautified. We need to match what's actually there.
-            let oldContentToMatch = step.oldContent;
-            let contentToMatchAgainst = currentContent;
-            
-            // If oldContent is provided, beautify both for comparison
-            if (oldContentToMatch) {
-              const beautifiedOldContent = beautifyCode(oldContentToMatch, path);
-              const beautifiedCurrentContent = beautifyCode(currentContent, path);
-              // Try matching with beautified versions first
-              if (beautifiedCurrentContent.includes(beautifiedOldContent)) {
-                oldContentToMatch = beautifiedOldContent;
-                contentToMatchAgainst = beautifiedCurrentContent;
-              }
-            }
-            
-            const result = applyEdit(
-              contentToMatchAgainst,
-              beautifiedNewContent,
-              oldContentToMatch
-            );
-
-            if (!result.ok) {
-              const conflictMessage =
-                "Edit conflict: file changed since planning. Please review manually or re-run with updated context.";
-              safeEmit( createAgentEvent('status', conflictMessage, { filePath: path }));
-              safeEmit( createAgentEvent('tool_result', `Edit failed: ${path} — ${result.error}`, {
-                toolName: 'edit_file',
-                filePath: path,
-                stepIndex: i,
-                conflict: true,
-              }));
-              log.push({
-                stepIndex: i,
-                type: "file_edit",
-                status: "error",
-                message: result.error,
-                path,
-                actionLabel: "EDIT",
-                statusLine: `Edit failed: ${path} — ${result.error}`,
-                conflict: true,
-              });
-              continue;
-            }
-
-            const { error } = await supabase
-              .from("workspace_files")
-              .update({
-                content: result.content,
-                updated_at: new Date().toISOString(),
-              })
-              .eq("workspace_id", workspaceId)
-              .eq("path", path);
-
-            if (error) {
-              safeEmit( createAgentEvent('tool_result', `Error saving ${path}: ${error.message}`, {
-                toolName: 'edit_file',
-                filePath: path,
-                stepIndex: i,
-              }));
-              log.push({
-                stepIndex: i,
-                type: "file_edit",
-                status: "error",
-                message: error.message,
-                path,
-                actionLabel: "EDIT",
-                statusLine: `Error saving ${path}: ${error.message}`,
-              });
-            } else {
-              if (!filesEdited.includes(path)) filesEdited.push(path);
-              safeEmit( createAgentEvent('tool_result', `Applied edit to ${path}`, {
-                toolName: 'edit_file',
-                filePath: path,
-                stepIndex: i,
-              }));
-              log.push({
-                stepIndex: i,
-                type: "file_edit",
-                status: "ok",
-                message: step.description ?? `Applied edit to ${path}`,
-                path,
-                actionLabel: "EDIT",
-                statusLine: `Applied edit to ${path}`,
-              });
-            }
-          } else if (step.type === "command") {
             const commandKind = classifyCommandKind(step.command);
             safeEmit( createAgentEvent('tool_call', `Running command: ${step.command}`, {
               toolName: 'run_command',
@@ -793,7 +652,7 @@ export async function POST(request: Request) {
               const cmdResult = await executeCommandInWorkspace(supabase, workspaceId, step.command);
               const classification = classifyCommandResult(cmdResult);
 
-              let status: "ok" | "skipped" | "error" = classification.status === "success" ? "ok" : "error";
+              const status: "ok" | "skipped" | "error" = classification.status === "success" ? "ok" : "error";
               let message = "";
               if (cmdResult.errorMessage) message = cmdResult.errorMessage;
               else if (cmdResult.exitCode === null) message = "Command timed out";
@@ -839,9 +698,35 @@ export async function POST(request: Request) {
               ) {
                 const creds = await getSelfDebugApiKey();
                 if (creds) {
+                  const applyFileEdit = async (path: string, newContent: string, oldContent?: string): Promise<boolean> => {
+                    const { data: fileRow } = await supabase
+                      .from("workspace_files")
+                      .select("content")
+                      .eq("workspace_id", workspaceId)
+                      .eq("path", path)
+                      .single();
+                    if (!fileRow) {
+                      const beautified = beautifyCode(newContent, path);
+                      const { error } = await supabase
+                        .from("workspace_files")
+                        .insert({ workspace_id: workspaceId, path, content: beautified });
+                      if (!error && !filesEdited.includes(path)) filesEdited.push(path);
+                      return !error;
+                    }
+                    const currentContent = fileRow.content ?? "";
+                    const result = applyEdit(currentContent, newContent, oldContent);
+                    if (!result.ok) return false;
+                    const { error } = await supabase
+                      .from("workspace_files")
+                      .update({ content: result.content, updated_at: new Date().toISOString() })
+                      .eq("workspace_id", workspaceId)
+                      .eq("path", path);
+                    if (!error && !filesEdited.includes(path)) filesEdited.push(path);
+                    return !error;
+                  };
                   const previousAttempts: Array<{
                     attempt: number;
-                    steps: typeof fixSteps;
+                    steps: FileEditStep[];
                     result: { status: string; summary: string };
                   }> = [];
                   
@@ -851,7 +736,7 @@ export async function POST(request: Request) {
                   
                   // Build intelligent context automatically (discovers relevant files based on codebase structure)
                   let workspaceFileList: string[] = [];
-                  let relevantFileContents: Record<string, string> = {};
+                  const relevantFileContents: Record<string, string> = {};
                   
                   if (classification.status === "failed" && workspaceId) {
                     try {
@@ -921,7 +806,7 @@ export async function POST(request: Request) {
 
                     safeEmit( createAgentEvent('tool_result', `Auto-fix attempt ${attempt}: applying ${fixSteps.length} edit(s)...`));
 
-                    // Apply fixes
+                    // Apply fixes to workspace_files (self-debug edits)
                     for (const fixStep of fixSteps) {
                       await applyFileEdit(
                         fixStep.path.trim(),

@@ -1,22 +1,29 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
-import { EVAL_TASKS } from "@/lib/eval/tasks";
+import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
+import { getEvalTasks } from "@/services/evaluation.service";
+import { validateEvalTasksResponse } from "@/lib/validation";
 
 /**
  * GET /api/evaluation/tasks
  * Returns the list of synthetic eval tasks for running the eval suite across models/prompts.
  */
 export async function GET() {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  try {
+    await requireAuth();
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
-  return NextResponse.json({
-    tasks: EVAL_TASKS,
-    hint: "Use these task IDs with the agent (e.g. paste instruction) or with scripts/run-eval to run the suite and compare models.",
-  });
+  const { tasks, hint } = getEvalTasks();
+  const validation = validateEvalTasksResponse({ tasks, hint });
+  if (!validation.success) {
+    console.error("Evaluation tasks validation failed:", validation.error);
+    return NextResponse.json(
+      { error: "Invalid eval tasks format", details: validation.error },
+      { status: 500 }
+    );
+  }
+  return NextResponse.json(validation.data);
 }

@@ -17,6 +17,8 @@ export type ChatOptions = {
   model?: string;
   /** 0 = deterministic, higher = more variation. Use ~0.2–0.4 for debug to reduce repetitive output. */
   temperature?: number;
+  /** Phase 4.2.2: Per-request token cap (max output tokens). */
+  maxTokens?: number;
 };
 
 export type LLMUsage = {

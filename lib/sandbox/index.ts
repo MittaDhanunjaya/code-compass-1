@@ -296,7 +296,7 @@ export async function promoteSandboxToWorkspace(
     // Check if workspace file changed since sandbox was created
     // We compare current workspace content with what we expect (from sandbox's original snapshot)
     // For simplicity, we'll do a direct update if content matches, otherwise treat as conflict
-    const currentContent = workspaceFile.content ?? "";
+    const _currentContent = workspaceFile.content ?? "";
     // Ensure sandbox content is beautified before promoting
     const beautifiedSandboxContent = beautifyCode(sandboxFile.content ?? "", path);
 
@@ -598,7 +598,7 @@ export async function runSandboxChecks(
           
           // Check for common error patterns
           const stderrLower = result.stderr.toLowerCase();
-          const stdoutLower = result.stdout.toLowerCase();
+          const _stdoutLower = result.stdout.toLowerCase();
           const combinedOutput = `${result.stdout}\n${result.stderr}`.toLowerCase();
           
           const hasError = 
@@ -690,7 +690,7 @@ export async function runSandboxChecks(
       let mainPyFile: string | null = null;
       
       try {
-        const files = readdirSync(sandboxDir, { recursive: false });
+        const files = readdirSync(sandboxDir, { recursive: false }) as string[];
         // Look for common entry points
         const entryPoints = ["main.py", "app.py", "run.py", "server.py", "__main__.py"];
         for (const entry of entryPoints) {

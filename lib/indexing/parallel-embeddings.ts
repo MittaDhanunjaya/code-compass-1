@@ -33,7 +33,8 @@ export async function generateEmbeddingsParallel(
   } = options;
 
   const provider = getProvider(providerId);
-  if (!provider.embeddings) {
+  const embeddingsFn = provider.embeddings;
+  if (!embeddingsFn) {
     throw new Error(`Provider ${providerId} does not support embeddings`);
   }
 
@@ -52,7 +53,7 @@ export async function generateEmbeddingsParallel(
 
     const batchPromises = concurrentBatches.map(async (batch, batchIndex) => {
       try {
-        const embeddings = await provider.embeddings(batch, apiKey);
+        const embeddings = await embeddingsFn(batch, apiKey);
         return { batchIndex: i + batchIndex, embeddings, error: null };
       } catch (error) {
         return {

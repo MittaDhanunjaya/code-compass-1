@@ -30,7 +30,7 @@ function shouldSkipPath(relativePath: string): boolean {
   const parts = relativePath.split("/").filter(Boolean);
   if (parts.some((p) => SKIP_DIRS.has(p))) return true;
   const lower = relativePath.toLowerCase();
-  if (SKIP_EXTENSIONS.some((ext) => lower.endsWith(ext))) return true;
+  if ([...SKIP_EXTENSIONS].some((ext) => lower.endsWith(ext))) return true;
   return false;
 }
 

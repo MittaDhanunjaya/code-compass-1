@@ -39,7 +39,7 @@ function currentFileFallback(
   content: string,
   filePath: string,
   symbolName: string,
-  lineNum: number
+  _lineNum: number
 ): { definitions: { filePath: string; line: number }[]; references: { filePath: string; line: number; context?: string }[] } {
   const lines = content.split("\n");
   const limitedLines = lines.length > MAX_FALLBACK_LINES ? lines.slice(0, MAX_FALLBACK_LINES) : lines;

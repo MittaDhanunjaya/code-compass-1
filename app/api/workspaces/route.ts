@@ -1,7 +1,14 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { workspacesCreateBodySchema } from "@/lib/validation/schemas";
+import { validateBody } from "@/lib/validation";
 import { cloneRepo, cloneRepoWithToken, walkRepo, removeClone } from "@/lib/github-import";
 import { decrypt } from "@/lib/encrypt";
+
+const selectWithBranch =
+  "id, name, created_at, updated_at, safe_edit_mode, github_repo_url, github_default_branch, github_owner, github_repo, github_is_private, github_current_branch";
+const selectWithoutBranch =
+  "id, name, created_at, updated_at, safe_edit_mode, github_repo_url, github_default_branch, github_owner, github_repo, github_is_private";
 
 function normalizeRepoUrl(url: string): string {
   const trimmed = url.trim();
@@ -39,7 +46,7 @@ export async function GET() {
   }
 
   // Add defaults for columns that might not exist yet (from migrations)
-  const workspacesWithDefaults = (data ?? []).map((w: any) => ({
+  const workspacesWithDefaults = (data ?? []).map((w: Record<string, unknown>) => ({
     ...w,
     safe_edit_mode: true,
     github_repo_url: null,
@@ -62,15 +69,9 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  let body: {
-    name?: string;
-    githubRepoUrl?: string;
-    githubBranch?: string;
-    fromMyRepo?: { owner: string; repo: string; defaultBranch: string; isPrivate: boolean };
-    files?: Array<{ path: string; content?: string }>;
-  };
+  let rawBody: unknown;
   try {
-    body = await request.json();
+    rawBody = await request.json();
   } catch {
     return NextResponse.json(
       { error: "Invalid JSON body" },
@@ -78,7 +79,13 @@ export async function POST(request: Request) {
     );
   }
 
-  const name = body.name?.trim() || "Untitled Workspace";
+  const validation = validateBody(workspacesCreateBodySchema, rawBody);
+  if (!validation.success) {
+    return NextResponse.json({ error: validation.error }, { status: 400 });
+  }
+  const body = validation.data;
+
+  const name = (body.name ?? "").trim() || "Untitled Workspace";
   const fromMyRepo = body.fromMyRepo;
   const githubRepoUrl = body.githubRepoUrl?.trim();
   const githubBranch = (body.githubBranch?.trim() || "main").replace(/^\s+|\s+$/g, "") || "main";
@@ -252,7 +259,7 @@ export async function POST(request: Request) {
   }
 
   // Keep clone on disk for v2 sync (pull/push)
-  const updateData: any = {
+  const updateData: Record<string, unknown> = {
     github_repo_url: repoUrl,
     github_default_branch: branch,
     github_owner: owner || null,
@@ -285,7 +292,7 @@ export async function POST(request: Request) {
       .select(selectWithoutBranch)
       .eq("id", workspace.id)
       .single();
-    updated = retry.data;
+    updated = retry.data as typeof updated;
     if (updated) {
       updated.github_current_branch = branch; // Set in response even if column doesn't exist
     }

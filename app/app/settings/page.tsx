@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
 import { Github, Key, Keyboard, Settings, Shield, User } from "lucide-react";
 import { DEFAULT_PROTECTED_PATTERNS } from "@/lib/protected-paths";
@@ -22,7 +22,7 @@ type GitHubOAuthConfig = {
   clientIdMasked: string | null;
 };
 
-export default function SettingsPage() {
+function SettingsContent() {
   const searchParams = useSearchParams();
   const [activeTab, setActiveTab] = useState<SettingsTab>("general");
   const [status, setStatus] = useState<GitHubStatus | null>(null);
@@ -358,5 +358,13 @@ export default function SettingsPage() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function SettingsPage() {
+  return (
+    <Suspense fallback={<div className="flex h-full items-center justify-center">Loading settings…</div>}>
+      <SettingsContent />
+    </Suspense>
   );
 }

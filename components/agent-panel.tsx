@@ -1,38 +1,30 @@
 "use client";
 
 import { useCallback, useState, useEffect, useRef } from "react";
-import { Loader2, Play, Check, X, FileEdit, Terminal, XCircle, Users, Settings2 } from "lucide-react";
+import { Play, X, XCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import { Textarea } from "@/components/ui/textarea";
 import { useEditor } from "@/lib/editor-context";
 import { useTerminal } from "@/lib/terminal-context";
 import { PROVIDERS, PROVIDER_LABELS, OPENROUTER_FREE_MODELS, type ProviderId } from "@/lib/llm/providers";
-import type { AgentPlan, PlanStep, AgentLogEntry, AgentExecuteResult, ScopeMode } from "@/lib/agent/types";
+import type { AgentPlan, PlanStep, FileEditStep, CommandStep, AgentExecuteResult, ScopeMode } from "@/lib/agent/types";
 import { SAFE_EDIT_MAX_FILES } from "@/lib/protected-paths";
 import type { AgentEvent } from "@/lib/agent-events";
 import { openFileInWorkspace } from "@/lib/open-file-in-workspace";
 import { useWorkspaceLabel } from "@/lib/use-workspace-label";
 import { ModelsManagerDialog } from "@/components/models-manager-dialog";
-import { ErrorWithAction } from "@/components/error-with-action";
-import { InlineEditDiffDialog } from "@/components/inline-edit-diff-dialog";
-import { getPlaybook, PLAYBOOKS } from "@/lib/playbooks";
-import { COPY } from "@/lib/copy";
-import { FeedbackPrompt } from "@/components/feedback-prompt";
+import { getPlaybook } from "@/lib/playbooks";
+import {
+  AgentInstructionInput,
+  AgentFooterActions,
+  AgentErrorDisplay,
+  AgentModelSelector,
+  AgentPlanReview,
+  AgentEventsLog,
+  AgentExecutionResult,
+  AgentConfirmDialogs,
+  AgentReviewQueue,
+} from "@/components/agent";
 import type { LogAttachment } from "@/lib/chat/log-utils";
-import { looksLikeLog, createLogAttachment } from "@/lib/chat/log-utils";
 
 type AgentPhase = "idle" | "loading_plan" | "plan_ready" | "executing" | "done";
 
@@ -81,7 +73,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
   const [error, setError] = useState<string | null>(null);
   const [autoRetryIn, setAutoRetryIn] = useState<number | null>(null); // seconds until auto-retry, null when not scheduled
   const autoRetryCountRef = useRef(0);
-  const autoRetryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoRetryTimeoutRef = useRef<number | NodeJS.Timeout | null>(null);
   const autoRetryIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [logAttachment, setLogAttachment] = useState<LogAttachment | null>(null);
   const [useDebugForLogs] = useState(() => {
@@ -249,8 +241,8 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
     }
   }, [agentEvents]);
 
-  // Persist provider selection
-  const setProvider = useCallback((newProvider: ProviderId) => {
+  // Persist provider selection (used by provider selector when wired)
+  const _setProvider = useCallback((newProvider: ProviderId) => {
     setProviderState(newProvider);
     if (typeof window !== "undefined") {
       const key = workspaceId ? `agent-provider-${workspaceId}` : "agent-provider-default";
@@ -266,8 +258,8 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
     }
   }, [workspaceId, model]);
 
-  // Persist model selection
-  const setModel = useCallback((newModel: string) => {
+  // Persist model selection (used by model selector when wired)
+  const _setModel = useCallback((newModel: string) => {
     setModelState(newModel);
     if (typeof window !== "undefined") {
       const key = workspaceId ? `agent-model-${workspaceId}` : "agent-model-default";
@@ -280,6 +272,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
     setProviderState(getStoredProvider());
     setModelState(getStoredModel());
     setScopeModeState(getStoredScopeMode());
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only re-run when workspace changes
   }, [workspaceId]);
 
   const setScopeMode = useCallback((mode: ScopeMode) => {
@@ -424,7 +417,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
 
       let buffer = "";
       let finalPlan: AgentPlan | null = null;
-      let finalUsage: any = null;
+      let finalUsage: { prompt_tokens?: number; completion_tokens?: number } | null = null;
       let finalModelFallback: { from: string; to: string } | undefined;
       let finalAvailableFreeModels: { id: string; label: string }[] | undefined;
       let lastStatusMessage: string | null = null;
@@ -463,7 +456,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                 setAgentEvents((prev) => [...prev, {
                   id: `${Date.now()}`,
                   type: "status",
-                  message: lastStatusMessage,
+                  message: lastStatusMessage ?? "Unknown error",
                   createdAt: new Date().toISOString(),
                 }]);
               } else if (data.id && data.type && data.message) {
@@ -518,7 +511,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                   return { ...summary };
                 });
               }
-            } catch (e) {
+            } catch {
               // Skip invalid JSON
             }
           }
@@ -529,9 +522,9 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
       if (finalPlan && finalPlan.steps && Array.isArray(finalPlan.steps) && finalPlan.steps.length > 0) {
         // Validate that steps have required fields
         const validSteps: PlanStep[] = [];
-        const invalidSteps: Array<{ index: number; step: any; reason: string }> = [];
+        const invalidSteps: Array<{ index: number; step: PlanStep; reason: string }> = [];
         
-        finalPlan.steps.forEach((step: any, index: number) => {
+        finalPlan.steps.forEach((step: PlanStep, index: number) => {
           if (!step || typeof step !== "object") {
             invalidSteps.push({ index, step, reason: "Step is not an object" });
             return;
@@ -554,7 +547,8 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
             }
             validSteps.push(step as CommandStep);
           } else {
-            invalidSteps.push({ index, step, reason: `Unknown step type: ${step.type || "undefined"}` });
+            const stepType = (step as { type?: string }).type;
+            invalidSteps.push({ index, step, reason: `Unknown step type: ${stepType || "undefined"}` });
           }
         });
         
@@ -642,6 +636,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
         setAgentEvents((prev) => [...prev, cancelEvent]);
         setRunSummary((prev) => prev ? { ...prev, isComplete: true, wasCancelled: true } : {
           editedFiles: new Set<string>(),
+          filesSkippedDueToConflict: new Set<string>(),
           commandsRun: [],
           reasoningCount: 0,
           toolCallCount: 0,
@@ -1086,7 +1081,6 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
 
   const cancelProtectedExecute = useCallback(() => {
     setProtectedConfirmOpen(false);
-    const paths = [...protectedPathsList];
     setProtectedPathsList([]);
     doExecute([], true);
   }, [protectedPathsList, doExecute]);
@@ -1214,145 +1208,21 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
               size="sm"
               className="h-6 text-xs"
               onClick={() => doExecute()}
-              disabled={phase === "executing"}
+              disabled={false}
             >
               Re-run same plan
             </Button>
           )}
-          <span className="text-xs text-muted-foreground">Model:</span>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button variant="outline" size="sm" className="h-7 text-xs font-medium min-w-[140px]">
-                {modelSelection.type === "auto"
-                  ? "Auto"
-                  : modelSelection.type === "group"
-                    ? `Group: ${modelSelection.label}`
-                    : modelSelection.label}
-                {" ▼"}
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" className="max-h-[320px] overflow-y-auto overflow-x-hidden min-w-[220px] max-w-[min(100vw-2rem,360px)]">
-              <div className="px-2 py-1.5">
-                <DropdownMenuItem onClick={() => setModelSelection({ type: "auto" })} className={modelSelection.type === "auto" ? "bg-accent" : ""}>
-                  Auto (best default)
-                  {modelSelection.type === "auto" && <span className="ml-2 text-xs">✓</span>}
-                </DropdownMenuItem>
-                {defaultGroupInfo?.members?.length ? (
-                  <p className="pl-2 pr-2 pb-1.5 pt-0 text-[11px] text-muted-foreground border-b border-border/60">
-                    {defaultGroupInfo.isUserSaved && defaultGroupInfo.label
-                      ? `Your default: ${defaultGroupInfo.label}`
-                      : defaultGroupInfo.members.map((m) => `${m.label} (${m.role})`).join(", ")}
-                  </p>
-                ) : null}
-                {defaultGroupInfo?.isUserSaved && (
-                  <DropdownMenuItem
-                    className="text-muted-foreground focus:text-foreground"
-                    onSelect={(e) => {
-                      e.preventDefault();
-                      (async () => {
-                        setDefaultGroupSaving(true);
-                        try {
-                          const res = await fetch("/api/models/default-group", {
-                            method: "PATCH",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ defaultModelGroupId: null }),
-                          });
-                          if (res.ok) {
-                            const data = await fetch("/api/models/default-group").then((r) => (r.ok ? r.json() : null));
-                            if (data?.members) setDefaultGroupInfo(data);
-                          }
-                        } finally {
-                          setDefaultGroupSaving(false);
-                        }
-                      })();
-                    }}
-                    disabled={defaultGroupSaving}
-                  >
-                    Clear saved default
-                  </DropdownMenuItem>
-                )}
-              </div>
-              {modelsAvailable?.defaultModels?.length ? (
-                <>
-                  <div className="px-2 py-1 text-xs font-medium text-muted-foreground border-b">Default models</div>
-                  {modelsAvailable.defaultModels.map((m) => (
-                    <DropdownMenuItem
-                      key={m.id}
-                      onClick={() => setModelSelection({ type: "model", modelId: m.id, label: m.label })}
-                      className={modelSelection.type === "model" && modelSelection.modelId === m.id ? "bg-accent" : ""}
-                    >
-                      {m.label}
-                      {m.isFree && <span className="ml-1 text-xs text-green-600 dark:text-green-400">(free)</span>}
-                      {modelSelection.type === "model" && modelSelection.modelId === m.id && <span className="ml-2 text-xs">✓</span>}
-                    </DropdownMenuItem>
-                  ))}
-                </>
-              ) : null}
-              {modelsAvailable?.userModels?.length ? (
-                <>
-                  <div className="px-2 py-1 text-xs font-medium text-muted-foreground border-b">Your models</div>
-                  {modelsAvailable.userModels.filter((m) => m.enabled).map((m) => (
-                    <DropdownMenuItem
-                      key={m.modelId}
-                      onClick={() => setModelSelection({ type: "model", modelId: m.modelId, label: m.label })}
-                      className={modelSelection.type === "model" && modelSelection.modelId === m.modelId ? "bg-accent" : ""}
-                    >
-                      {m.label}
-                      {modelSelection.type === "model" && modelSelection.modelId === m.modelId && <span className="ml-2 text-xs">✓</span>}
-                    </DropdownMenuItem>
-                  ))}
-                </>
-              ) : null}
-              {modelsAvailable?.groups?.length ? (
-                <>
-                  <div className="px-2 py-1 text-xs font-medium text-muted-foreground border-b flex items-center gap-1">
-                    <Users className="h-3 w-3" /> Groups
-                  </div>
-                  {modelsAvailable.groups.map((g) => (
-                    <DropdownMenuItem
-                      key={g.id}
-                      onClick={() => setModelSelection({ type: "group", modelGroupId: g.id, label: g.label })}
-                      className={modelSelection.type === "group" && modelSelection.modelGroupId === g.id ? "bg-accent" : ""}
-                    >
-                      <Users className="h-3.5 w-3.5 mr-1.5 text-muted-foreground" />
-                      {g.label}
-                      {modelSelection.type === "group" && modelSelection.modelGroupId === g.id && <span className="ml-2 text-xs">✓</span>}
-                    </DropdownMenuItem>
-                  ))}
-                </>
-              ) : null}
-              {modelSelection.type === "group" && (
-                <DropdownMenuItem
-                  className="text-muted-foreground border-t border-border/60 mt-1 pt-1"
-                  disabled={defaultGroupSaving || (defaultGroupInfo?.isUserSaved && defaultGroupInfo?.groupId === modelSelection.modelGroupId)}
-                  onSelect={(e) => {
-                    e.preventDefault();
-                    (async () => {
-                      setDefaultGroupSaving(true);
-                      try {
-                        const res = await fetch("/api/models/default-group", {
-                          method: "PATCH",
-                          headers: { "Content-Type": "application/json" },
-                          body: JSON.stringify({ defaultModelGroupId: modelSelection.modelGroupId }),
-                        });
-                        if (res.ok) {
-                          const data = await fetch("/api/models/default-group").then((r) => (r.ok ? r.json() : null));
-                          if (data?.members) setDefaultGroupInfo(data);
-                        }
-                      } finally {
-                        setDefaultGroupSaving(false);
-                      }
-                    })();
-                  }}
-                >
-                  {defaultGroupInfo?.isUserSaved && defaultGroupInfo?.groupId === modelSelection.modelGroupId ? "Saved as default" : "Save as default"}
-                </DropdownMenuItem>
-              )}
-            </DropdownMenuContent>
-          </DropdownMenu>
-          <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setModelsManagerOpen(true)} title="Manage models & groups">
-            <Settings2 className="h-3.5 w-3.5" />
-          </Button>
+          <AgentModelSelector
+            modelSelection={modelSelection}
+            setModelSelection={setModelSelection}
+            modelsAvailable={modelsAvailable}
+            defaultGroupInfo={defaultGroupInfo}
+            defaultGroupSaving={defaultGroupSaving}
+            setDefaultGroupSaving={setDefaultGroupSaving}
+            setDefaultGroupInfo={setDefaultGroupInfo}
+            onModelsManagerOpen={() => setModelsManagerOpen(true)}
+          />
         </div>
       </div>
 
@@ -1367,146 +1237,18 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
             Edit rules
           </button>
         </p>
-        {/* Instruction + Start */}
-        <div className="space-y-2">
-          <div className="flex items-center justify-between gap-2 flex-wrap">
-            <label className="text-xs font-medium text-muted-foreground">
-              Instruction
-            </label>
-            <div className="flex items-center gap-2">
-              <span className="text-[11px] text-muted-foreground">Scope:</span>
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button variant="outline" size="sm" className="h-7 text-xs min-w-[100px]">
-                    {scopeMode === "conservative" ? "Conservative" : scopeMode === "aggressive" ? "Aggressive" : "Normal"}
-                    {" ▼"}
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end">
-                  <DropdownMenuItem onClick={() => setScopeMode("conservative")} className={scopeMode === "conservative" ? "bg-accent" : ""}>
-                    Conservative
-                  </DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => setScopeMode("normal")} className={scopeMode === "normal" ? "bg-accent" : ""}>
-                    Normal
-                  </DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => setScopeMode("aggressive")} className={scopeMode === "aggressive" ? "bg-accent" : ""}>
-                    Aggressive
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-              <span className="text-[10px] text-muted-foreground hidden sm:inline">(whole workspace)</span>
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button variant="ghost" size="sm" className="h-7 text-xs text-muted-foreground">
-                    Playbooks
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="max-w-xs">
-                  {PLAYBOOKS.map((p) => (
-                    <DropdownMenuItem
-                      key={p.id}
-                      onSelect={() => setInstruction(p.instruction)}
-                      className="flex flex-col items-start gap-0.5"
-                    >
-                      <span className="font-medium">{p.title}</span>
-                      <span className="text-xs text-muted-foreground line-clamp-2">{p.description}</span>
-                    </DropdownMenuItem>
-                  ))}
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
-          </div>
-          <Textarea
-            placeholder="e.g. Add a README with setup instructions. Paste terminal logs to format with line numbers."
-            value={instruction}
-            onChange={(e) => setInstruction(e.target.value)}
-            onPaste={(e) => {
-              const pasted = e.clipboardData?.getData("text");
-              const fromTerminal = e.clipboardData?.types?.includes("application/x-aiforge-terminal");
-              if (fromTerminal && pasted && pasted.includes("\n")) {
-                e.preventDefault();
-                if (looksLikeLog(pasted)) {
-                  setLogAttachment(createLogAttachment(pasted));
-                  setInstruction((prev) => prev || "Here's the error I'm seeing.");
-                } else {
-                  const lines = pasted.trim().split(/\r?\n/);
-                  const formatted =
-                    `Terminal (lines 1-${lines.length}):\n` +
-                    lines.map((l, i) => `[${i + 1}] ${l}`).join("\n");
-                  const ta = e.target as HTMLTextAreaElement;
-                  if (ta && typeof ta.selectionStart === "number") {
-                    const start = ta.selectionStart;
-                    const end = ta.selectionEnd ?? instruction.length;
-                    setInstruction(instruction.slice(0, start) + formatted + instruction.slice(end));
-                  } else {
-                    setInstruction(formatted);
-                  }
-                }
-              } else if (pasted && looksLikeLog(pasted)) {
-                e.preventDefault();
-                setLogAttachment(createLogAttachment(pasted));
-                setInstruction((prev) => prev || "Here's the error I'm seeing.");
-              }
-            }}
-            disabled={phase !== "idle" && phase !== "done"}
-            title={phase !== "idle" && phase !== "done" ? "Finish or reset the current run to edit the task" : undefined}
-            className="min-h-[80px] resize-none text-sm"
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                startPlan();
-              }
-            }}
-          />
-          {logAttachment && (
-            <div className="inline-flex items-center gap-2 rounded bg-slate-800 px-2 py-1 text-xs text-slate-100 dark:bg-slate-700">
-              <span>
-                🖥 {logAttachment.source ?? "log"} ({logAttachment.lineCount} lines)
-              </span>
-              <button
-                type="button"
-                onClick={() => setLogAttachment(null)}
-                className="text-slate-300 hover:text-slate-100"
-                aria-label="Remove log"
-              >
-                ×
-              </button>
-            </div>
-          )}
-          {logAttachment && useDebugForLogs && workspaceId && (
-            <div className="text-xs text-muted-foreground">
-              Log detected – will run <strong>Debug-from-log</strong> on this workspace.
-            </div>
-          )}
-          <Button
-            className="w-full gap-2"
-            onClick={startPlan}
-            disabled={
-              (!instruction.trim() && !logAttachment) ||
-              phase === "loading_plan" ||
-              phase === "executing"
-            }
-            title={
-              !instruction.trim() && !logAttachment
-                ? "Enter a task or paste logs"
-                : phase === "loading_plan" || phase === "executing"
-                  ? "Wait for the current step to finish"
-                  : undefined
-            }
-          >
-            {phase === "loading_plan" ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Planning…
-              </>
-            ) : (
-              <>
-                <Play className="h-4 w-4" />
-                Start
-              </>
-            )}
-          </Button>
-        </div>
+        <AgentInstructionInput
+          instruction={instruction}
+          setInstruction={setInstruction}
+          scopeMode={scopeMode}
+          setScopeMode={setScopeMode}
+          phase={phase}
+          logAttachment={logAttachment}
+          setLogAttachment={setLogAttachment}
+          useDebugForLogs={useDebugForLogs}
+          workspaceId={workspaceId}
+          onStartPlan={startPlan}
+        />
 
         {phase === "idle" && !plan && !instruction.trim() && (
           <p className="text-xs text-muted-foreground py-2">
@@ -1514,40 +1256,27 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
           </p>
         )}
 
-        {error && (
-          <div className="space-y-2">
-            <ErrorWithAction message={error} />
-            {autoRetryIn != null && autoRetryIn > 0 ? (
-              <p className="text-sm text-muted-foreground">
-                Retrying in {autoRetryIn} second{autoRetryIn !== 1 ? "s" : ""}…
-              </p>
-            ) : null}
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-8"
-              onClick={() => {
-                if (autoRetryTimeoutRef.current != null) {
-                  clearTimeout(autoRetryTimeoutRef.current);
-                  autoRetryTimeoutRef.current = null;
-                }
-                if (autoRetryIntervalRef.current != null) {
-                  clearInterval(autoRetryIntervalRef.current);
-                  autoRetryIntervalRef.current = null;
-                }
-                setAutoRetryIn(null);
-                setError(null);
-                if (phase === "plan_ready" && plan) {
-                  approveAndExecute();
-                } else if (phase === "idle" && instruction.trim()) {
-                  startPlan();
-                }
-              }}
-            >
-              {autoRetryIn != null ? "Retry now" : "Retry"}
-            </Button>
-          </div>
-        )}
+        <AgentErrorDisplay
+          error={error}
+          autoRetryIn={autoRetryIn}
+          onRetry={() => {
+            if (autoRetryTimeoutRef.current != null) {
+              clearTimeout(autoRetryTimeoutRef.current);
+              autoRetryTimeoutRef.current = null;
+            }
+            if (autoRetryIntervalRef.current != null) {
+              clearInterval(autoRetryIntervalRef.current);
+              autoRetryIntervalRef.current = null;
+            }
+            setAutoRetryIn(null);
+            setError(null);
+            if (phase === "plan_ready" && plan) {
+              approveAndExecute();
+            } else if (phase === "idle" && instruction.trim()) {
+              startPlan();
+            }
+          }}
+        />
 
         {/* Rate limit fallback banner */}
         {phase === "plan_ready" && modelFallbackBanner && (
@@ -1582,829 +1311,151 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
 
         {/* Plan review: constrained height so Approve/Reject stay visible */}
         {phase === "plan_ready" && plan && (
-          <div className="flex flex-col rounded-lg border border-border bg-muted/20 p-3 max-h-[min(65vh,520px)] min-h-0">
-            <div className="shrink-0 space-y-2">
-              <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground flex-wrap">
-                <span className="font-medium">
-                  Plan ({plan.steps.length} steps){runScope ? ` • Planned: ${runScope.fileCount} file(s), ≈${runScope.approxLinesChanged} lines` : ""} • {PROVIDER_LABELS[provider]}
-                </span>
-                {planUsage && (
-                  <span className="rounded bg-background/60 px-2 py-0.5">
-                    {planUsage}
-                  </span>
-                )}
-              </div>
-              {planContextUsed && planContextUsed.length > 0 && (
-                <div className="rounded bg-background/40 px-2 py-1 text-[11px] text-muted-foreground">
-                  <span className="font-medium text-foreground/80">Context used: </span>
-                  {planContextUsed.slice(0, 8).map((p) => (
-                    <span key={p} className="font-mono truncate inline-block max-w-[180px] align-bottom mr-1" title={p}>{p}</span>
-                  ))}
-                  {planContextUsed.length > 8 && <span>+{planContextUsed.length - 8} more</span>}
-                </div>
-              )}
-              {plan.summary && (
-                <p className="text-sm text-muted-foreground">{plan.summary}</p>
-              )}
-            </div>
-            <ul className="flex-1 min-h-0 space-y-1.5 text-sm overflow-y-auto overflow-x-hidden pr-1 mt-2">
-              {plan.steps && plan.steps.length > 0 ? (
-                plan.steps.map((step: PlanStep, i: number) => {
-                  const stepContent = step.type === "file_edit"
-                    ? (step.path || "(no path specified)")
-                    : (step.command || "(no command specified)");
-                  
-                  return (
-                    <li key={i} className="flex items-start gap-2">
-                      {step.type === "file_edit" ? (
-                        <FileEdit className="h-4 w-4 shrink-0 mt-0.5 text-muted-foreground" />
-                      ) : (
-                        <Terminal className="h-4 w-4 shrink-0 mt-0.5 text-muted-foreground" />
-                      )}
-                      <span className="flex-1">
-                        <span className={!step.path && !step.command ? "text-destructive/70" : ""}>
-                          {stepContent}
-                        </span>
-                        {step.description && (
-                          <span className="text-muted-foreground">
-                            {" "}
-                            — {step.description}
-                          </span>
-                        )}
-                        {step.type === "file_edit" && !step.path && (
-                          <span className="text-destructive/70 text-xs ml-1">
-                            (invalid step: missing path)
-                          </span>
-                        )}
-                        {step.type === "command" && !step.command && (
-                          <span className="text-destructive/70 text-xs ml-1">
-                            (invalid step: missing command)
-                          </span>
-                        )}
-                      </span>
-                    </li>
-                  );
-                })
-              ) : (
-                <li className="text-sm text-muted-foreground italic">
-                  No steps available (plan may be malformed)
-                </li>
-              )}
-            </ul>
-          </div>
+          <AgentPlanReview
+            plan={plan}
+            runScope={runScope}
+            planUsage={planUsage}
+            planContextUsed={planContextUsed}
+            provider={provider}
+          />
         )}
 
         {/* Agent Activity Feed - Shows real-time agent thinking and tool usage */}
-        {(phase === "loading_plan" || phase === "executing" || (phase === "done" && agentEvents.length > 0)) && agentEvents.length > 0 && (
-          <div className="rounded-lg border border-border bg-muted/20 p-3 space-y-2">
-            <div className="flex items-center justify-between">
-              <div className="text-xs font-medium text-muted-foreground">Agent activity</div>
-              <div className="text-[10px] text-muted-foreground">
-                {agentEvents.length} event{agentEvents.length !== 1 ? 's' : ''}
-              </div>
-            </div>
-            <div className="max-h-64 overflow-y-auto space-y-1.5 text-xs font-mono">
-              {agentEvents.map((event) => {
-                const labelMap: Record<AgentEvent['type'], string> = {
-                  reasoning: "Thinking",
-                  tool_call: "Tool",
-                  tool_result: "Result",
-                  status: "Status",
-                  guardrail_warning: "Guardrail",
-                };
-                const label = labelMap[event.type] || event.type;
-                const colorMap: Record<AgentEvent['type'], string> = {
-                  reasoning: "text-blue-600 dark:text-blue-400",
-                  tool_call: "text-purple-600 dark:text-purple-400",
-                  tool_result: "text-green-600 dark:text-green-400",
-                  status: "text-muted-foreground",
-                  guardrail_warning: "text-amber-600 dark:text-amber-400",
-                };
-                const iconMap: Record<AgentEvent['type'], string> = {
-                  reasoning: "💭",
-                  tool_call: "🔧",
-                  tool_result: "✓",
-                  status: "ℹ",
-                  guardrail_warning: "⚠",
-                };
-                return (
-                  <div key={event.id} className="flex items-start gap-2 py-0.5">
-                    <span className={`shrink-0 font-medium ${colorMap[event.type] || "text-muted-foreground"}`}>
-                      {iconMap[event.type]} [{label}]
-                    </span>
-                    <div className="flex-1 min-w-0">
-                      <div className="text-foreground break-words">{event.message}</div>
-                      {event.meta?.modelLabel && (
-                        <div className="text-muted-foreground text-[10px] mt-0.5 opacity-75">
-                          Model: {event.meta.modelLabel}
-                          {event.meta.modelRole && ` (${event.meta.modelRole})`}
-                        </div>
-                      )}
-                      {event.meta?.filePath && (
-                        <div className="text-muted-foreground font-mono text-[10px] mt-0.5 opacity-75">
-                          📄{" "}
-                          <button
-                            onClick={() => handleFileClick(event.meta!.filePath!)}
-                            className="underline hover:text-foreground transition-colors cursor-pointer"
-                            title="Open this file"
-                          >
-                            {event.meta.filePath}
-                          </button>
-                        </div>
-                      )}
-                      {event.meta?.command && (
-                        <div className="text-muted-foreground font-mono text-[10px] mt-0.5 opacity-75">
-                          $ {event.meta.command}
-                        </div>
-                      )}
-                      {event.meta?.toolName && !event.meta.filePath && !event.meta.command && (
-                        <div className="text-muted-foreground text-[10px] mt-0.5 opacity-75">
-                          Tool: {event.meta.toolName}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-              <div ref={eventsEndRef} />
-            </div>
-            
-            {/* Run Summary - shown when execution is complete or cancelled */}
-            {runSummary && runSummary.isComplete && (phase === "done" || (phase === "plan_ready" && runSummary.wasCancelled)) && (
-              <div className="mt-3 pt-3 border-t border-border/50">
-                <div className="text-xs font-medium text-muted-foreground mb-2">
-                  Run summary
-                  {runSummary.wasCancelled && (
-                    <span className="ml-2 text-amber-600 dark:text-amber-400">(Cancelled)</span>
-                  )}
-                </div>
-                <div className="space-y-1.5 text-xs">
-                  {(runSummary.scope || runSummary.scopeMode) && (
-                    <div className="text-muted-foreground">
-                      {runSummary.scope && (
-                        <span>Planned: {runSummary.scope.fileCount} file(s), ≈{runSummary.scope.approxLinesChanged} lines</span>
-                      )}
-                      {runSummary.scopeMode && (
-                        <span>{runSummary.scope ? ` (mode: ${runSummary.scopeMode.charAt(0).toUpperCase() + runSummary.scopeMode.slice(1)})` : `Scope mode: ${runSummary.scopeMode}`}</span>
-                      )}
-                    </div>
-                  )}
-                  {runSummary.retried && (runSummary.attempt1 || runSummary.attempt2) && (
-                    <div className="text-muted-foreground">
-                      Attempt 1: {runSummary.attempt1?.testsPassed ? "tests passed" : "tests failed"}.
-                      Attempt 2: {runSummary.attempt2?.testsPassed ? "tests passed" : "tests failed"}.
-                    </div>
-                  )}
-                  {runSummary.editedFiles.size > 0 && (
-                    <div>
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-muted-foreground">Edited {runSummary.editedFiles.size} file(s):</span>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="h-6 text-xs"
-                          onClick={() => {
-                            const paths = Array.from(runSummary.editedFiles);
-                            if (paths.length > 0) handleFileClick(paths[0], true);
-                          }}
-                        >
-                          Review all changes
-                        </Button>
-                      </div>
-                      <p className="text-muted-foreground text-[10px] mt-1">
-                        Click any file to inspect its changes, or &quot;Review all changes&quot; to start from the first edited file.
-                      </p>
-                      <div className="mt-1 flex flex-wrap gap-1.5">
-                        {Array.from(runSummary.editedFiles).slice(0, 5).map((filePath) => (
-                          <button
-                            key={filePath}
-                            onClick={() => handleFileClick(filePath)}
-                            className="px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-700 dark:text-blue-400 hover:bg-blue-500/20 transition-colors font-mono text-[10px] underline"
-                            title="Open this file"
-                          >
-                            {filePath}
-                          </button>
-                        ))}
-                        {runSummary.editedFiles.size > 5 && (
-                          <span className="text-muted-foreground text-[10px] py-0.5">
-                            +{runSummary.editedFiles.size - 5} more
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                  )}
-                  {(runSummary.filesSkippedDueToConflict?.size ?? 0) > 0 && (
-                    <div>
-                      <span className="text-muted-foreground">Needs human review (file changed since planning):</span>{" "}
-                      <span className="font-mono text-[10px] text-amber-600 dark:text-amber-400">
-                        {Array.from(runSummary.filesSkippedDueToConflict ?? []).slice(0, 5).join(", ")}
-                        {(runSummary.filesSkippedDueToConflict?.size ?? 0) > 5 && ` +${(runSummary.filesSkippedDueToConflict?.size ?? 0) - 5} more`}
-                      </span>
-                    </div>
-                  )}
-                  {runSummary.commandsRun.length > 0 && (
-                    <div>
-                      <span className="text-muted-foreground">Ran {runSummary.commandsRun.length} command(s):</span>{" "}
-                      <span className="font-mono text-[10px]">
-                        {runSummary.commandsRun.slice(0, 3).join(", ")}
-                        {runSummary.commandsRun.length > 3 && ` +${runSummary.commandsRun.length - 3} more`}
-                      </span>
-                    </div>
-                  )}
-                  <div className="text-muted-foreground text-[10px] pt-1">
-                    Total events: {agentEvents.length} (
-                    {runSummary.reasoningCount > 0 && `reasoning: ${runSummary.reasoningCount}`}
-                    {runSummary.reasoningCount > 0 && runSummary.toolCallCount > 0 && ", "}
-                    {runSummary.toolCallCount > 0 && `tools: ${runSummary.toolCallCount}`}
-                    {runSummary.toolCallCount > 0 && runSummary.toolResultCount > 0 && ", "}
-                    {runSummary.toolResultCount > 0 && `results: ${runSummary.toolResultCount}`}
-                    )
-                  </div>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-        {phase === "executing" && agentEvents.length === 0 && (
-          <div className="flex items-center gap-2 rounded-lg bg-muted/50 px-3 py-2 text-sm text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            Running plan… (editing files, running commands, running tests)
-          </div>
+        {(phase === "loading_plan" || phase === "executing" || (phase === "done" && agentEvents.length > 0) || (phase === "plan_ready" && runSummary?.wasCancelled)) && (
+          <AgentEventsLog
+            agentEvents={agentEvents}
+            runSummary={runSummary}
+            phase={phase}
+            onFileClick={handleFileClick}
+            eventsEndRef={eventsEndRef}
+          />
         )}
 
         {/* Execution log + summary */}
         {phase === "done" && executeResult && (
-          <div className="space-y-3 rounded-lg border border-border bg-muted/20 p-3">
-            <div className="text-xs font-medium text-muted-foreground">
-              Execution log
-            </div>
-            <ul className="space-y-1 text-sm">
-              {executeResult.log.map((entry: AgentLogEntry, i: number) => (
-                <li
-                  key={i}
-                  className={`flex items-start gap-2 ${
-                    entry.type === "info"
-                      ? "text-muted-foreground italic"
-                      : entry.status === "ok"
-                        ? "text-green-700 dark:text-green-400"
-                        : entry.status === "error"
-                          ? "text-destructive"
-                          : "text-muted-foreground"
-                  }`}
-                >
-                  <span className="shrink-0 font-mono text-xs text-muted-foreground">
-                    [{entry.stepIndex + 1}]
-                  </span>
-                  {entry.actionLabel != null && (
-                    <span
-                      className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] font-medium ${
-                        entry.actionLabel === "EDIT"
-                          ? "bg-blue-500/15 text-blue-700 dark:text-blue-400"
-                          : entry.actionLabel === "CMD-SETUP"
-                            ? "bg-amber-500/15 text-amber-700 dark:text-amber-400"
-                            : entry.actionLabel === "CMD-TEST"
-                              ? "bg-purple-500/15 text-purple-700 dark:text-purple-400"
-                              : entry.actionLabel === "AUTO-FIX"
-                                ? "bg-orange-500/15 text-orange-700 dark:text-orange-400"
-                                : "bg-muted text-muted-foreground"
-                      }`}
-                    >
-                      {entry.actionLabel}
-                    </span>
-                  )}
-                  <span className="min-w-0">
-                    {entry.statusLine ?? entry.message}
-                  </span>
-                </li>
-              ))}
-            </ul>
-            <div className="border-t border-border pt-2 text-sm">
-              <div className="font-medium text-muted-foreground">
-                Completion summary
-              </div>
-              <p className="mt-1">{executeResult.summary}</p>
-              {(executeResult as any).sandboxChecks && (
-                <div className="mt-2 rounded border border-border bg-muted/30 p-2 text-xs">
-                  <div className="font-medium mb-1">Sandbox checks:</div>
-                  <div className="space-y-1">
-                    <div className="flex items-start gap-2">
-                      <span>Lint:</span>
-                      <div className="flex-1">
-                        <span className={`font-mono ${
-                          (executeResult as any).sandboxChecks.lint.status === 'passed' ? 'text-green-600 dark:text-green-400' : 
-                          (executeResult as any).sandboxChecks.lint.status === 'failed' ? 'text-red-600 dark:text-red-400' :
-                          'text-muted-foreground'
-                        }`}>
-                          {(executeResult as any).sandboxChecks.lint.status === 'passed' ? '✓ passed' : 
-                           (executeResult as any).sandboxChecks.lint.status === 'failed' ? '✗ failed' :
-                           (executeResult as any).sandboxChecks.lint.status === 'skipped' ? '⊘ skipped' : '○ not configured'}
-                        </span>
-                        {(executeResult as any).sandboxChecks.lint.logs && (executeResult as any).sandboxChecks.lint.status === 'failed' && (
-                          <div className="text-[10px] text-muted-foreground mt-0.5 font-mono max-h-20 overflow-y-auto">
-                            {(executeResult as any).sandboxChecks.lint.logs}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                    <div className="flex items-start gap-2">
-                      <span>Tests:</span>
-                      <div className="flex-1">
-                        <span className={`font-mono ${
-                          (executeResult as any).sandboxChecks.tests.status === 'passed' ? 'text-green-600 dark:text-green-400' : 
-                          (executeResult as any).sandboxChecks.tests.status === 'failed' ? 'text-red-600 dark:text-red-400' :
-                          'text-muted-foreground'
-                        }`}>
-                          {(executeResult as any).sandboxChecks.tests.status === 'passed' ? '✓ passed' : 
-                           (executeResult as any).sandboxChecks.tests.status === 'failed' ? '✗ failed' :
-                           (executeResult as any).sandboxChecks.tests.status === 'skipped' ? '⊘ skipped' : '○ not configured'}
-                        </span>
-                        {(executeResult as any).sandboxChecks.tests.logs && (executeResult as any).sandboxChecks.tests.status === 'failed' && (
-                          <div className="text-[10px] text-muted-foreground mt-0.5 font-mono max-h-20 overflow-y-auto">
-                            {(executeResult as any).sandboxChecks.tests.logs}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                    {(executeResult as any).sandboxChecks.run && (
-                      <div className="flex items-start gap-2">
-                        <span>Run:</span>
-                        <div className="flex-1">
-                          <span className={`font-mono ${
-                            (executeResult as any).sandboxChecks.run.status === 'passed' ? 'text-green-600 dark:text-green-400' : 
-                            (executeResult as any).sandboxChecks.run.status === 'failed' ? 'text-red-600 dark:text-red-400' :
-                            'text-muted-foreground'
-                          }`}>
-                            {(executeResult as any).sandboxChecks.run.status === 'passed' ? '✓ passed' : 
-                             (executeResult as any).sandboxChecks.run.status === 'failed' ? '✗ failed' :
-                             (executeResult as any).sandboxChecks.run.status === 'skipped' ? '⊘ skipped' : '○ not configured'}
-                          </span>
-                          {(executeResult as any).sandboxChecks.run.logs && (executeResult as any).sandboxChecks.run.status === 'failed' && (
-                            <div className="text-[10px] text-muted-foreground mt-0.5 font-mono max-h-20 overflow-y-auto">
-                              {(executeResult as any).sandboxChecks.run.logs}
-                            </div>
-                          )}
-                          {(executeResult as any).sandboxChecks.run.port && (
-                            <div className="text-[10px] text-muted-foreground mt-0.5">
-                              Running on port {(executeResult as any).sandboxChecks.run.port}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    )}
-                    {(executeResult as any).pendingReview ? (
-                      <p className="text-amber-600 dark:text-amber-400 mt-1 italic text-[11px] font-medium">
-                        Review your changes below. Accept or reject each file, then click Apply accepted.
-                      </p>
-                    ) : (executeResult as any).sandboxChecks.run && (executeResult as any).sandboxChecks.run.status === 'failed' ? (
-                      <p className="text-red-600 dark:text-red-400 mt-1 italic text-[11px] font-medium">
-                        ✗ CRITICAL: Application failed to run. Changes were NOT applied. Please fix errors and try again.
-                      </p>
-                    ) : (executeResult as any).sandboxChecks.lint.status === 'failed' || (executeResult as any).sandboxChecks.tests.status === 'failed' ? (
-                      <p className="text-amber-600 dark:text-amber-400 mt-1 italic text-[11px]">
-                        Sandbox checks failed (lint/tests), but application runs. Review the errors above.
-                      </p>
-                    ) : (executeResult as any).sandboxChecks.lint.status === 'passed' && (executeResult as any).sandboxChecks.tests.status === 'passed' && (!(executeResult as any).sandboxChecks.run || (executeResult as any).sandboxChecks.run.status === 'passed') ? (
-                      <p className="text-green-600 dark:text-green-400 mt-1 italic text-[11px]">
-                        ✓ All checks passed. Application verified working. Review and apply below.
-                      </p>
-                    ) : (executeResult as any).sandboxChecks.run && (executeResult as any).sandboxChecks.run.status === 'passed' ? (
-                      <p className="text-green-600 dark:text-green-400 mt-1 italic text-[11px]">
-                        ✓ Application runs successfully. Review and apply below.
-                      </p>
-                    ) : (
-                      <p className="text-muted-foreground mt-1 italic text-[11px]">
-                        Sandbox checks skipped/not configured. Review and apply below.
-                      </p>
-                    )}
-                  </div>
-                </div>
-              )}
-              {(executeResult as any).pendingReview?.fileEdits?.length > 0 && workspaceId && (
-                <div className="mt-3 rounded border border-border bg-muted/20 p-2 space-y-2">
-                  <p className="text-xs font-medium text-muted-foreground">Review edits before applying (Phase F)</p>
-                  <div className="flex gap-2 flex-wrap">
-                    <Button
-                      size="sm"
-                      variant="default"
-                      className="text-xs"
-                      onClick={() => {
-                        const fileEdits = (executeResult as any).pendingReview.fileEdits as { path: string; originalContent: string; newContent: string }[];
-                        setAgentReviewQueue([...fileEdits]);
-                        setAgentReviewIndex(0);
-                        setAgentReviewAccepted(new Set());
-                      }}
-                    >
-                      Review each file in diff
-                    </Button>
-                  </div>
-                  <p className="text-[11px] text-muted-foreground">Or accept/reject per file below, then Apply accepted.</p>
-                  <ul className="space-y-1.5 max-h-48 overflow-y-auto">
-                    {((executeResult as any).pendingReview.fileEdits as { path: string; originalContent: string; newContent: string }[]).map((edit, idx) => (
-                      <li key={`${edit.path}-${idx}`} className="flex items-center gap-2 text-xs">
-                        <input
-                          type="checkbox"
-                          checked={agentReviewAccepted.has(edit.path)}
-                          onChange={() => {
-                            setAgentReviewAccepted((prev) => {
-                              const next = new Set(prev);
-                              if (next.has(edit.path)) next.delete(edit.path);
-                              else next.add(edit.path);
-                              return next;
-                            });
-                          }}
-                          className="rounded border-border"
-                        />
-                        <span className="font-mono truncate flex-1" title={edit.path}>{edit.path}</span>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-6 text-xs"
-                          onClick={() => openFile(edit.path)}
-                          title="Open file"
-                        >
-                          Open
-                        </Button>
-                      </li>
-                    ))}
-                  </ul>
-                  <Button
-                    size="sm"
-                    className="w-full"
-                    disabled={agentReviewApplying || agentReviewAccepted.size === 0}
-                    onClick={async () => {
-                      if (!workspaceId || agentReviewAccepted.size === 0) return;
-                      const fileEdits = (executeResult as any).pendingReview.fileEdits as { path: string; originalContent: string; newContent: string }[];
-                      const edits = fileEdits.filter((e) => agentReviewAccepted.has(e.path)).map((e) => ({ path: e.path, content: e.newContent }));
-                      setAgentReviewApplying(true);
-                      try {
-                        const res = await fetch(`/api/workspaces/${workspaceId}/agent/apply-edits`, {
-                          method: "POST",
-                          headers: { "Content-Type": "application/json" },
-                          body: JSON.stringify({ edits }),
-                        });
-                        const data = await res.json().catch(() => ({}));
-                        if (!res.ok) {
-                          if (res.status === 400 && Array.isArray(data.fullFileReplacePaths) && data.fullFileReplacePaths.length > 0) {
-                            setPendingFullFileReplaceEdits(edits);
-                            setAgentFullFileReplaceConfirmOpen(true);
-                            return;
-                          }
-                          if (res.status === 400 && Array.isArray(data.largeEditPaths) && data.largeEditPaths.length > 0) {
-                            setPendingLargeEditEdits(edits);
-                            setAgentLargeEditConfirmOpen(true);
-                            return;
-                          }
-                          throw new Error(data.error || "Failed to apply edits");
-                        }
-                        for (const e of edits) {
-                          updateContent(e.path, e.content);
-                        }
-                        setExecuteResult((prev) => {
-                          if (!prev) return prev;
-                          const next = { ...prev, filesEdited: [...(prev.filesEdited ?? []), ...edits.map((x) => x.path)] };
-                          delete (next as any).pendingReview;
-                          return next;
-                        });
-                      } catch (e) {
-                        setError(e instanceof Error ? e.message : "Failed to apply edits");
-                      } finally {
-                        setAgentReviewApplying(false);
-                      }
-                    }}
-                  >
-                    {agentReviewApplying ? "Applying…" : `Apply accepted (${agentReviewAccepted.size})`}
-                  </Button>
-                </div>
-              )}
-              {executeResult.filesEdited?.length > 0 && !(executeResult as any).pendingReview ? (
-                <div className="mt-2 space-y-1">
-                  <p className="font-medium text-muted-foreground">
-                    Files created/modified ({executeResult.filesEdited.length}):
-                  </p>
-                  <ul className="list-disc list-inside space-y-0.5 text-muted-foreground">
-                    {executeResult.filesEdited.map((path, idx) => (
-                      <li key={`${path}-${idx}`} className="font-mono text-xs">
-                        {path}
-                      </li>
-                    ))}
-                  </ul>
-                  <p className="mt-2 text-xs text-muted-foreground">
-                    💡 Files are saved in your workspace. Check the file tree on the left (refresh if needed).
-                  </p>
-                  {showAgentFeedback && (
-                    <FeedbackPrompt
-                      source="agent"
-                      workspaceId={workspaceId}
-                      onSubmitted={() => setShowAgentFeedback(false)}
-                      className="mt-2"
-                    />
-                  )}
-                </div>
-              ) : (executeResult as any).sandboxChecks?.run?.status === 'failed' ? (
-                <div className="mt-2 space-y-1">
-                  <p className="text-red-600 dark:text-red-400 text-xs font-medium">
-                    ⚠️ No changes were applied because the application failed to run. Please review the errors above and fix them before trying again.
-                  </p>
-                </div>
-              ) : null}
-            </div>
-          </div>
+          <AgentExecutionResult
+            executeResult={executeResult}
+            workspaceId={workspaceId}
+            agentReviewAccepted={agentReviewAccepted}
+            agentReviewApplying={agentReviewApplying}
+            showAgentFeedback={showAgentFeedback}
+            onOpenFile={(path, content) => openFile(path, content ?? "")}
+            onUpdateContent={updateContent}
+            onSetExecuteResult={setExecuteResult}
+            onSetAgentReviewAccepted={setAgentReviewAccepted}
+            onSetAgentReviewApplying={setAgentReviewApplying}
+            onSetAgentReviewQueue={setAgentReviewQueue}
+            onSetAgentReviewIndex={setAgentReviewIndex}
+            onSetError={setError}
+            onSetPendingFullFileReplaceEdits={setPendingFullFileReplaceEdits}
+            onSetAgentFullFileReplaceConfirmOpen={setAgentFullFileReplaceConfirmOpen}
+            onSetPendingLargeEditEdits={setPendingLargeEditEdits}
+            onSetAgentLargeEditConfirmOpen={setAgentLargeEditConfirmOpen}
+            onSetShowAgentFeedback={setShowAgentFeedback}
+          />
         )}
       </div>
 
-      {/* Rerun fixed at bottom of panel when execution is done - always visible without scrolling */}
-      {phase === "done" && executeResult && (
-        <div className="shrink-0 min-h-[52px] border-t border-border bg-background px-3 py-2 flex items-center gap-2 flex-wrap shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.1)] dark:shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.3)]">
-          <Button size="sm" variant="outline" onClick={rerun}>
-            Rerun
-          </Button>
-        </div>
-      )}
-
-      {/* Approve/Reject fixed at bottom of panel when plan is ready */}
-      {phase === "plan_ready" && plan && (
-        <div className="shrink-0 min-h-[52px] border-t border-border bg-background px-3 py-2 flex items-center gap-2 flex-wrap shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.1)] dark:shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.3)]">
-          <Button size="sm" className="gap-1" onClick={approveAndExecute}>
-            <Check className="h-3.5 w-3.5" />
-            Approve
-          </Button>
-          <Button size="sm" variant="outline" className="gap-1" onClick={rejectPlan}>
-            <X className="h-3.5 w-3.5" />
-            Reject
-          </Button>
-        </div>
-      )}
+      <AgentFooterActions
+        phase={phase}
+        plan={plan}
+        onApprove={approveAndExecute}
+        onReject={rejectPlan}
+        onRerun={rerun}
+      />
 
       </div>
 
-      <Dialog open={largeFileConfirmOpen} onOpenChange={(open) => { if (!open) setLargeFileConfirmOpen(false); }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Confirm large change</DialogTitle>
-          </DialogHeader>
-          <p className="text-sm text-muted-foreground py-2">
-            This action will change {largeFileCount} file(s) in this workspace. In Safe Edit mode we recommend reviewing large changes carefully. Continue?
-          </p>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setLargeFileConfirmOpen(false)}>
-              Cancel
-            </Button>
-            <Button onClick={confirmLargeFileExecute}>
-              Continue
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={agentFullFileReplaceConfirmOpen} onOpenChange={(open) => { if (!open) { setAgentFullFileReplaceConfirmOpen(false); setPendingFullFileReplaceEdits([]); } }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Full file replace</DialogTitle>
-          </DialogHeader>
-          <p className="text-sm text-muted-foreground py-2">
-            This replaces almost the entire file. If you didn&apos;t ask for a full rewrite, cancel and re-run with a clearer request. Apply anyway?
-          </p>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => { setAgentFullFileReplaceConfirmOpen(false); setPendingFullFileReplaceEdits([]); }}>
-              Cancel
-            </Button>
-            <Button onClick={async () => {
-              if (!workspaceId || pendingFullFileReplaceEdits.length === 0) return;
-              setAgentFullFileReplaceConfirmOpen(false);
-              setAgentReviewApplying(true);
-              try {
-                const res = await fetch(`/api/workspaces/${workspaceId}/agent/apply-edits`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ edits: pendingFullFileReplaceEdits, confirmFullFileReplace: true }),
-                });
-                const data = await res.json().catch(() => ({}));
-                if (!res.ok) throw new Error(data.error || "Failed to apply");
-                for (const e of pendingFullFileReplaceEdits) updateContent(e.path, e.content);
-                setExecuteResult((prev) => {
-                  if (!prev) return prev;
-                  const next = { ...prev, filesEdited: [...(prev.filesEdited ?? []), ...pendingFullFileReplaceEdits.map((x) => x.path)] };
-                  delete (next as any).pendingReview;
-                  return next;
-                });
-              } catch (e) {
-                setError(e instanceof Error ? e.message : "Failed to apply");
-              } finally {
-                setAgentReviewApplying(false);
-                setPendingFullFileReplaceEdits([]);
-              }
-            }}>
-              Apply anyway
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={agentLargeEditConfirmOpen} onOpenChange={(open) => { if (!open) { setAgentLargeEditConfirmOpen(false); setPendingLargeEditEdits([]); } }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Large edit blocked</DialogTitle>
-          </DialogHeader>
-          <p className="text-sm text-muted-foreground py-2">
-            One or more files have a change of more than 40% of lines. This guardrail helps prevent accidental large replacements. Apply these edits anyway?
-          </p>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => { setAgentLargeEditConfirmOpen(false); setPendingLargeEditEdits([]); setAgentReviewApplying(false); }}>
-              Cancel
-            </Button>
-            <Button
-              onClick={async () => {
-                if (!workspaceId || pendingLargeEditEdits.length === 0) return;
-                setAgentReviewApplying(true);
-                try {
-                  const res = await fetch(`/api/workspaces/${workspaceId}/agent/apply-edits`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ edits: pendingLargeEditEdits, confirmLargeEdit: true }),
-                  });
-                  const data = await res.json().catch(() => ({}));
-                  if (!res.ok) throw new Error(data.error || "Failed to apply");
-                  for (const e of pendingLargeEditEdits) updateContent(e.path, e.content);
-                  setExecuteResult((prev) => {
-                    if (!prev) return prev;
-                    const next = { ...prev, filesEdited: [...(prev.filesEdited ?? []), ...pendingLargeEditEdits.map((x) => x.path)] };
-                    delete (next as any).pendingReview;
-                    return next;
-                  });
-                } catch (e) {
-                  setError(e instanceof Error ? e.message : "Failed to apply");
-                } finally {
-                  setAgentReviewApplying(false);
-                  setAgentLargeEditConfirmOpen(false);
-                  setPendingLargeEditEdits([]);
-                }
-              }}
-            >
-              Apply anyway
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={aggressiveConfirmOpen} onOpenChange={(open) => { if (!open) setAggressiveConfirmOpen(false); }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Aggressive scope with Safe Edit on</DialogTitle>
-          </DialogHeader>
-          <p className="text-sm text-muted-foreground py-2">
-            Aggressive mode may change many files/lines. Safe Edit is on; some changes may be blocked. Continue?
-          </p>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setAggressiveConfirmOpen(false)}>
-              Cancel
-            </Button>
-            <Button onClick={() => { setAggressiveConfirmOpen(false); doExecute(undefined, undefined, true); }}>
-              Continue
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-      <Dialog open={protectedConfirmOpen} onOpenChange={(open) => { if (!open) { setProtectedConfirmOpen(false); setProtectedPathsList([]); } }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{COPY.safety.title}</DialogTitle>
-          </DialogHeader>
-          <p className="text-sm text-muted-foreground py-2">
-            {COPY.safety.body(protectedPathsList)}
-          </p>
-          <DialogFooter>
-            <Button variant="outline" onClick={cancelProtectedExecute}>
-              {COPY.safety.cancel}
-            </Button>
-            <Button onClick={confirmProtectedExecute}>
-              {COPY.safety.allow}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <AgentConfirmDialogs
+        largeFileConfirmOpen={largeFileConfirmOpen}
+        largeFileCount={largeFileCount}
+        onLargeFileClose={() => setLargeFileConfirmOpen(false)}
+        onLargeFileConfirm={confirmLargeFileExecute}
+        agentFullFileReplaceConfirmOpen={agentFullFileReplaceConfirmOpen}
+        onFullFileReplaceClose={() => { setAgentFullFileReplaceConfirmOpen(false); setPendingFullFileReplaceEdits([]); }}
+        onFullFileReplaceConfirm={async () => {
+          if (!workspaceId || pendingFullFileReplaceEdits.length === 0) return;
+          setAgentFullFileReplaceConfirmOpen(false);
+          setAgentReviewApplying(true);
+          try {
+            const res = await fetch(`/api/workspaces/${workspaceId}/agent/apply-edits`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ edits: pendingFullFileReplaceEdits, confirmFullFileReplace: true }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.error || "Failed to apply");
+            for (const e of pendingFullFileReplaceEdits) updateContent(e.path, e.content);
+            setExecuteResult((prev) => {
+              if (!prev) return prev;
+              const next = { ...prev, filesEdited: [...(prev.filesEdited ?? []), ...pendingFullFileReplaceEdits.map((x) => x.path)] };
+              delete (next as Record<string, unknown>).pendingReview;
+              return next;
+            });
+          } catch (e) {
+            setError(e instanceof Error ? e.message : "Failed to apply");
+          } finally {
+            setAgentReviewApplying(false);
+            setPendingFullFileReplaceEdits([]);
+          }
+        }}
+        agentLargeEditConfirmOpen={agentLargeEditConfirmOpen}
+        onLargeEditClose={() => { setAgentLargeEditConfirmOpen(false); setPendingLargeEditEdits([]); setAgentReviewApplying(false); }}
+        onLargeEditConfirm={async () => {
+          if (!workspaceId || pendingLargeEditEdits.length === 0) return;
+          setAgentReviewApplying(true);
+          try {
+            const res = await fetch(`/api/workspaces/${workspaceId}/agent/apply-edits`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ edits: pendingLargeEditEdits, confirmLargeEdit: true }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.error || "Failed to apply");
+            for (const e of pendingLargeEditEdits) updateContent(e.path, e.content);
+            setExecuteResult((prev) => {
+              if (!prev) return prev;
+              const next = { ...prev, filesEdited: [...(prev.filesEdited ?? []), ...pendingLargeEditEdits.map((x) => x.path)] };
+              delete (next as Record<string, unknown>).pendingReview;
+              return next;
+            });
+          } catch (e) {
+            setError(e instanceof Error ? e.message : "Failed to apply");
+          } finally {
+            setAgentReviewApplying(false);
+            setAgentLargeEditConfirmOpen(false);
+            setPendingLargeEditEdits([]);
+          }
+        }}
+        aggressiveConfirmOpen={aggressiveConfirmOpen}
+        onAggressiveClose={() => setAggressiveConfirmOpen(false)}
+        onAggressiveConfirm={() => { setAggressiveConfirmOpen(false); doExecute(undefined, undefined, true); }}
+        protectedConfirmOpen={protectedConfirmOpen}
+        protectedPathsList={protectedPathsList}
+        onProtectedClose={() => { setProtectedConfirmOpen(false); setProtectedPathsList([]); }}
+        onProtectedCancel={cancelProtectedExecute}
+        onProtectedAllow={confirmProtectedExecute}
+      />
 
       {/* Phase F: review each file in diff before apply (like Composer) */}
-      {agentReviewQueue.length > 0 && agentReviewQueue[agentReviewIndex] && workspaceId && (
-        <InlineEditDiffDialog
-          key={`${agentReviewQueue[agentReviewIndex].path}-${agentReviewIndex}`}
-          open={true}
-          onOpenChange={(open) => {
-            if (!open) {
-              setAgentReviewQueue([]);
-              setAgentReviewIndex(0);
-            }
-          }}
-          path={agentReviewQueue[agentReviewIndex].path}
-          originalContent={agentReviewQueue[agentReviewIndex].originalContent}
-          newContent={agentReviewQueue[agentReviewIndex].newContent}
-          workspaceId={workspaceId}
-          applyOnAccept={false}
-          onAccept={async () => {
-            const current = agentReviewQueue[agentReviewIndex];
-            const acceptedPaths = new Set(agentReviewAccepted);
-            acceptedPaths.add(current.path);
-            setAgentReviewAccepted(acceptedPaths);
-            const nextIndex = agentReviewIndex + 1;
-            if (nextIndex >= agentReviewQueue.length) {
-              setAgentReviewQueue([]);
-              setAgentReviewIndex(0);
-              setAgentReviewApplying(true);
-              try {
-                const fileEdits = (executeResult as any)?.pendingReview?.fileEdits as { path: string; newContent: string }[] | undefined;
-                if (fileEdits?.length) {
-                  const edits = fileEdits.filter((e) => acceptedPaths.has(e.path)).map((e) => ({ path: e.path, content: e.newContent }));
-                  if (edits.length > 0) {
-                    const res = await fetch(`/api/workspaces/${workspaceId}/agent/apply-edits`, {
-                      method: "POST",
-                      headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify({ edits }),
-                    });
-                    const data = await res.json().catch(() => ({}));
-                    if (!res.ok) {
-                      if (res.status === 400 && Array.isArray(data.fullFileReplacePaths) && data.fullFileReplacePaths.length > 0) {
-                        setPendingFullFileReplaceEdits(edits);
-                        setAgentFullFileReplaceConfirmOpen(true);
-                        return;
-                      }
-                      if (res.status === 400 && Array.isArray(data.largeEditPaths) && data.largeEditPaths.length > 0) {
-                        setPendingLargeEditEdits(edits);
-                        setAgentLargeEditConfirmOpen(true);
-                        return;
-                      }
-                      throw new Error(data.error || "Failed to apply edits");
-                    }
-                    for (const e of edits) updateContent(e.path, e.content);
-                    setExecuteResult((prev) => {
-                      if (!prev) return prev;
-                      const next = { ...prev, filesEdited: [...(prev.filesEdited ?? []), ...edits.map((x) => x.path)] };
-                      delete (next as any).pendingReview;
-                      return next;
-                    });
-                  }
-                }
-              } catch (e) {
-                setError(e instanceof Error ? e.message : "Failed to apply edits");
-              } finally {
-                setAgentReviewApplying(false);
-              }
-            } else {
-              setAgentReviewIndex(nextIndex);
-            }
-          }}
-          onReject={() => {
-            const nextIndex = agentReviewIndex + 1;
-            if (nextIndex >= agentReviewQueue.length) {
-              setAgentReviewQueue([]);
-              setAgentReviewIndex(0);
-              if (agentReviewAccepted.size > 0) {
-                const fileEdits = (executeResult as any)?.pendingReview?.fileEdits as { path: string; newContent: string }[] | undefined;
-                if (fileEdits?.length) {
-                  const edits = fileEdits.filter((e) => agentReviewAccepted.has(e.path)).map((e) => ({ path: e.path, content: e.newContent }));
-                  if (edits.length > 0) {
-                    setAgentReviewApplying(true);
-                    (async () => {
-                      try {
-                        const res = await fetch(`/api/workspaces/${workspaceId}/agent/apply-edits`, {
-                          method: "POST",
-                          headers: { "Content-Type": "application/json" },
-                          body: JSON.stringify({ edits }),
-                        });
-                        const data = await res.json().catch(() => ({}));
-                        if (!res.ok) {
-                          if (res.status === 400 && Array.isArray(data.fullFileReplacePaths) && data.fullFileReplacePaths.length > 0) {
-                            setPendingFullFileReplaceEdits(edits);
-                            setAgentFullFileReplaceConfirmOpen(true);
-                            return;
-                          }
-                          if (res.status === 400 && Array.isArray(data.largeEditPaths) && data.largeEditPaths.length > 0) {
-                            setPendingLargeEditEdits(edits);
-                            setAgentLargeEditConfirmOpen(true);
-                            return;
-                          }
-                          throw new Error(data.error || "Failed to apply");
-                        }
-                        for (const e of edits) updateContent(e.path, e.content);
-                        setExecuteResult((prev) => {
-                          if (!prev) return prev;
-                          const next = { ...prev, filesEdited: [...(prev.filesEdited ?? []), ...edits.map((x) => x.path)] };
-                          delete (next as any).pendingReview;
-                          return next;
-                        });
-                      } catch (err) {
-                        setError(err instanceof Error ? err.message : "Failed to apply");
-                      } finally {
-                        setAgentReviewApplying(false);
-                      }
-                    })();
-                  }
-                }
-              }
-            } else {
-              setAgentReviewIndex(nextIndex);
-            }
-          }}
-        />
-      )}
+      <AgentReviewQueue
+        queue={agentReviewQueue}
+        index={agentReviewIndex}
+        workspaceId={workspaceId}
+        agentReviewAccepted={agentReviewAccepted}
+        fileEdits={(executeResult?.pendingReview?.fileEdits ?? []) as { path: string; originalContent: string; newContent: string }[]}
+        onSetAgentReviewAccepted={setAgentReviewAccepted}
+        onSetAgentReviewQueue={setAgentReviewQueue}
+        onSetAgentReviewIndex={setAgentReviewIndex}
+        onSetAgentReviewApplying={setAgentReviewApplying}
+        onSetExecuteResult={setExecuteResult}
+        onUpdateContent={updateContent}
+        onSetError={setError}
+        onSetPendingFullFileReplaceEdits={setPendingFullFileReplaceEdits}
+        onSetAgentFullFileReplaceConfirmOpen={setAgentFullFileReplaceConfirmOpen}
+        onSetPendingLargeEditEdits={setPendingLargeEditEdits}
+        onSetAgentLargeEditConfirmOpen={setAgentLargeEditConfirmOpen}
+      />
 
       <ModelsManagerDialog
         open={modelsManagerOpen}

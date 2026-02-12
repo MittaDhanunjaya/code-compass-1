@@ -17,7 +17,7 @@ export async function saveChatMessage(
   userId: string,
   role: "user" | "assistant" | "system",
   content: string,
-  metadata?: Record<string, any>
+  metadata?: Record<string, unknown>
 ): Promise<void> {
   await supabase.from("chat_messages").insert({
     workspace_id: workspaceId,

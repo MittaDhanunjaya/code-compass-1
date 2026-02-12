@@ -7,7 +7,7 @@
  * Beautify code content by converting escaped sequences to actual characters
  * and optionally formatting based on file type.
  */
-export function beautifyCode(content: string, filePath?: string): string {
+export function beautifyCode(content: string, _filePath?: string): string {
   if (!content || typeof content !== "string") {
     return content;
   }
@@ -100,7 +100,7 @@ export async function formatCode(
   filePath?: string
 ): Promise<string> {
   // First, apply basic beautification (always)
-  let formatted = beautifyCode(content, filePath);
+  const formatted = beautifyCode(content, filePath);
   
   // Try to use Prettier if available (optional enhancement)
   // For now, we'll just use the basic beautifier

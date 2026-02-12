@@ -119,7 +119,7 @@ describe("JSON Parser - Comprehensive Edge Case Testing", () => {
       const json = `{"steps": [{"content": "line1\\nline2"}], "summary": "test"}`;
       const result = parseJSONRobust(json, ["steps"]);
       expect(result.success).toBe(true);
-      expect((result.data as any).steps[0].content).toBe("line1\nline2");
+      expect((result.data as { steps: Array<{ content: string }> }).steps[0].content).toBe("line1\nline2");
     });
   });
 
@@ -186,7 +186,7 @@ describe("JSON Parser - Comprehensive Edge Case Testing", () => {
       const json = `{"steps": [{"content": "// not a comment"}], "summary": "test"}`;
       const result = parseJSONRobust(json, ["steps"]);
       expect(result.success).toBe(true);
-      expect((result.data as any).steps[0].content).toBe("// not a comment");
+      expect((result.data as { steps: Array<{ content: string }> }).steps[0].content).toBe("// not a comment");
     });
   });
 
@@ -195,21 +195,21 @@ describe("JSON Parser - Comprehensive Edge Case Testing", () => {
       const json = `{"steps": [], "active": True}`;
       const result = parseJSONRobust(json, ["steps"]);
       expect(result.success).toBe(true);
-      expect((result.data as any).active).toBe(true);
+      expect((result.data as { active: boolean }).active).toBe(true);
     });
 
     it("should convert False to false", () => {
       const json = `{"steps": [], "active": False}`;
       const result = parseJSONRobust(json, ["steps"]);
       expect(result.success).toBe(true);
-      expect((result.data as any).active).toBe(false);
+      expect((result.data as { active: boolean }).active).toBe(false);
     });
 
     it("should convert None to null", () => {
       const json = `{"steps": [], "value": None}`;
       const result = parseJSONRobust(json, ["steps"]);
       expect(result.success).toBe(true);
-      expect((result.data as any).value).toBe(null);
+      expect((result.data as { value: null }).value).toBe(null);
     });
   });
 
@@ -308,7 +308,7 @@ describe("JSON Parser - Comprehensive Edge Case Testing", () => {
       const json = `{"steps": [{"content": "Special: !@#$%^&*()_+-=[]{}|;':\\\",./<>?"}]}`;
       const result = parseJSONRobust(json, ["steps"]);
       expect(result.success).toBe(true);
-      expect((result.data as any).steps[0].content).toContain("Special:");
+      expect((result.data as { steps: Array<{ content: string }> }).steps[0].content).toContain("Special:");
     });
   });
 });

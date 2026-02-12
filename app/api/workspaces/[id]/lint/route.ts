@@ -42,7 +42,7 @@ async function runEslint(
     }
     const overrideConfig: Record<string, unknown> = {
       languageOptions: {
-        ...(parser ? { parser: parser as any } : {}),
+        ...(parser ? { parser } : {}),
         parserOptions: {
           ecmaVersion: "latest",
           sourceType: "module",

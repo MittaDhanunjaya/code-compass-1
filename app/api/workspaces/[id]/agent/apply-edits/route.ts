@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
 
 type RouteParams = { params: Promise<{ id: string }> };
 
@@ -15,16 +16,16 @@ const FULL_FILE_REPLACE_RATIO = 0.95;
  */
 export async function POST(request: Request, { params }: RouteParams) {
   const { id: workspaceId } = await params;
-  const supabase = await createClient();
-  const { getDevBypassUser } = await import("@/lib/auth-dev-bypass");
-  const devUser = getDevBypassUser(request);
-  let user: { id: string } | null = devUser;
-  if (!user) {
-    const { data } = await supabase.auth.getUser();
-    user = data?.user ?? null;
-  }
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  let user: { id: string };
+  let supabase: Awaited<ReturnType<typeof createClient>>;
+  try {
+    const auth = await requireAuth(request);
+    user = auth.user;
+    supabase = auth.supabase;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
   const { data: workspace } = await supabase

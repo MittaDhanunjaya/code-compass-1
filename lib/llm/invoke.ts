@@ -22,6 +22,8 @@ export type InvokeChatInput = {
   task?: TaskType;
   /** Optional temperature (e.g. 0.3 for debug to reduce same-output repetition). */
   temperature?: number;
+  /** Phase 4.2.2: Per-request token cap (max output tokens). */
+  maxTokens?: number;
 };
 
 export type InvokeChatOutput = {
@@ -56,7 +58,7 @@ function sleep(ms: number): Promise<void> {
  * Invoke chat with retries (on rate limit), logging, and standardized output.
  */
 export async function invokeChat(input: InvokeChatInput): Promise<InvokeChatOutput> {
-  const { messages, apiKey, providerId, model, context, task = "chat", temperature } = input;
+  const { messages, apiKey, providerId, model, context, task = "chat", temperature, maxTokens } = input;
   const provider = getProvider(providerId);
   const modelOpt = getModelForProvider(providerId, model ?? undefined);
   const start = Date.now();
@@ -69,6 +71,7 @@ export async function invokeChat(input: InvokeChatInput): Promise<InvokeChatOutp
         model: modelOpt,
         context,
         temperature,
+        maxTokens,
       });
       const latencyMs = Date.now() - start;
       if (process.env.NODE_ENV !== "test") {

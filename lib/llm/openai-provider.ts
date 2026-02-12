@@ -45,6 +45,7 @@ export const openAIProvider: LLMProvider = {
       model: options?.model ?? "gpt-4o-mini",
       messages: built,
       ...(options?.temperature != null && { temperature: options.temperature }),
+      ...(options?.maxTokens != null && { max_tokens: options.maxTokens }),
     });
     const content = completion.choices[0]?.message?.content ?? "";
     const usage: LLMUsage | undefined = completion.usage
@@ -70,6 +71,7 @@ export const openAIProvider: LLMProvider = {
       messages: built,
       stream: true,
       ...(options?.temperature != null && { temperature: options.temperature }),
+      ...(options?.maxTokens != null && { max_tokens: options.maxTokens }),
     });
 
     for await (const chunk of stream) {

@@ -193,7 +193,7 @@ export function getStackProfile(stack: StackKind): StackProfile | null {
 /** Format diagnostics for use in agent "fix diagnostics" prompt. */
 export function formatDiagnosticsForPrompt(diagnostics: Array<{ line: number; column?: number; message: string; severity?: string }>): string {
   return diagnostics
-    .map((d) => `Line ${d.line}${d.column != null ? `:${d.column}` : ""} (${d.severty ?? "error"}): ${d.message}`)
+    .map((d) => `Line ${d.line}${d.column != null ? `:${d.column}` : ""} (${d.severity ?? "error"}): ${d.message}`)
     .join("\n");
 }
 

@@ -69,6 +69,8 @@ function createLanguageService(
   const host: ts.LanguageServiceHost = {
     getScriptFileNames: () => rootFileNames,
     getScriptVersion: (fileName) => String(scriptVersions.get(fileName) ?? 0),
+    readFile: (fileName) => files.get(fileName) ?? undefined,
+    fileExists: (fileName) => files.has(fileName),
     getScriptSnapshot: (fileName) => {
       const content = files.get(fileName);
       if (content === undefined) return undefined;

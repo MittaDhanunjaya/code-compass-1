@@ -86,7 +86,7 @@ export function applyScopeCaps(
     return a.approx - b.approx;
   });
 
-  let kept: FileEditStep[] = [];
+  const kept: FileEditStep[] = [];
   let lines = 0;
   for (const { step, approx } of withApprox) {
     if (kept.length >= MAX_CONSERVATIVE_FILES) break;
@@ -94,7 +94,7 @@ export function applyScopeCaps(
     kept.push(step);
     lines += approx;
   }
-  const keptPaths = new Set(kept.map((s) => s.path));
+  const _keptPaths = new Set(kept.map((s) => s.path));
   const trimmedSteps: PlanStep[] = [...kept, ...commandSteps];
   const dropped = fileEdits.length - kept.length;
   const message =

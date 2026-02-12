@@ -19,12 +19,16 @@ export function KeySettingsContent() {
     openai: false,
     gemini: false,
     perplexity: false,
+    ollama: false,
+    lmstudio: false,
   });
   const [needsReentry, setNeedsReentry] = useState<Record<ProviderId, boolean>>({
     openrouter: false,
     openai: false,
     gemini: false,
     perplexity: false,
+    ollama: false,
+    lmstudio: false,
   });
   const [apiKey, setApiKey] = useState("");
   const [loading, setLoading] = useState(true);
@@ -53,12 +57,16 @@ export function KeySettingsContent() {
         openai: false,
         gemini: false,
         perplexity: false,
+        ollama: false,
+        lmstudio: false,
       };
       const reentryMap: Record<ProviderId, boolean> = {
         openrouter: false,
         openai: false,
         gemini: false,
         perplexity: false,
+        ollama: false,
+        lmstudio: false,
       };
       for (const { provider, configured, needsReentry } of results) {
         configuredMap[provider as ProviderId] = configured;

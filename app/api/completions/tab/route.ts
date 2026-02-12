@@ -100,10 +100,10 @@ export async function POST(request: Request) {
     try {
       const searchQuery = prefix.slice(-120);
       const searchCacheKey = getSearchKey(workspaceId, searchQuery, 2, true);
-      let searchData: any = null;
+      let searchData: { results?: Array<{ path: string; preview: string }> } | null = null;
       const cachedSearch = searchCache.get(searchCacheKey);
       if (cachedSearch) {
-        searchData = cachedSearch;
+        searchData = cachedSearch as { results?: Array<{ path: string; preview: string }> };
       } else {
         const searchPromise = fetch(
           `${request.headers.get("origin") || "http://localhost:3000"}/api/search?query=${encodeURIComponent(searchQuery)}&workspaceId=${workspaceId}&limit=2&semantic=true`
@@ -116,22 +116,26 @@ export async function POST(request: Request) {
         if (result && result instanceof Response && result.ok) {
           searchData = await result.json();
           if (searchData?.results) {
-            searchCache.set(searchCacheKey, searchData, 300000); // 5min cache
+            searchCache.set(
+              searchCacheKey,
+              { results: searchData.results, count: searchData.results.length },
+              300000
+            );
           }
         }
       }
       
       if (searchData?.results && searchData.results.length > 0) {
         const contextFiles = searchData.results
-          .filter((r: any) => r.path !== filePath)
+          .filter((r) => r.path !== filePath)
           .slice(0, 1) // Only 1 file for speed
-          .map((r: any) => `${r.path}: ${r.preview.slice(0, 150)}`) // Shorter preview
+          .map((r) => `${r.path}: ${r.preview.slice(0, 150)}`) // Shorter preview
           .join("\n");
         if (contextFiles) {
           codebaseContext = `\nSimilar: ${contextFiles}`;
         }
       }
-    } catch (error) {
+    } catch {
       // Silently fail - codebase context is optional
     }
   }

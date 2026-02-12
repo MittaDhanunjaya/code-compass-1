@@ -1,11 +1,13 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
 import { decrypt } from "@/lib/encrypt";
 import { getModelForProvider, PROVIDERS, type ProviderId } from "@/lib/llm/providers";
 import { applyEnvRouting } from "@/lib/llm/task-routing";
 import { getPatchModelCandidates } from "@/lib/llm/ab-stats";
-import { invokeChatWithFallback, type InvokeChatCandidate } from "@/lib/llm/invoke";
+import { invokeChatWithFallback, type InvokeChatCandidate } from "@/lib/llm/router";
 import { createAgentEvent } from "@/lib/agent-events";
+import { getDevBypassUser } from "@/lib/auth-dev-bypass";
 import { detectStackFromPaths } from "@/lib/sandbox/stack-commands";
 import { getDebugPromptHintsForStack } from "@/lib/sandbox/stack-profiles";
 
@@ -22,7 +24,7 @@ export type DebugMeta = {
 
 /** Normalize stack trace: trim noisy prefixes, collapse duplicate consecutive frames. */
 function normalizeStackLog(raw: string): string {
-  let lines = raw.split(/\r?\n/);
+  const lines = raw.split(/\r?\n/);
   const trimmed = lines.map((l) => l.replace(/^\s*(at\s+|#\d+\s+)/, "").trim()).filter(Boolean);
   const seen = new Set<string>();
   const out: string[] = [];
@@ -251,19 +253,19 @@ export type DebugFromLogResponse = {
 
 export async function POST(request: Request, { params }: RouteParams) {
   const { id: workspaceId } = await params;
-  const supabase = await createClient();
-  const { getDevBypassUser } = await import("@/lib/auth-dev-bypass");
-  const devUser = getDevBypassUser(request);
-  let user: { id: string } | null = devUser;
-  if (!user) {
-    const { data } = await supabase.auth.getUser();
-    user = data?.user ?? null;
-  }
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  let user: { id: string };
+  let supabase: Awaited<ReturnType<typeof createClient>>;
+  try {
+    const auth = await requireAuth(request);
+    user = auth.user;
+    supabase = auth.supabase;
+  } catch (e) {
+    const res = withAuthResponse(e);
+    if (res) return res;
+    throw e;
   }
 
-  let body: { logText?: string; provider?: string; model?: string };
+  let body: { logText?: string; provider?: string; model?: string; scopeMode?: "conservative" | "normal" | "aggressive" };
   try {
     body = await request.json();
   } catch {
@@ -504,12 +506,13 @@ ${fileContext}
 
   // Dev bypass fallback: when using X-Dev-Token and no keys in DB, use DEV_OPENROUTER_API_KEY
   if (candidates.length === 0) {
+    const devUser = getDevBypassUser(request);
     const devKey = process.env.NODE_ENV === "development" && devUser && process.env.DEV_OPENROUTER_API_KEY;
     if (devKey) {
       candidates = [{
         providerId: "openrouter" as ProviderId,
         model: "openrouter/free",
-        apiKey: process.env.DEV_OPENROUTER_API_KEY,
+        apiKey: devKey,
       }];
     }
   }
@@ -528,16 +531,14 @@ ${fileContext}
   });
 
   try {
-    const { content } = await invokeChatWithFallback(
-      {
-        messages: [
-          { role: "system", content: DEBUG_SYSTEM },
-          { role: "user", content: userMessage },
-        ],
-        task: "debug",
-      },
-      candidates
-    );
+    const { content } = await invokeChatWithFallback({
+      messages: [
+        { role: "system", content: DEBUG_SYSTEM },
+        { role: "user", content: userMessage },
+      ],
+      task: "debug",
+      candidates,
+    });
 
     const trimmed = (content ?? "").trim();
     const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
@@ -589,8 +590,6 @@ ${fileContext}
       
       // Validate path exists in workspace (unless it's a new file)
       const pathExists = pathSet.has(path);
-      const isNewFile = !pathExists && !e.oldContent;
-      
       if (!pathExists && e.oldContent) {
         // Trying to edit a file that doesn't exist
         invalidEdits.push(`Path "${path}" not found in workspace`);

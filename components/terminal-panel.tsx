@@ -185,9 +185,9 @@ export function TerminalPanel({
               content: "^C",
               command: "",
             },
-            activeTerminalId
+            activeTerminalId ?? undefined
           );
-          setTerminalExecuting(activeTerminalId, false);
+          if (activeTerminalId) setTerminalExecuting(activeTerminalId, false);
           return;
         }
       }

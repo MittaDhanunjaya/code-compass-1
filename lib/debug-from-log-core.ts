@@ -8,7 +8,7 @@ import { decrypt } from "@/lib/encrypt";
 import { getModelForProvider, PROVIDERS, type ProviderId } from "@/lib/llm/providers";
 import { applyEnvRouting } from "@/lib/llm/task-routing";
 import { getPatchModelCandidates } from "@/lib/llm/ab-stats";
-import { invokeChatWithFallback, type InvokeChatCandidate } from "@/lib/llm/invoke";
+import { invokeChatWithFallback, type InvokeChatCandidate } from "@/lib/llm/router";
 import { detectStackFromPaths } from "@/lib/sandbox/stack-commands";
 import { getDebugPromptHintsForStack } from "@/lib/sandbox/stack-profiles";
 
@@ -418,17 +418,15 @@ ${fileContext}
   }
 
   try {
-    const { content } = await invokeChatWithFallback(
-      {
-        messages: [
-          { role: "system", content: DEBUG_SYSTEM },
-          { role: "user", content: userMessage },
-        ],
-        task: "debug",
-        temperature: 0.35,
-      },
-      candidates
-    );
+    const { content } = await invokeChatWithFallback({
+      messages: [
+        { role: "system", content: DEBUG_SYSTEM },
+        { role: "user", content: userMessage },
+      ],
+      task: "debug",
+      temperature: 0.35,
+      candidates,
+    });
 
     const trimmed = (content ?? "").trim();
     const jsonMatch = trimmed.match(/\{[\s\S]*\}/);

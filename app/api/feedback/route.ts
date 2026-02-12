@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { feedbackBodySchema } from "@/lib/validation/schemas";
+import { validateBody } from "@/lib/validation";
 
 /**
  * POST /api/feedback
@@ -13,22 +15,26 @@ export async function POST(request: Request) {
   if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
-  let body: { workspaceId?: string | null; source: "agent" | "composer" | "debug"; helpful: boolean };
+  let rawBody: unknown;
   try {
-    body = await request.json();
+    rawBody = await request.json();
   } catch {
     return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
   }
-  const source = body.source;
-  if (!["agent", "composer", "debug"].includes(source)) {
-    return NextResponse.json({ error: "Invalid source" }, { status: 400 });
+
+  const validation = validateBody(feedbackBodySchema, rawBody);
+  if (!validation.success) {
+    return NextResponse.json({ error: validation.error }, { status: 400 });
   }
-  const workspaceId = typeof body.workspaceId === "string" && body.workspaceId.trim() ? body.workspaceId.trim() : null;
+  const body = validation.data;
+
+  const source = body.source;
+  const workspaceId = body.workspaceId && body.workspaceId.trim() ? body.workspaceId.trim() : null;
   await supabase.from("feedback").insert({
     user_id: user.id,
     workspace_id: workspaceId,
     source,
-    helpful: !!body.helpful,
+    helpful: body.helpful,
   });
   return NextResponse.json({ ok: true });
 }

@@ -34,8 +34,8 @@ export async function loadRules(
     const content = file.content || "";
     const rules = content
       .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith("#"));
+      .map((line: string) => line.trim())
+      .filter((line: string) => line && !line.startsWith("#"));
 
     return {
       rules,
