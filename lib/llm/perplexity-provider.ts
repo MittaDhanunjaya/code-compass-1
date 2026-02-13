@@ -50,7 +50,7 @@ function buildMessages(
     result.push({ role: "system", content: systemParts.join("\n\n") });
   }
   for (const { role, content } of normalized) {
-    result.push({ role, content });
+    result.push({ role, content } as OpenAI.Chat.ChatCompletionMessageParam);
   }
 
   return result;

@@ -17,7 +17,7 @@ export const lmstudioProvider: LLMProvider = {
     const client = new OpenAI({ baseURL: LMSTUDIO_BASE, apiKey: "lm-studio" });
     const completion = await client.chat.completions.create({
       model,
-      messages: messages.map((m) => ({ role: m.role as "system" | "user" | "assistant", content: m.content })),
+      messages: messages.map((m) => ({ role: m.role, content: m.content })) as OpenAI.Chat.ChatCompletionMessageParam[],
     });
     const content = completion.choices[0]?.message?.content ?? "";
     const usage = completion.usage
@@ -39,7 +39,7 @@ export const lmstudioProvider: LLMProvider = {
     const client = new OpenAI({ baseURL: LMSTUDIO_BASE, apiKey: "lm-studio" });
     const stream = await client.chat.completions.create({
       model,
-      messages: messages.map((m) => ({ role: m.role as "system" | "user" | "assistant", content: m.content })),
+      messages: messages.map((m) => ({ role: m.role, content: m.content })) as OpenAI.Chat.ChatCompletionMessageParam[],
       stream: true,
     });
     for await (const chunk of stream) {

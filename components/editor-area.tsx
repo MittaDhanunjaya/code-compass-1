@@ -711,7 +711,7 @@ export function EditorArea() {
                   editorRef.current = editor;
                   // Ensure find widget is closed on mount; it only appears when user presses Ctrl/Cmd+F
                   try {
-                    const findController = editor.getContribution?.("editor.contrib.findController");
+                    const findController = editor.getContribution?.("editor.contrib.findController") as { closeFindWidget?: () => void } | undefined;
                     if (typeof findController?.closeFindWidget === "function") {
                       findController.closeFindWidget();
                     }
@@ -1008,7 +1008,6 @@ export function EditorArea() {
                   lineNumbersMinChars: 0,
                   lineDecorationsWidth: 0,
                   glyphMargin: false,
-                  renderOverviewRuler: false,
                   stickyScroll: { enabled: false },
                   folding: false,
                   showFoldingControls: "never",

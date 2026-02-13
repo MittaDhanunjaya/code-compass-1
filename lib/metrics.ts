@@ -95,7 +95,7 @@ export function recordSupabaseRpcLatency(latencyMs: number): void {
 }
 
 /** Phase 4: Reconciliation drift (actual - reserved). Positive = under-refunded, negative = over-refunded. */
-let reconciliationDriftSamples: number[] = [];
+const reconciliationDriftSamples: number[] = [];
 let reconciliationChargeFailureCount = 0;
 
 export function recordReconciliationDrift(drift: number): void {

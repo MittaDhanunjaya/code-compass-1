@@ -27,10 +27,7 @@ function buildMessages(messages: ChatMessage[], context?: ChatOptions["context"]
   }
 
   for (const m of messages) {
-    result.push({
-      role: m.role as "system" | "user" | "assistant",
-      content: m.content,
-    });
+    result.push({ role: m.role, content: m.content } as OpenAI.Chat.ChatCompletionMessageParam);
   }
 
   return result;

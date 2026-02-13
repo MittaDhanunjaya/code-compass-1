@@ -7,7 +7,7 @@ const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 
 const OPENROUTER_DEFAULT_MODEL = "openrouter/free";
 
-const KNOWN_FREE_IDS = new Set(OPENROUTER_FREE_MODELS.map((m) => m.id));
+const KNOWN_FREE_IDS = new Set<string>(OPENROUTER_FREE_MODELS.map((m) => m.id));
 
 /**
  * Pass through known free models so users get their chosen model. Route unknown
@@ -45,10 +45,7 @@ function buildMessages(
   }
 
   for (const m of messages) {
-    result.push({
-      role: m.role as "system" | "user" | "assistant",
-      content: m.content,
-    });
+    result.push({ role: m.role, content: m.content } as OpenAI.Chat.ChatCompletionMessageParam);
   }
 
   return result;

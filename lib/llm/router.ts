@@ -211,7 +211,7 @@ export async function invokeChatWithFallback(
   const tracker = createProviderAvailabilityTracker();
   const getModel = (c: (typeof candidates)[0]) => c.model ?? "default";
 
-  const throwAllFailed = (code: string) => {
+  const throwAllFailed = (code: string): never => {
     const err = new Error("All AI providers failed") as Error & { code?: string; recommendedProviders?: string[]; recommendedModels?: string[] };
     err.code = code;
     err.recommendedProviders = [...new Set(candidates.map((x) => x.providerId))];
@@ -260,6 +260,7 @@ export async function invokeChatWithFallback(
     }
   }
   throwAllFailed(ALL_MODELS_EXHAUSTED);
+  return undefined as never;
 }
 
 // Re-export for consumers that need the raw invoke (e.g. streaming with custom handling)

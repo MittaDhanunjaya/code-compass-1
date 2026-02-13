@@ -950,7 +950,7 @@ ${instruction.slice(0, 8000)}
                 if (retry > 0) emit(createAgentEvent('reasoning', `Retry ${retry} succeeded: got valid JSON plan.`));
                 break;
               }
-              lastError = schemaValidation.error;
+              lastError = schemaValidation.success ? "Plan has no steps" : schemaValidation.error;
             } else {
               lastError = safeErrorStr(parseResult.error);
             }
