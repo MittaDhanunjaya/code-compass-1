@@ -102,6 +102,7 @@ export const agentPlanStreamBodySchema = z.object({
 export const agentExecuteStreamBodySchema = z.object({
   workspaceId: z.string().uuid().optional(),
   plan: agentPlanSchema,
+  planHash: z.string().optional(),
   provider: providerIdSchema.optional(),
   model: z.string().optional(),
   modelId: z.string().optional(),

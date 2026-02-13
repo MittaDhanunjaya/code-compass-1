@@ -35,6 +35,7 @@ export type RunSummary = {
 export type UseAgentExecuteParams = {
   workspaceId: string | null;
   plan: AgentPlan | null;
+  planHash?: string | null;
   modelSelection: ModelSelection;
   provider: string;
   model: string;
@@ -61,6 +62,7 @@ export function useAgentExecute(params: UseAgentExecuteParams) {
   const {
     workspaceId,
     plan,
+    planHash,
     modelSelection,
     provider,
     model,
@@ -101,6 +103,7 @@ export function useAgentExecute(params: UseAgentExecuteParams) {
           body: JSON.stringify({
             workspaceId,
             plan,
+            ...(planHash ? { planHash } : {}),
             ...(modelSelection.type === "model"
               ? { modelId: modelSelection.modelId }
               : modelSelection.type === "group"

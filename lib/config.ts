@@ -67,3 +67,25 @@ export function getConfig(): EnvConfig {
   if (!cachedConfig) return parseEnv();
   return cachedConfig;
 }
+
+/** Production safe mode: is streaming allowed? Default true. */
+export function isStreamingEnabled(): boolean {
+  try {
+    const v = process.env.STREAMING_ENABLED;
+    if (v === "false" || v === "0") return false;
+    return true;
+  } catch {
+    return true;
+  }
+}
+
+/** Production safe mode: are weak/free-tier models allowed? Default true. */
+export function isWeakModelsEnabled(): boolean {
+  try {
+    const v = process.env.WEAK_MODELS_ENABLED;
+    if (v === "false" || v === "0") return false;
+    return true;
+  } catch {
+    return true;
+  }
+}

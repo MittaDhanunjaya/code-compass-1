@@ -74,6 +74,9 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
   const [instruction, setInstruction] = useState("");
   const [phase, setPhase] = useState<AgentPhase>("idle");
   const [plan, setPlan] = useState<AgentPlan | null>(null);
+  const [planHash, setPlanHash] = useState<string | null>(null);
+  const [modelsExhaustedModalOpen, setModelsExhaustedModalOpen] = useState(false);
+  const [modelsExhaustedData, setModelsExhaustedData] = useState<{ recommendedProviders: string[]; recommendedModels: string[] } | null>(null);
   const [executeResult, setExecuteResult] = useState<AgentExecuteResult | null>(null);
   const [agentReviewAccepted, setAgentReviewAccepted] = useState<Set<string>>(new Set());
   const [agentReviewApplying, setAgentReviewApplying] = useState(false);
@@ -448,6 +451,11 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
     scopeMode,
     fetchFileList,
     onPlan: handlePlanReceived,
+    setPlanHash,
+    setModelsExhaustedModal: (data) => {
+      setModelsExhaustedData(data);
+      setModelsExhaustedModalOpen(!!data);
+    },
     onPhase: setPhase,
     onError: setError,
     setAgentEvents,
@@ -515,6 +523,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
   const { doExecute } = useAgentExecute({
     workspaceId,
     plan,
+    planHash,
     modelSelection,
     provider,
     model,
@@ -603,6 +612,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
 
   const reset = useCallback(() => {
     setPlan(null);
+    setPlanHash(null);
     setExecuteResult(null);
     setPlanDiffDialogOpen(false);
     setPendingPlanDiff(null);
@@ -1024,6 +1034,38 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
             >
               Use new plan
             </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={modelsExhaustedModalOpen} onOpenChange={(o) => { setModelsExhaustedModalOpen(o); if (!o) setModelsExhaustedData(null); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Model unavailable</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground py-2">
+            All AI models are rate-limited or out of quota. Retry or switch to another model.
+          </p>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setModelsExhaustedModalOpen(false)}>
+              Dismiss
+            </Button>
+            {modelsExhaustedData && modelsExhaustedData.recommendedProviders.length > 0 && (
+              <Button
+                onClick={() => {
+                  const p = modelsExhaustedData.recommendedProviders[0];
+                  const m = modelsExhaustedData.recommendedModels[0];
+                  if (p && PROVIDERS.includes(p as ProviderId)) {
+                    setProviderState(p as ProviderId);
+                    if (m && p === "openrouter") setModelState(m);
+                  }
+                  setModelsExhaustedModalOpen(false);
+                  setModelsExhaustedData(null);
+                }}
+              >
+                Switch to {modelsExhaustedData.recommendedProviders[0] === "openrouter" ? "OpenRouter" : modelsExhaustedData.recommendedProviders[0]}
+              </Button>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>

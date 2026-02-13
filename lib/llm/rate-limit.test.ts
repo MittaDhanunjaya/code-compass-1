@@ -8,6 +8,7 @@ import {
   isInfraFailure,
   isFallbackableError,
   isBudgetExceededError,
+  isQuotaExceededError,
 } from "./rate-limit";
 
 describe("rate-limit", () => {
@@ -63,6 +64,25 @@ describe("rate-limit", () => {
       expect(isFallbackableError(new Error("429 Too Many Requests"))).toBe(true);
       expect(isFallbackableError(new Error("Request timeout"))).toBe(true);
       expect(isFallbackableError(new Error("404 no endpoints found"))).toBe(true);
+    });
+  });
+
+  describe("isQuotaExceededError", () => {
+    it("returns true for 429, quota exceeded, rate limit", () => {
+      expect(isQuotaExceededError(new Error("429 Too Many Requests"))).toBe(true);
+      expect(isQuotaExceededError(new Error("quota exceeded"))).toBe(true);
+      expect(isQuotaExceededError(new Error("RESOURCE_EXHAUSTED"))).toBe(true);
+    });
+
+    it("returns false for budget exceeded (user limit)", () => {
+      expect(isQuotaExceededError({ code: "BUDGET_EXCEEDED" })).toBe(false);
+    });
+  });
+
+  describe("isQuotaExceededError", () => {
+    it("returns true for 429, quota exceeded", () => {
+      expect(isQuotaExceededError(new Error("429 Too Many Requests"))).toBe(true);
+      expect(isQuotaExceededError(new Error("quota exceeded"))).toBe(true);
     });
   });
 

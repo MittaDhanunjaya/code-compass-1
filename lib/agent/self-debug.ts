@@ -6,6 +6,7 @@
 import { getProvider, type ProviderId } from "@/lib/llm/providers";
 import type { FileEditStep } from "@/lib/agent/types";
 import { extractPortFromError, findAvailablePort } from "./port-utils";
+import { SELF_HEAL_REPAIR_INSTRUCTIONS } from "./terminal-error-context";
 
 const SELF_DEBUG_SYSTEM = `You are an intelligent coding assistant helping to fix a failed command. Analyze the error, understand the codebase structure, and propose targeted fixes.
 
@@ -16,8 +17,9 @@ Output a single JSON object with this exact shape:
   "steps": [
     { "type": "file_edit", "path": "<relative path>", "oldContent": "<exact snippet to replace or omit>", "newContent": "<new content>", "description": "<optional>" }
   ],
-  "reasoning": "<brief explanation of what you're fixing>"
+  "reasoning": "<one-sentence explanation of the fix>"
 }
+${SELF_HEAL_REPAIR_INSTRUCTIONS}
 
 Your approach:
 1. **Understand the error**: Read the error message carefully. What is it telling you? What went wrong and why?
@@ -30,6 +32,7 @@ Guidelines:
 - path must be relative to workspace root.
 - Include oldContent only when replacing a specific snippet; omit for full file replace.
 - Propose at most 3-5 file_edit steps. Be targeted; only fix what the failure suggests.
+- Only modify files directly related to the error. Do not change unrelated code.
 - Think through the problem systematically. Don't guess - use the information provided.
 - If you cannot suggest a fix, return { "steps": [], "reasoning": "Unable to determine fix" }.
 - Output ONLY the JSON object.`;

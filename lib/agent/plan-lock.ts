@@ -6,16 +6,21 @@
 import { createHash } from "crypto";
 import type { AgentPlan, FileEditStep } from "./types";
 
-/** Stable hash of plan for execution lock. */
+/** Stable hash of plan for execution lock. Order-independent for file list. */
 export function hashPlan(plan: AgentPlan): string {
-  const canonical = JSON.stringify({
-    steps: plan.steps.map((s) => {
-      if (s.type === "file_edit") {
-        return { type: "file_edit", path: s.path.trim() };
-      }
-      return { type: "command", command: s.command };
-    }),
+  const normalized = plan.steps.map((s) => {
+    if (s.type === "file_edit") {
+      return { type: "file_edit" as const, path: s.path.trim() };
+    }
+    return { type: "command" as const, command: s.command };
   });
+  normalized.sort((a, b) => {
+    if (a.type !== b.type) return a.type === "file_edit" ? -1 : 1;
+    const keyA = a.type === "file_edit" ? a.path : a.command;
+    const keyB = b.type === "file_edit" ? b.path : b.command;
+    return keyA.localeCompare(keyB);
+  });
+  const canonical = JSON.stringify({ steps: normalized });
   return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
 }
 

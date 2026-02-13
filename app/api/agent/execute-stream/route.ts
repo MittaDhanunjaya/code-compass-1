@@ -8,7 +8,7 @@ import { applyEdit } from "@/lib/agent/diff-engine";
 import { executeCommandInWorkspace, executeCommand } from "@/lib/agent/execute-command-server";
 import { classifyCommandKind, classifyCommandResult } from "@/lib/agent/command-classify";
 import { proposeFixSteps, buildTails } from "@/lib/agent/self-debug";
-import { getAllowedPaths, isPathAllowed } from "@/lib/agent/plan-lock";
+import { getAllowedPaths, isPathAllowed, hashPlan } from "@/lib/agent/plan-lock";
 import { validatePathForPlan } from "@/lib/agent/file-safety";
 import { tryErrorRecovery } from "@/lib/agent/error-recovery";
 import { validatePlanConsistency } from "@/lib/agent/plan-validator";
@@ -113,7 +113,22 @@ export async function POST(request: Request) {
   const body = validation.data;
 
   const plan = body.plan;
+  const planHashFromClient = body.planHash;
   const confirmedProtectedPaths = new Set((body.confirmedProtectedPaths ?? []).map((p) => p.trim()).filter(Boolean));
+
+  // Plan hash verification: refuse execution if plan was mutated after approval
+  if (planHashFromClient) {
+    const computedHash = hashPlan(plan);
+    if (computedHash !== planHashFromClient) {
+      return NextResponse.json(
+        {
+          error: "Plan was modified after approval. Please re-run planning and approve again.",
+          code: "PLAN_HASH_MISMATCH",
+        },
+        { status: 400 }
+      );
+    }
+  }
   const skipProtected = body.skipProtected === true;
 
   const workspaceId = await resolveWorkspaceId(supabase, user.id, body.workspaceId);
@@ -298,13 +313,21 @@ export async function POST(request: Request) {
           if (!allowedPaths.has(path)) rejectedByLock.push(path);
           else if (!validatePathForPlan(path).ok) rejectedBySafety.push(path);
         }
+        if (rejectedByLock.length > 0) {
+          const err = {
+            type: "error",
+            code: "internal_error",
+            message: `Execution cannot create or modify files not in the approved plan: ${rejectedByLock.join(", ")}`,
+          };
+          safeEmit(createAgentEvent("status", `Error: ${err.message}`));
+          safeEnqueue(controller, encoder, `data: ${JSON.stringify(err)}\n\n`);
+          safeClose(controller);
+          return;
+        }
         fileEditSteps = fileEditSteps.filter((s) => {
           const p = s.path.trim();
           return allowedPaths.has(p) && validatePathForPlan(p).ok;
         });
-        if (rejectedByLock.length > 0) {
-          safeEmit(createAgentEvent("status", `Plan lock: skipped ${rejectedByLock.length} path(s) not in plan`));
-        }
         if (rejectedBySafety.length > 0) {
           safeEmit(createAgentEvent("status", `File safety: skipped ${rejectedBySafety.length} path(s)`));
         }
@@ -815,6 +838,14 @@ export async function POST(request: Request) {
                 const creds = await getSelfDebugApiKey();
                 if (creds) {
                   const applyFileEdit = async (path: string, newContent: string, oldContent?: string): Promise<boolean> => {
+                    const normalized = path.trim();
+                    if (!allowedPaths.has(normalized)) {
+                      const err = { type: "error", code: "internal_error", message: `Cannot create or modify file "${normalized}" - not in approved plan` };
+                      safeEmit(createAgentEvent("status", `Error: ${err.message}`));
+                      safeEnqueue(controller, encoder, `data: ${JSON.stringify(err)}\n\n`);
+                      safeClose(controller);
+                      throw new Error(err.message);
+                    }
                     const { data: fileRow } = await supabase
                       .from("workspace_files")
                       .select("content")

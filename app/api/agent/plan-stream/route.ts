@@ -26,10 +26,12 @@ import { multiStepReasoning } from "@/lib/agent/chain-of-thought";
 import { applyEnvRouting } from "@/lib/llm/task-routing";
 import { validateToolName, validateToolInput } from "@/services/tools/registry";
 import { agentPlanStreamBodySchema } from "@/lib/validation/schemas";
-import { validateBody, validateAgentPlanOutput } from "@/lib/validation";
+import { validateBody } from "@/lib/validation";
+import { validateDeterministicPlan, hashPlanForValidation } from "@/lib/agent/deterministic-plan-schema";
 import { logger, logAgentStarted, logAgentCompleted, getRequestId } from "@/lib/logger";
 import { captureException } from "@/lib/sentry";
 import { recordAgentPlanDuration, recordLLMBudgetReserved, recordLLMBudgetRefunded, recordLLMBudgetExceeded, recordLLMStreamAbortedTimeout, recordLLMStreamAbortedClient } from "@/lib/metrics";
+import { isStreamingEnabled, isWeakModelsEnabled } from "@/lib/config";
 
 // Same system prompt as plan route, but with instruction to emit reasoning messages
 const PLAN_SYSTEM = `You are an intelligent coding agent planner. Your job is to understand the user's request, analyze the codebase, and create a plan that accomplishes the task.
@@ -613,7 +615,7 @@ ${instruction.slice(0, 8000)}
         
         // Build configs for fallback: when one model hits rate limit, try next available model from user's account
         type ConfigTry = { providerId: ProviderId; apiKey: string; modelSlug: string; modelLabel: string };
-        const configsToTry: ConfigTry[] = [];
+        let configsToTry: ConfigTry[] = [];
         if (configs.length > 1) {
           // Use all configs for fallback (different providers/models)
           for (const c of configs) {
@@ -643,6 +645,21 @@ ${instruction.slice(0, 8000)}
               modelLabel: inv.modelLabel,
             });
           }
+        }
+        // Production safe mode: exclude weak/free-tier models when WEAK_MODELS_ENABLED=false
+        let configsFiltered = configsToTry;
+        if (!isWeakModelsEnabled()) {
+          configsFiltered = configsToTry.filter((c) => {
+            const cap = getModelCapabilities(c.providerId, c.modelSlug);
+            return !cap?.rateLimited;
+          });
+          if (configsFiltered.length === 0) {
+            emit(createAgentEvent("status", "Error: No non-free models configured. Add an API key or set WEAK_MODELS_ENABLED=true."));
+            safeEnqueue(controller, encoder, `data: ${JSON.stringify({ type: "error", error: "No models available. Add API key or enable weak models.", code: "NO_MODELS" })}\n\n`);
+            safeClose(controller);
+            return;
+          }
+          configsToTry = configsFiltered;
         }
         // Reorder: prefer models that support streaming + planning (per capability registry)
         const PLANNING_REQUIREMENTS = ["streaming", "planning"] as const;
@@ -909,6 +926,20 @@ ${instruction.slice(0, 8000)}
                   continue;
                 }
                 const fallbackMsg = fallbackError instanceof Error ? fallbackError.message : "Unknown fallback error";
+                const allExhausted = i >= configsToTry.length - 1 && (isRateLimitError(streamError) || isRateLimitError(fallbackError));
+                if (allExhausted) {
+                  const exhaustedEvent = {
+                    type: "error",
+                    code: "ALL_MODELS_EXHAUSTED",
+                    error: "All available AI models are currently rate-limited or out of quota.",
+                    message: "Model X unavailable, switched to Y. All models exhausted.",
+                    recommendedProviders: [...new Set(configsToTry.map((c) => c.providerId))],
+                    recommendedModels: [...new Set(configsToTry.map((c) => c.modelSlug))],
+                  };
+                  safeEnqueue(controller, encoder, `data: ${JSON.stringify(exhaustedEvent)}\n\n`);
+                  safeClose(controller);
+                  return;
+                }
                 throw new Error(`Both streaming and non-streaming requests failed. Streaming error: ${streamErrorMsg}. Fallback error: ${fallbackMsg}`);
               }
             }
@@ -944,9 +975,9 @@ ${instruction.slice(0, 8000)}
           const MAX_PARSE_RETRIES = 3;
           for (let retry = 0; retry <= MAX_PARSE_RETRIES; retry++) {
             if (parseResult.success && parseResult.data) {
-              const schemaValidation = validateAgentPlanOutput(parseResult.data);
-              if (schemaValidation.success && schemaValidation.data.steps?.length) {
-                plan = schemaValidation.data;
+              const schemaValidation = validateDeterministicPlan(parseResult.data);
+              if (schemaValidation.success && schemaValidation.plan.steps?.length) {
+                plan = schemaValidation.plan;
                 if (retry > 0) emit(createAgentEvent('reasoning', `Retry ${retry} succeeded: got valid JSON plan.`));
                 break;
               }
@@ -1055,9 +1086,9 @@ ${instruction.slice(0, 8000)}
               const { extractAgentPlanJSON } = await import("@/lib/utils/json-parser");
               const retryResult = extractAgentPlanJSON<AgentPlan>(retryRaw, ["steps"]);
               if (retryResult.success && retryResult.data) {
-                const schemaCheck = validateAgentPlanOutput(retryResult.data);
-                if (schemaCheck.success && schemaCheck.data.steps?.length) {
-                  plan = schemaCheck.data;
+                const schemaCheck = validateDeterministicPlan(retryResult.data);
+                if (schemaCheck.success && schemaCheck.plan.steps?.length) {
+                  plan = schemaCheck.plan;
                   emit(createAgentEvent('reasoning', `Retry succeeded: got ${plan.steps.length} step(s).`));
                 }
               }
@@ -1115,11 +1146,11 @@ ${instruction.slice(0, 8000)}
                 const { extractAgentPlanJSON } = await import("@/lib/utils/json-parser");
                 const retryResult = extractAgentPlanJSON<AgentPlan>(retryRaw, ["steps"]);
                 if (retryResult.success && retryResult.data) {
-                  const schemaCheck = validateAgentPlanOutput(retryResult.data);
-                  if (schemaCheck.success && schemaCheck.data.steps?.length) {
-                    const stillMissing = missingNpmScripts(schemaCheck.data);
+                  const schemaCheck = validateDeterministicPlan(retryResult.data);
+                  if (schemaCheck.success && schemaCheck.plan.steps?.length) {
+                    const stillMissing = missingNpmScripts(schemaCheck.plan);
                     if (stillMissing.length === 0) {
-                      plan = schemaCheck.data;
+                      plan = schemaCheck.plan;
                       emit(createAgentEvent('reasoning', `Plan corrected: package.json now defines required script(s).`));
                     }
                   }
@@ -1232,9 +1263,9 @@ ${instruction.slice(0, 8000)}
               const { extractAgentPlanJSON } = await import("@/lib/utils/json-parser");
               const retryResult = extractAgentPlanJSON<AgentPlan>(retryRaw, ["steps"]);
               if (retryResult.success && retryResult.data) {
-                const schemaCheck = validateAgentPlanOutput(retryResult.data);
-                if (schemaCheck.success && schemaCheck.data.steps?.length) {
-                  plan = schemaCheck.data;
+                const schemaCheck = validateDeterministicPlan(retryResult.data);
+                if (schemaCheck.success && schemaCheck.plan.steps?.length) {
+                  plan = schemaCheck.plan;
                   emit(createAgentEvent('reasoning', 'Retry succeeded: got proper step objects.'));
                 }
               }
@@ -1408,9 +1439,11 @@ ${instruction.slice(0, 8000)}
         const durationMs = Date.now() - planStart;
 
         // Send the plan as a final event (include model info for free-model fallback UI)
+        const planHash = hashPlanForValidation(plan);
         safeEnqueue(controller, encoder, `data: ${JSON.stringify({
           type: 'plan',
           plan,
+          planHash,
           usage,
           modelUsed: modelUsed ?? undefined,
           modelFallback: modelFallback ?? undefined,

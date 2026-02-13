@@ -52,6 +52,8 @@ export type UseAgentPlanParams = {
   scopeMode: ScopeMode;
   fetchFileList: () => Promise<string[]>;
   onPlan: (plan: AgentPlan | null) => void;
+  setPlanHash?: (hash: string | null) => void;
+  setModelsExhaustedModal?: (data: { recommendedProviders: string[]; recommendedModels: string[] } | null) => void;
   onPhase: (phase: "idle" | "loading_plan" | "plan_ready") => void;
   onError: (error: string | null) => void;
   /** @deprecated Use setAgentEvents - kept for backward compatibility */
@@ -79,6 +81,8 @@ export function useAgentPlan(params: UseAgentPlanParams) {
     scopeMode,
     fetchFileList,
     onPlan,
+    setPlanHash,
+    setModelsExhaustedModal,
     onPhase,
     onError,
     setAgentEvents,
@@ -105,6 +109,7 @@ export function useAgentPlan(params: UseAgentPlanParams) {
     setPlanContextUsed(null);
     setRunScope(null);
     setPlanDebugInfo(null);
+    setPlanHash?.(null);
     setAgentEvents([]);
     setRunSummary(null);
     setModelFallbackBanner(null);
@@ -191,6 +196,7 @@ export function useAgentPlan(params: UseAgentPlanParams) {
               const data = JSON.parse(line.slice(6));
               if (data.type === "plan") {
                 finalPlan = data.plan;
+                if (typeof data.planHash === "string") setPlanHash?.(data.planHash);
                 finalUsage = data.usage;
                 finalPlanDebugInfo = {
                   modelUsed: data.modelUsed ?? "unknown",
@@ -225,6 +231,12 @@ export function useAgentPlan(params: UseAgentPlanParams) {
               } else if (data.type === "error") {
                 lastStatusMessage = data.error || data.message || data.reason || "Unknown error";
                 lastErrorCode = data.code ?? null;
+                if (data.code === "ALL_MODELS_EXHAUSTED" && data.recommendedProviders && data.recommendedModels) {
+                  setModelsExhaustedModal?.({
+                    recommendedProviders: data.recommendedProviders,
+                    recommendedModels: data.recommendedModels,
+                  });
+                }
                 setAgentEvents((prev) => [
                   ...prev,
                   {
@@ -417,6 +429,8 @@ export function useAgentPlan(params: UseAgentPlanParams) {
     scopeMode,
     fetchFileList,
     onPlan,
+    setPlanHash,
+    setModelsExhaustedModal,
     onPhase,
     onError,
     setAgentEvents,
