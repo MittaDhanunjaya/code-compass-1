@@ -7,6 +7,7 @@ import { chatStreamBodySchema } from "@/lib/validation/schemas";
 import { validateBody } from "@/lib/validation";
 import { createChatStream, getChatProviderKeys } from "@/services/chat.service";
 import { enforceAndRecordBudget, BudgetExceededError, ServiceUnavailableError, STREAMING_RESERVE_TOKENS } from "@/lib/llm/budget-guard";
+import { isOfflineMode } from "@/lib/config";
 import { acquireStreamSlot, releaseStreamSlot } from "@/lib/stream-caps";
 import { getRequestId } from "@/lib/logger";
 import { recordLLMBudgetReserved, recordLLMBudgetExceeded } from "@/lib/metrics";
@@ -61,6 +62,13 @@ export async function POST(request: Request) {
 
   const requestId = getRequestId(request);
   const workspaceId = body.context?.workspaceId ?? null;
+
+  if (isOfflineMode()) {
+    return new Response(
+      JSON.stringify({ error: "AI is offline. Remote model calls are disabled.", code: "OFFLINE_MODE" }),
+      { status: 503, headers: { "Content-Type": "application/json" } }
+    );
+  }
 
   const streamCap = await acquireStreamSlot(user.id, workspaceId);
   if (!streamCap.ok) {

@@ -89,3 +89,13 @@ export function isWeakModelsEnabled(): boolean {
     return true;
   }
 }
+
+/** Production safe mode: disable all remote model calls. Show offline banner when true. */
+export function isOfflineMode(): boolean {
+  try {
+    const v = process.env.OFFLINE_MODE;
+    return v === "true" || v === "1";
+  } catch {
+    return false;
+  }
+}

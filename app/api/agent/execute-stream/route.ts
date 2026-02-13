@@ -8,7 +8,9 @@ import { applyEdit } from "@/lib/agent/diff-engine";
 import { executeCommandInWorkspace, executeCommand } from "@/lib/agent/execute-command-server";
 import { classifyCommandKind, classifyCommandResult } from "@/lib/agent/command-classify";
 import { proposeFixSteps, buildTails } from "@/lib/agent/self-debug";
+import { buildSelfDebugContext } from "@/lib/agent/terminal-error-context";
 import { getAllowedPaths, isPathAllowed, hashPlan } from "@/lib/agent/plan-lock";
+import { isOfflineMode } from "@/lib/config";
 import { validatePathForPlan } from "@/lib/agent/file-safety";
 import { tryErrorRecovery } from "@/lib/agent/error-recovery";
 import { validatePlanConsistency } from "@/lib/agent/plan-validator";
@@ -117,17 +119,15 @@ export async function POST(request: Request) {
   const confirmedProtectedPaths = new Set((body.confirmedProtectedPaths ?? []).map((p) => p.trim()).filter(Boolean));
 
   // Plan hash verification: refuse execution if plan was mutated after approval
-  if (planHashFromClient) {
-    const computedHash = hashPlan(plan);
-    if (computedHash !== planHashFromClient) {
-      return NextResponse.json(
-        {
-          error: "Plan was modified after approval. Please re-run planning and approve again.",
-          code: "PLAN_HASH_MISMATCH",
-        },
-        { status: 400 }
-      );
-    }
+  const computedHash = hashPlan(plan);
+  if (computedHash !== planHashFromClient) {
+    return NextResponse.json(
+      {
+        error: "Plan was modified after approval. Please re-run planning and approve again.",
+        code: "PLAN_HASH_MISMATCH",
+      },
+      { status: 400 }
+    );
   }
   const skipProtected = body.skipProtected === true;
 
@@ -136,6 +136,13 @@ export async function POST(request: Request) {
     return NextResponse.json(
       { error: "No active workspace selected" },
       { status: 400 }
+    );
+  }
+
+  if (isOfflineMode()) {
+    return NextResponse.json(
+      { error: "AI is offline. Remote model calls are disabled.", code: "OFFLINE_MODE" },
+      { status: 503 }
     );
   }
 
@@ -317,7 +324,8 @@ export async function POST(request: Request) {
           const err = {
             type: "error",
             code: "internal_error",
-            message: `Execution cannot create or modify files not in the approved plan: ${rejectedByLock.join(", ")}`,
+            message: "Execution attempted to modify undeclared file.",
+            details: rejectedByLock.join(", "),
           };
           safeEmit(createAgentEvent("status", `Error: ${err.message}`));
           safeEnqueue(controller, encoder, `data: ${JSON.stringify(err)}\n\n`);
@@ -840,7 +848,7 @@ export async function POST(request: Request) {
                   const applyFileEdit = async (path: string, newContent: string, oldContent?: string): Promise<boolean> => {
                     const normalized = path.trim();
                     if (!allowedPaths.has(normalized)) {
-                      const err = { type: "error", code: "internal_error", message: `Cannot create or modify file "${normalized}" - not in approved plan` };
+                      const err = { type: "error", code: "internal_error", message: "Execution attempted to modify undeclared file.", details: normalized };
                       safeEmit(createAgentEvent("status", `Error: ${err.message}`));
                       safeEnqueue(controller, encoder, `data: ${JSON.stringify(err)}\n\n`);
                       safeClose(controller);
@@ -929,12 +937,14 @@ export async function POST(request: Request) {
                   for (let attempt = 1; attempt <= MAX_DEBUG_ATTEMPTS; attempt++) {
                     safeEmit( createAgentEvent('reasoning', `Auto-fix attempt ${attempt}/${MAX_DEBUG_ATTEMPTS}...`));
                     
-                    const { stdoutTail, stderrTail } = buildTails(lastResult.stdout ?? "", lastResult.stderr ?? "");
+                    const tails = buildTails(lastResult.stdout ?? "", lastResult.stderr ?? "");
+                    const debugCtx = buildSelfDebugContext(step.command, lastResult, tails);
                     const fixSteps = await proposeFixSteps(
                       {
-                        command: step.command,
-                        stdoutTail,
-                        stderrTail,
+                        command: debugCtx.command,
+                        stdoutTail: debugCtx.stdoutTail,
+                        stderrTail: debugCtx.stderrTail,
+                        exitCode: debugCtx.exitCode,
                         filesEdited: [...filesEdited],
                         workspaceFiles: workspaceFileList.length > 0 ? workspaceFileList : undefined,
                         fileContents: Object.keys(relevantFileContents).length > 0 ? relevantFileContents : undefined,

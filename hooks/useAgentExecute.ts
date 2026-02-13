@@ -88,6 +88,10 @@ export function useAgentExecute(params: UseAgentExecuteParams) {
   const doExecute = useCallback(
     async (confirmedProtectedPaths?: string[], skipProtected?: boolean, confirmedAggressive?: boolean) => {
       if (!plan || !workspaceId) return;
+      if (!planHash?.trim()) {
+        setError("Plan hash is required. Please re-run planning and approve again.");
+        return;
+      }
       setError(null);
       setAgentEvents([]);
       setRunSummary(null);
@@ -103,7 +107,7 @@ export function useAgentExecute(params: UseAgentExecuteParams) {
           body: JSON.stringify({
             workspaceId,
             plan,
-            ...(planHash ? { planHash } : {}),
+            planHash,
             ...(modelSelection.type === "model"
               ? { modelId: modelSelection.modelId }
               : modelSelection.type === "group"

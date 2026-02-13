@@ -40,6 +40,7 @@ import { refundBudget, estimateTokensFromChars } from "@/lib/llm/budget-guard";
 import { reconcileBudgetWithUsage } from "@/lib/llm/budget-reconciliation";
 import { recordLLMBudgetRefunded, recordLLMStreamAbortedTimeout, recordLLMStreamAbortedClient } from "@/lib/metrics";
 import type { StreamChunk } from "@/lib/llm/types";
+import { isStreamingEnabled } from "@/lib/config";
 
 export type ChatCompletionInput = {
   messages: ChatMessage[];
@@ -444,6 +445,17 @@ export function createChatStream(input: ChatStreamInput): ReadableStream<Uint8Ar
           const providerSignal = mergeAbortSignals([mergedSignal, providerAbortController.signal]);
 
           try {
+            const useStreaming = isStreamingEnabled();
+            if (!useStreaming) {
+              const { content, usage } = await p.chat(messages, apiKey, { context, model: modelOpt });
+              providerUsage = usage ?? null;
+              totalChars = content.length;
+              await enqueue(content);
+              streamSucceeded = true;
+              lastError = null;
+              allFailedDueToQuota = false;
+              break;
+            }
             let firstToken = false;
             for await (const chunk of p.stream(messages, apiKey, { context, model: modelOpt, signal: providerSignal }) as AsyncIterable<StreamChunk>) {
               clearTimeout(firstTokenTimeoutId);

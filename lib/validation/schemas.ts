@@ -102,7 +102,7 @@ export const agentPlanStreamBodySchema = z.object({
 export const agentExecuteStreamBodySchema = z.object({
   workspaceId: z.string().uuid().optional(),
   plan: agentPlanSchema,
-  planHash: z.string().optional(),
+  planHash: z.string().min(1, "planHash is required for execution lock"),
   provider: providerIdSchema.optional(),
   model: z.string().optional(),
   modelId: z.string().optional(),

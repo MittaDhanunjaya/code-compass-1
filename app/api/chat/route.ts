@@ -9,6 +9,7 @@ import { resolveWorkspaceId } from "@/lib/workspaces/active-workspace";
 import { loadChatHistory } from "@/lib/chat-memory";
 import { chatCompletion, ChatServiceError } from "@/services/chat.service";
 import { getLLMUserFriendlyError, isAllModelsExhaustedError, errorResponse } from "@/lib/errors";
+import { isOfflineMode } from "@/lib/config";
 
 export async function GET(request: Request) {
   let user: { id: string };
@@ -101,6 +102,13 @@ export async function POST(request: Request) {
         message: "These look like runtime logs. Confirm to debug against workspace or send as normal message.",
       });
     }
+  }
+
+  if (isOfflineMode()) {
+    return NextResponse.json(
+      { error: "AI is offline. Remote model calls are disabled.", code: "OFFLINE_MODE" },
+      { status: 503 }
+    );
   }
 
   try {

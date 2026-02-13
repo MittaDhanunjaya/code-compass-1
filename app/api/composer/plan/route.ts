@@ -9,6 +9,7 @@ import { resolveWorkspaceId } from "@/lib/workspaces/active-workspace";
 import { planComposer, ComposerPlanError } from "@/services/composer.service";
 import { composerPlanBodySchema } from "@/lib/validation/schemas";
 import { validateBody } from "@/lib/validation";
+import { isOfflineMode } from "@/lib/config";
 
 export async function POST(request: Request) {
   let user: { id: string };
@@ -77,6 +78,13 @@ export async function POST(request: Request) {
     return NextResponse.json(
       { error: "currentFilePath is required for scope 'current_folder'" },
       { status: 400 }
+    );
+  }
+
+  if (isOfflineMode()) {
+    return NextResponse.json(
+      { error: "AI is offline. Remote model calls are disabled.", code: "OFFLINE_MODE" },
+      { status: 503 }
     );
   }
 

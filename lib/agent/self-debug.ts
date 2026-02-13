@@ -6,11 +6,13 @@
 import { getProvider, type ProviderId } from "@/lib/llm/providers";
 import type { FileEditStep } from "@/lib/agent/types";
 import { extractPortFromError, findAvailablePort } from "./port-utils";
-import { SELF_HEAL_REPAIR_INSTRUCTIONS } from "./terminal-error-context";
+import { SELF_HEAL_REPAIR_INSTRUCTIONS, normalizeTerminalError } from "./terminal-error-context";
 
 const SELF_DEBUG_SYSTEM = `You are an intelligent coding assistant helping to fix a failed command. Analyze the error, understand the codebase structure, and propose targeted fixes.
 
 CRITICAL: Output valid JSON only. No markdown, no explanation outside the JSON. Use double quotes for all strings.
+
+You receive a structured error context: command, exitCode, stdout, stderr. The exitCode is explicitly available as a signal (e.g. 1 = general error, 2 = misuse, 127 = command not found). Use it to diagnose the failure. Only modify files mentioned in stack traces or stderr paths.
 
 Output a single JSON object with this exact shape:
 {
@@ -42,8 +44,11 @@ const _MAX_RETRY_ATTEMPTS = 5; // Maximum number of self-debug attempts
 
 export type SelfDebugContext = {
   command: string;
+  /** Normalized from terminal result; use normalizeTerminalError() to build. */
   stdoutTail: string;
   stderrTail: string;
+  /** Exit code from command (null if unknown). Passed to repair prompt as signal. */
+  exitCode?: number | null;
   filesEdited: string[];
   workspaceFiles?: string[]; // List of workspace file paths for context
   fileContents?: Record<string, string>; // File contents for relevant files (e.g., server files for port conflicts)
@@ -68,11 +73,11 @@ export async function proposeFixSteps(
   context: SelfDebugContext,
   options: SelfDebugOptions
 ): Promise<FileEditStep[]> {
-  const { command, stdoutTail, stderrTail, filesEdited, workspaceFiles, fileContents, previousAttempts } = context;
+  const { command, stdoutTail, stderrTail, exitCode, filesEdited, workspaceFiles, fileContents, previousAttempts } = context;
   
   const userContentParts = [
     `Failed command: ${command}`,
-    "",
+    ...(exitCode != null ? [`exitCode: ${exitCode}`, ""] : []),
     "stdout (last lines):",
     stdoutTail || "(empty)",
     "",

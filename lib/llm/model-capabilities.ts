@@ -7,13 +7,13 @@
 export type PlanningStrength = true | "weak" | false;
 
 export type ModelCapability = {
-  /** Supports streaming responses */
+  /** Supports streaming responses (alias: supportsStreaming) */
   streaming: boolean;
-  /** Supports agent planning (JSON plan generation) */
+  /** Supports agent planning (alias: supportsPlanning) */
   planning: PlanningStrength;
   /** Max context/output tokens (approximate) */
   maxTokens?: number;
-  /** Free tier – stricter rate limits, may hit 429 */
+  /** Free tier – stricter rate limits, may hit 429 (alias: freeTierQuotaRisk) */
   rateLimited?: boolean;
   /** Preferred for planning tasks (strong reasoning) */
   planningPreferred?: boolean;
@@ -102,6 +102,24 @@ export function getModelCapabilities(
   // Fallback: try slug alone (OpenRouter-style)
   if (providerId === "openrouter") return MODEL_CAPABILITIES[modelSlug];
   return undefined;
+}
+
+/** Alias: supportsStreaming */
+export function supportsStreaming(providerId: string, modelSlug: string): boolean {
+  const cap = getModelCapabilities(providerId, modelSlug);
+  return cap?.streaming ?? true;
+}
+
+/** Alias: supportsPlanning */
+export function supportsPlanning(providerId: string, modelSlug: string): boolean {
+  const cap = getModelCapabilities(providerId, modelSlug);
+  return cap?.planning === true || cap?.planning === "weak" || cap == null;
+}
+
+/** Alias: freeTierQuotaRisk */
+export function freeTierQuotaRisk(providerId: string, modelSlug: string): boolean {
+  const cap = getModelCapabilities(providerId, modelSlug);
+  return cap?.rateLimited === true;
 }
 
 export type TaskRequirement = "streaming" | "planning" | "planningPreferred";

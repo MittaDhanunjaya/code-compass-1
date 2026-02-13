@@ -4,7 +4,7 @@ import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
 import { checkRateLimit, getRateLimitIdentifier } from "@/lib/api-rate-limit";
 import { getDevBypassUser } from "@/lib/auth-dev-bypass";
 import { getProvider, getModelForProvider, OPENROUTER_FREE_MODELS, PROVIDERS, PROVIDER_LABELS, type ProviderId } from "@/lib/llm/providers";
-import { getModelCapabilities, modelMeetsRequirement } from "@/lib/llm/model-capabilities";
+import { getModelCapabilities, modelMeetsRequirement, findCapableFallback } from "@/lib/llm/model-capabilities";
 import { isRateLimitError } from "@/lib/llm/rate-limit";
 import type { AgentPlan, FileEditStep, CommandStep, PlanStep } from "@/lib/agent/types";
 import type { ScopeMode } from "@/lib/agent/types";
@@ -31,7 +31,7 @@ import { validateDeterministicPlan, hashPlanForValidation } from "@/lib/agent/de
 import { logger, logAgentStarted, logAgentCompleted, getRequestId } from "@/lib/logger";
 import { captureException } from "@/lib/sentry";
 import { recordAgentPlanDuration, recordLLMBudgetReserved, recordLLMBudgetRefunded, recordLLMBudgetExceeded, recordLLMStreamAbortedTimeout, recordLLMStreamAbortedClient } from "@/lib/metrics";
-import { isStreamingEnabled, isWeakModelsEnabled } from "@/lib/config";
+import { isStreamingEnabled, isWeakModelsEnabled, isOfflineMode } from "@/lib/config";
 
 // Same system prompt as plan route, but with instruction to emit reasoning messages
 const PLAN_SYSTEM = `You are an intelligent coding agent planner. Your job is to understand the user's request, analyze the codebase, and create a plan that accomplishes the task.
@@ -190,6 +190,13 @@ export async function POST(request: Request) {
     return NextResponse.json(
       { error: "No active workspace selected" },
       { status: 400 }
+    );
+  }
+
+  if (isOfflineMode()) {
+    return NextResponse.json(
+      { error: "AI is offline. Remote model calls are disabled.", code: "OFFLINE_MODE" },
+      { status: 503 }
     );
   }
 
@@ -798,7 +805,9 @@ ${instruction.slice(0, 8000)}
             const streamStartTime = Date.now();
             usage = null;
             const streamAbortSignal = createStreamAbortSignal(request, MAX_STREAM_DURATION_MS, (r) => { abortReason = r; });
+            const useStreaming = isStreamingEnabled() && modelMeetsRequirement(cfg.providerId, tryModel, "streaming");
             try {
+            if (useStreaming) {
             for await (const chunk of tryProvider.stream(
             [
               { role: "system", content: systemPromptWithRules },
@@ -895,6 +904,19 @@ ${instruction.slice(0, 8000)}
               emit(createAgentEvent('reasoning', cleaned));
             }
           }
+            } else {
+              emit(createAgentEvent('reasoning', 'Using non-streaming mode (STREAMING_ENABLED=false or model does not support streaming).'));
+              const chatResponse = await tryProvider.chat(
+                [
+                  { role: "system", content: systemPromptWithRules },
+                  { role: "user", content: userContent },
+                ],
+                cfg.apiKey,
+                { model: tryModel, temperature: 0, topP: 1, signal: streamAbortSignal }
+              );
+              raw = chatResponse.content ?? "";
+              usage = chatResponse.usage ?? null;
+            }
             modelUsed = tryModel;
             winningConfig = cfg;
             streamDone = true;
@@ -948,15 +970,70 @@ ${instruction.slice(0, 8000)}
 
         // Parse plan from streaming response (if not already generated from chain-of-thought)
         if (!plan) {
-          const trimmed = raw.trim();
+          let trimmed = raw.trim();
 
           // Handle empty or missing response (e.g. Perplexity sometimes returns no content)
           if (!trimmed) {
-            emit(createAgentEvent('status', 'Error: The model returned no content'));
-            emit(createAgentEvent('reasoning', 'The model returned an empty response. This can happen with some providers (e.g. Perplexity) or when the request times out. Try: using OpenRouter (free models) or Gemini, or retrying.'));
-            safeEnqueue(controller, encoder, `data: ${JSON.stringify({ type: 'error', error: 'The model returned no content. Try a different provider (e.g. OpenRouter or Gemini) or retry.' })}\n\n`);
-            safeClose(controller);
-            return;
+            emit(createAgentEvent('status', 'Model returned no content; retrying with same provider...'));
+            let emptyRetryRaw = "";
+            if (winningConfig) {
+              try {
+                const retryProvider = getProvider(winningConfig.providerId);
+                const retryAbort = new AbortController();
+                const retryTimeout = setTimeout(() => retryAbort.abort(), PLAN_RETRY_TIMEOUT_MS);
+                const retryResponse = await retryProvider.chat(
+                  [
+                    { role: "system", content: systemPromptWithRules },
+                    { role: "user", content: userContent },
+                  ],
+                  winningConfig.apiKey,
+                  { model: winningConfig.modelSlug, temperature: 0, topP: 1, signal: retryAbort.signal }
+                );
+                clearTimeout(retryTimeout);
+                emptyRetryRaw = (retryResponse.content || "").trim();
+              } catch {
+                emit(createAgentEvent('reasoning', 'Same-provider retry failed. Trying fallback provider...'));
+              }
+            }
+            if (!emptyRetryRaw && configsToTry.length > 1 && winningConfig) {
+              const fallbackIdx = configsToTry.findIndex((c) => c.providerId === winningConfig!.providerId && c.modelSlug === winningConfig!.modelSlug);
+              const fallbackConfig = findCapableFallback(configsToTry, fallbackIdx >= 0 ? fallbackIdx : 0, ["planning"]);
+              if (fallbackConfig) {
+                emit(createAgentEvent('status', `Trying fallback provider ${fallbackConfig.modelLabel}...`));
+                try {
+                  const fallbackProvider = getProvider(fallbackConfig.providerId);
+                  const fallbackAbort = new AbortController();
+                  const fallbackTimeout = setTimeout(() => fallbackAbort.abort(), PLAN_RETRY_TIMEOUT_MS);
+                  const fallbackResponse = await fallbackProvider.chat(
+                    [
+                      { role: "system", content: systemPromptWithRules },
+                      { role: "user", content: userContent },
+                    ],
+                    fallbackConfig.apiKey,
+                    { model: fallbackConfig.modelSlug, temperature: 0, topP: 1, signal: fallbackAbort.signal }
+                  );
+                  clearTimeout(fallbackTimeout);
+                  emptyRetryRaw = (fallbackResponse.content || "").trim();
+                  if (emptyRetryRaw) {
+                    modelUsed = fallbackConfig.modelSlug;
+                    winningConfig = fallbackConfig;
+                    emit(createAgentEvent('reasoning', `Fallback provider succeeded: got ${emptyRetryRaw.length} chars.`));
+                  }
+                } catch {
+                  emit(createAgentEvent('reasoning', 'Fallback provider retry failed.'));
+                }
+              }
+            }
+            const finalRaw = emptyRetryRaw || trimmed;
+            if (!finalRaw) {
+              emit(createAgentEvent('status', 'Error: The model returned no content'));
+              emit(createAgentEvent('reasoning', 'The model returned an empty response after retries. Try a different provider (e.g. OpenRouter or Gemini) or retry.'));
+              safeEnqueue(controller, encoder, `data: ${JSON.stringify({ type: 'error', error: 'The model returned no content. Try a different provider (e.g. OpenRouter or Gemini) or retry.', code: 'EMPTY_RESPONSE' })}\n\n`);
+              safeClose(controller);
+              return;
+            }
+            raw = finalRaw;
+            trimmed = finalRaw;
           }
 
           emit(createAgentEvent('reasoning', 'Parsing plan response...'));
@@ -971,8 +1048,8 @@ ${instruction.slice(0, 8000)}
           let parseResult = extractAgentPlanJSON<AgentPlan>(currentRaw, ["steps"]);
           let lastError = safeErrorStr(parseResult.error);
 
-          // Phase 3: Retry-on-parse-failure loop (up to 3 retries with validation error + raw output)
-          const MAX_PARSE_RETRIES = 3;
+          // Phase 3: Retry-on-parse-failure: 1 retry with same provider, then fallback provider
+          const MAX_PARSE_RETRIES = 1;
           for (let retry = 0; retry <= MAX_PARSE_RETRIES; retry++) {
             if (parseResult.success && parseResult.data) {
               const schemaValidation = validateDeterministicPlan(parseResult.data);
@@ -1017,6 +1094,45 @@ ${instruction.slice(0, 8000)}
                 console.warn("Plan parse retry failed:", retryErr);
                 emit(createAgentEvent('reasoning', `Retry ${retry + 1} failed: ${isTimeout ? "Request timed out. Try a different model." : msg}`));
                 break;
+              }
+            }
+          }
+
+          if (!plan && configsToTry.length > 1 && winningConfig) {
+            const currentIdx = configsToTry.findIndex((c) => c.providerId === winningConfig!.providerId && c.modelSlug === winningConfig!.modelSlug);
+            const fallbackConfig = findCapableFallback(configsToTry, currentIdx >= 0 ? currentIdx : 0, ["planning"]);
+            if (fallbackConfig) {
+              emit(createAgentEvent('status', `Parse failed with primary provider; retrying with fallback ${fallbackConfig.modelLabel}...`));
+              const fixHint = `\n\n[System: Your previous response had invalid JSON or schema errors. Fix and output ONLY valid JSON. No markdown. No commentary.\nError: ${lastError}\nOutput ONLY a JSON object with "steps" array. Each step: {"type":"file_edit","path":"...","newContent":"..."} or {"type":"command","command":"..."}]\n\n`;
+              try {
+                const fallbackProvider = getProvider(fallbackConfig.providerId);
+                const fallbackAbort = new AbortController();
+                const fallbackTimeout = setTimeout(() => fallbackAbort.abort(), PLAN_RETRY_TIMEOUT_MS);
+                const fallbackResponse = await fallbackProvider.chat(
+                  [
+                    { role: "system", content: systemPromptWithRules },
+                    { role: "user", content: userContent + fixHint },
+                  ],
+                  fallbackConfig.apiKey,
+                  { model: fallbackConfig.modelSlug, temperature: 0, topP: 1, signal: fallbackAbort.signal }
+                );
+                clearTimeout(fallbackTimeout);
+                const fallbackRaw = (fallbackResponse.content || "").trim();
+                if (fallbackRaw) {
+                  const fallbackParse = extractAgentPlanJSON<AgentPlan>(fallbackRaw, ["steps"]);
+                  if (fallbackParse.success && fallbackParse.data) {
+                    const schemaCheck = validateDeterministicPlan(fallbackParse.data);
+                    if (schemaCheck.success && schemaCheck.plan.steps?.length) {
+                      plan = schemaCheck.plan;
+                      modelUsed = fallbackConfig.modelSlug;
+                      winningConfig = fallbackConfig;
+                      emit(createAgentEvent('reasoning', `Fallback provider succeeded: got valid plan with ${plan.steps.length} step(s).`));
+                    }
+                  }
+                }
+              } catch (fallbackErr) {
+                console.warn("Fallback provider parse retry failed:", fallbackErr);
+                emit(createAgentEvent('reasoning', 'Fallback provider retry failed.'));
               }
             }
           }

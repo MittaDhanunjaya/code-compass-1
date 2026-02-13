@@ -15,6 +15,7 @@ import { WorkspaceSelector } from "@/components/workspace-selector";
 import { CmdKOverlay } from "@/components/cmd-k-overlay";
 import { FirstRunChecklist } from "@/components/first-run-checklist";
 import { RulesEditorDialog } from "@/components/rules-editor-dialog";
+import { OfflineBanner } from "@/components/offline-banner";
 
 type AIPanelTab = "chat" | "composer" | "agent";
 
@@ -77,7 +78,9 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
   }, [workspaceId]);
 
   return (
-    <div className="flex h-screen w-full overflow-hidden bg-background">
+    <div className="flex flex-col h-screen w-full overflow-hidden bg-background">
+      <OfflineBanner />
+      <div className="flex flex-1 min-h-0">
       {/* Left sidebar - min-h-0 so flex-1 scrollable area gets bounded height */}
       <aside className="flex w-56 flex-col min-h-0 border-r border-border bg-muted/30">
         <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-3">
@@ -154,6 +157,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
           <ChatPanel workspaceId={workspaceId} activeTab={aiPanelTab} />
         </div>
       </aside>
+      </div>
       <CommandPalette />
       <FirstRunChecklist />
       <RulesEditorDialog

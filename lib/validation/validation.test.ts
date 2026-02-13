@@ -9,6 +9,7 @@ import {
   agentExecuteStreamBodySchema,
   chatStreamBodySchema,
 } from "./schemas";
+import { hashPlan } from "@/lib/agent/plan-lock";
 import { validateBody, validateAgentPlanOutput, validatePrAnalyzeOutput, validateDebugFromLogOutput } from "./index";
 
 describe("agentPlanOutputSchema", () => {
@@ -112,10 +113,10 @@ describe("validateBody", () => {
   });
 
   it("validates agentExecuteStreamBodySchema", () => {
+    const plan = { steps: [{ type: "file_edit", path: "a.ts", newContent: "x" }] };
     const body = {
-      plan: {
-        steps: [{ type: "file_edit", path: "a.ts", newContent: "x" }],
-      },
+      plan,
+      planHash: hashPlan(plan),
     };
     const result = validateBody(agentExecuteStreamBodySchema, body);
     expect(result.success).toBe(true);
@@ -124,6 +125,13 @@ describe("validateBody", () => {
   it("rejects execute without plan", () => {
     const result = validateBody(agentExecuteStreamBodySchema, {});
     expect(result.success).toBe(false);
+  });
+
+  it("rejects execute without planHash", () => {
+    const plan = { steps: [{ type: "file_edit", path: "a.ts", newContent: "x" }] };
+    const result = validateBody(agentExecuteStreamBodySchema, { plan });
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toMatch(/planHash|required/i);
   });
 });
 

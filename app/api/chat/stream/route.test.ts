@@ -46,6 +46,11 @@ vi.mock("@/lib/encrypt", () => ({
   decrypt: vi.fn().mockResolvedValue("sk-mock-api-key"),
 }));
 
+vi.mock("@/lib/config", () => ({
+  isStreamingEnabled: vi.fn().mockReturnValue(true),
+  isOfflineMode: vi.fn().mockReturnValue(false),
+}));
+
 describe("POST /api/chat/stream", () => {
   beforeEach(async () => {
     vi.clearAllMocks();
@@ -96,6 +101,34 @@ describe("POST /api/chat/stream", () => {
     const res = await POST(req);
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toContain("text/plain");
+    expect(res.body).toBeInstanceOf(ReadableStream);
+
+    const reader = res.body!.getReader();
+    const chunks: string[] = [];
+    let done = false;
+    while (!done) {
+      const { value, done: d } = await reader.read();
+      done = d;
+      if (value) chunks.push(new TextDecoder().decode(value));
+    }
+    const fullText = chunks.join("");
+    expect(fullText).toContain(MOCK_STREAM_CONTENT);
+  });
+
+  it("uses non-streaming path when STREAMING_ENABLED=false", async () => {
+    const config = await import("@/lib/config");
+    vi.mocked(config.isStreamingEnabled).mockReturnValueOnce(false);
+
+    const req = new Request("http://localhost/api/chat/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ role: "user", content: "Hello" }],
+        provider: "openrouter",
+      }),
+    });
+    const res = await POST(req);
+    expect(res.status).toBe(200);
     expect(res.body).toBeInstanceOf(ReadableStream);
 
     const reader = res.body!.getReader();
