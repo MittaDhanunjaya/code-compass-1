@@ -21,17 +21,20 @@ function buildMessages(
     systemParts.push(parts.join(""));
   }
 
-  // Merge consecutive same-role messages; collect system into systemParts.
-  const normalized: { role: "user" | "assistant"; content: string }[] = [];
+  // Merge consecutive same-role text-only messages; collect system into systemParts.
+  // Multimodal content (images) is passed through as-is without merging.
+  const normalized: { role: "user" | "assistant"; content: string | import("./types").ContentPart[] }[] = [];
   for (const m of messages) {
     if (m.role === "system") {
-      systemParts.push(m.content);
+      const text = typeof m.content === "string" ? m.content : m.content.filter((p) => p.type === "text").map((p) => (p as { type: "text"; text: string }).text).join("\n");
+      systemParts.push(text);
       continue;
     }
     if (m.role !== "user" && m.role !== "assistant") continue;
     const last = normalized[normalized.length - 1];
-    if (last?.role === m.role) {
-      last.content += "\n\n" + m.content;
+    const canMerge = last?.role === m.role && typeof m.content === "string" && typeof last.content === "string";
+    if (canMerge) {
+      last.content = (last.content as string) + "\n\n" + m.content;
     } else {
       normalized.push({ role: m.role, content: m.content });
     }

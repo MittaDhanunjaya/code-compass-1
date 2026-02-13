@@ -99,6 +99,29 @@ Code Compass is a Next.js 15 app with:
 
 ---
 
+## Tooling vs AI (Critical Separation)
+
+**Never use LLMs for deterministic tasks.** Use native tools instead.
+
+| Task | Tool | AI |
+|------|------|-----|
+| Formatting | Prettier, Black, gofmt, clang-format, rustfmt | ❌ |
+| Linting | ESLint, Ruff, etc. (run in sandbox) | ❌ |
+| Validation | Zod | ❌ |
+| Diffs | Monaco diff editor | ❌ |
+| File ops | Native FS, Supabase | ❌ |
+| Planning | — | ✓ |
+| Reasoning | — | ✓ |
+| Refactoring | — | ✓ (optional) |
+
+**Implementation**:
+- `lib/formatters` — Prettier, Black, gofmt, etc. No LLM.
+- `prepareEditContent()` — Escape normalization + deterministic formatter before applying any edit.
+- Sandbox runs lint/test/run via stack commands (ESLint, pytest, etc.).
+- LLM output parsing: `parseJSONRobust`, Zod schemas — never ask LLM to "validate" or "format".
+
+---
+
 ## Security
 
 - Auth on all sensitive routes

@@ -2,15 +2,16 @@
 
 import { useEffect, useState, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
-import { Github, Key, Keyboard, Settings, Shield, User } from "lucide-react";
+import { Cpu, Github, Key, Keyboard, Settings, Shield, User } from "lucide-react";
 import { DEFAULT_PROTECTED_PATTERNS } from "@/lib/protected-paths";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { KeySettingsContent } from "@/components/key-settings-content";
 import { KeyboardShortcutsSettings } from "@/components/keyboard-shortcuts-settings";
+import { ModelPreferencesSettings } from "@/components/model-preferences-settings";
 
-type SettingsTab = "general" | "keys" | "safety" | "shortcuts" | "github";
+type SettingsTab = "general" | "keys" | "models" | "safety" | "shortcuts" | "github";
 
 type GitHubStatus = {
   linked: boolean;
@@ -73,6 +74,7 @@ function SettingsContent() {
     const tab = searchParams.get("tab");
     const github = searchParams.get("github");
     if (tab === "keys") setActiveTab("keys");
+    else if (tab === "models") setActiveTab("models");
     else if (tab === "safety") setActiveTab("safety");
     else if (tab === "shortcuts") setActiveTab("shortcuts");
     else if (tab === "github" || github) setActiveTab("github");
@@ -148,6 +150,7 @@ function SettingsContent() {
   const tabs: { id: SettingsTab; label: string; icon: React.ReactNode }[] = [
     { id: "general", label: "General", icon: <User className="h-4 w-4" /> },
     { id: "keys", label: "API Keys", icon: <Key className="h-4 w-4" /> },
+    { id: "models", label: "Models", icon: <Cpu className="h-4 w-4" /> },
     { id: "safety", label: "Safety", icon: <Shield className="h-4 w-4" /> },
     { id: "shortcuts", label: "Shortcuts", icon: <Keyboard className="h-4 w-4" /> },
     { id: "github", label: "GitHub", icon: <Github className="h-4 w-4" /> },
@@ -167,7 +170,7 @@ function SettingsContent() {
   ];
 
   return (
-    <div className="flex flex-1 flex-col p-6 max-w-2xl">
+    <div className="flex flex-1 flex-col min-h-0 overflow-y-auto p-6 max-w-2xl">
       <h1 className="text-xl font-semibold mb-4 flex items-center gap-2">
         <Settings className="h-5 w-5" />
         Settings
@@ -199,6 +202,20 @@ function SettingsContent() {
           </section>
         </div>
       )}
+      {activeTab === "models" && (
+        <div className="space-y-4">
+          <section className="space-y-2">
+            <Label className="text-base font-medium flex items-center gap-2">
+              <Cpu className="h-4 w-4" />
+              Model preferences
+            </Label>
+            <p className="text-sm text-muted-foreground">
+              Pick up to 10 models from Free, Low-cost, and Efficient categories. These appear in the model dropdown in Chat, Composer, and Agent—when the selector is enabled for each mode.
+            </p>
+            <ModelPreferencesSettings />
+          </section>
+        </div>
+      )}
       {activeTab === "keys" && (
         <div className="space-y-4">
           <section className="space-y-2">
@@ -206,6 +223,9 @@ function SettingsContent() {
               <Key className="h-4 w-4" />
               LLM provider API keys
             </Label>
+            <p className="text-sm text-muted-foreground">
+              Add one key per provider (OpenRouter, OpenAI, Gemini, Perplexity, Ollama, LM Studio). One key works for all models from that provider. For non-listed models (e.g. a custom OpenRouter model), add the provider key here, then add the model in Settings → Models or in the model dropdown.
+            </p>
             <p className="text-sm text-muted-foreground">
               The app picks a best default model from your connected APIs and free models (Chat, Cmd+K, tab completion, Agent). You can change it anytime in the model dropdown in Chat or in the Agent panel.
             </p>

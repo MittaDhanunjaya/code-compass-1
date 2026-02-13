@@ -23,8 +23,8 @@ export const AGENT_CONFIG = {
 
 /** Streaming and chunking limits */
 export const STREAMING_CONFIG = {
-  /** Upstream timeout for LLM streams (5 min) */
-  STREAM_UPSTREAM_TIMEOUT_MS: 5 * 60 * 1000,
+  /** Upstream timeout for LLM streams - hard cap 60s */
+  STREAM_UPSTREAM_TIMEOUT_MS: 60_000,
   /** Max total stream duration - hard cap (60s) */
   MAX_STREAM_DURATION_MS: 60_000,
   /** CoT (chain-of-thought) timeout when waiting for reasoning (ms) */

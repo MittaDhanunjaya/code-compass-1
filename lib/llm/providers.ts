@@ -5,6 +5,10 @@ import { perplexityProvider } from "./perplexity-provider";
 import { openRouterProvider } from "./openrouter-provider";
 import { ollamaProvider } from "./ollama-provider";
 import { lmstudioProvider } from "./lmstudio-provider";
+import { OPENROUTER_FREE_MODELS } from "./openrouter-models";
+
+export { OPENROUTER_FREE_MODELS } from "./openrouter-models";
+export type { OpenRouterModelId } from "./openrouter-models";
 
 export const PROVIDERS = ["openrouter", "openai", "gemini", "perplexity", "ollama", "lmstudio"] as const;
 export type ProviderId = (typeof PROVIDERS)[number];
@@ -26,17 +30,6 @@ export const PROVIDER_KEYS_URL: Record<ProviderId, string> = {
   ollama: "",
   lmstudio: "",
 };
-
-// Free models available through OpenRouter. openrouter/free is a router that picks an available free model (most reliable).
-// Note: Some :free variant IDs may 404; getModelForProvider maps them to openrouter/free.
-export const OPENROUTER_FREE_MODELS = [
-  { id: "openrouter/free", label: "Free (auto-select)" },
-  { id: "deepseek/deepseek-chat:free", label: "DeepSeek Chat (free)" },
-  { id: "meta-llama/llama-3.2-3b-instruct:free", label: "Llama 3.2 3B (free)" },
-  { id: "mistralai/mistral-7b-instruct:free", label: "Mistral 7B Instruct (free)" },
-] as const;
-
-export type OpenRouterModelId = (typeof OPENROUTER_FREE_MODELS)[number]["id"];
 
 const providerMap: Record<ProviderId, LLMProvider> = {
   openrouter: openRouterProvider,
@@ -63,13 +56,26 @@ export function getModelForProvider(
 ): string | undefined {
   if (providerId === "openrouter") {
     const m = bodyModel?.trim();
-    // Route all :free model IDs through openrouter/free so we never 404 when OpenRouter changes endpoints
+    const knownFreeIds = OPENROUTER_FREE_MODELS.map((x) => x.id);
+    // Pass through when user selected a known free model (so they actually get that model)
+    if (m && knownFreeIds.includes(m as (typeof knownFreeIds)[number])) return m;
+    // Route unknown :free or empty to openrouter/free for robustness
     if (!m || m.endsWith(":free")) return "openrouter/free";
     return m;
   }
   if (providerId === "openai") {
     const m = bodyModel?.trim();
     if (m && (m.startsWith("gpt-") || m.startsWith("o1-") || m.startsWith("gpt-4"))) return m;
+    return undefined;
+  }
+  if (providerId === "perplexity") {
+    const m = bodyModel?.trim();
+    if (m && (m === "sonar" || m === "sonar-pro")) return m;
+    return undefined;
+  }
+  if (providerId === "gemini") {
+    const m = bodyModel?.trim();
+    if (m && (m.startsWith("gemini-") || m.startsWith("gemini/"))) return m;
     return undefined;
   }
   if (providerId === "ollama") {

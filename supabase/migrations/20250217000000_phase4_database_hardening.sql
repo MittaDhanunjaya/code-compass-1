@@ -23,6 +23,7 @@ CREATE INDEX IF NOT EXISTS idx_embedding_cache_created ON public.embedding_cache
 ALTER TABLE public.embedding_cache ENABLE ROW LEVEL SECURITY;
 
 -- Authenticated users can read/write during indexing (cache is content-based, not user-specific)
+DROP POLICY IF EXISTS "Authenticated users can use embedding cache" ON public.embedding_cache;
 CREATE POLICY "Authenticated users can use embedding cache"
   ON public.embedding_cache
   FOR ALL
@@ -44,6 +45,7 @@ CREATE INDEX IF NOT EXISTS idx_token_usage_daily_user_date ON public.token_usage
 
 ALTER TABLE public.token_usage_daily ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "Users can manage own token usage" ON public.token_usage_daily;
 CREATE POLICY "Users can manage own token usage"
   ON public.token_usage_daily
   FOR ALL
@@ -65,6 +67,7 @@ CREATE INDEX IF NOT EXISTS idx_token_usage_workspace_daily_ws_date ON public.tok
 
 ALTER TABLE public.token_usage_workspace_daily ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "Workspace owners can manage workspace token usage" ON public.token_usage_workspace_daily;
 CREATE POLICY "Workspace owners can manage workspace token usage"
   ON public.token_usage_workspace_daily
   FOR ALL

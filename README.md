@@ -10,9 +10,11 @@ Code Compass is a **safety-first, multi-provider AI IDE** for GitHub repos and l
 - [How to use the application](#how-to-use-the-application)
 - [Features and how to use them](#features-and-how-to-use-them)
 - [Getting started](#getting-started)
+- [Environments](#environments)
 - [Configuration](#configuration)
 - [CI integration](#ci-integration)
 - [Project structure and what to commit](#project-structure-and-what-to-commit)
+- [Architecture & API](#architecture--api)
 - [Contributing](#contributing)
 - [Status and roadmap](#status-and-roadmap)
 
@@ -214,6 +216,20 @@ npm start
 npm run test
 ```
 
+### Environments
+
+Code Compass uses `NODE_ENV` to distinguish environments:
+
+| Command | Environment | NODE_ENV | Use case |
+|---------|--------------|----------|----------|
+| `npm run dev` | Development | `development` | Local development with hot reload, dev tools, `X-Dev-Token` auth bypass, debug routes |
+| `npm run build` + `npm run start` | Production | `production` | Production build; preflight checks block startup if critical systems fail; auth required |
+| `npm run test` | Test | `test` | Unit tests (Vitest); metrics and logging are skipped |
+
+- **Development** — Default for `npm run dev`. Hot reload, dev-only features (e.g. `/api/debug/*`), optional `DEV_OPENROUTER_API_KEY`.
+- **Production** — Used by `npm run start` after `npm run build`. Preflight gate runs at startup; no dev bypasses.
+- **Test** — Set by Vitest when running `npm run test`. Used for automated tests, not a running app.
+
 ### Lint
 
 ```bash
@@ -227,6 +243,22 @@ npm run lint
 - **Per-workspace stack** — `.code-compass/config.json` in the repo (or via Stack & Commands in the UI): `services[]` with `name`, `root`, `stack`, `lintCommand`, `testCommand`, `runCommand`. Used by the sandbox and debug-from-log.
 - **Per-workspace rules** — Project rules (e.g. `.code-compass-rules`) for Agent/Composer behavior.
 - **Env overrides** — Task routing and provider behavior can be tuned via environment variables; see `lib/llm/task-routing.ts` and provider code.
+
+---
+
+## Resilience & Fallbacks
+
+Code Compass handles common environment and quota failures to avoid crashes and improve DX:
+
+- **Port collision** — If port 3000 is busy, `npm run dev` and `npm start` automatically pick a free port in 3001–3100 and log `Port 3000 busy → using PORT=<port>`. Cross-platform (macOS/Linux/Windows).
+- **NODE_ENV guardrail** — If `NODE_ENV` is invalid or unset, it is auto-set to `development` for `next dev` and `production` for `next start`, with a warning.
+- **Preflight** — Before `dev`, `start`, and `test`, the preflight checks that required scripts (`dev`, `build`, `start`, `test`) and binaries (`next`, `vitest`) exist. If missing, it prints remediation commands and exits non-zero.
+- **Healthcheck** — Run `npm run healthcheck` in CI to validate ports, `NODE_ENV`, scripts, binaries, and AI provider config. Exits 0 if all pass.
+- **AI provider fallback** — On 429, quota, or rate-limit, the LLM router retries with the next configured provider. Structured logs: `{ provider, model, reason, retryingWith }`. Set `AI_PROVIDERS_ENABLED=false` to disable AI calls. When all providers fail, the UI receives `AI_TEMPORARILY_UNAVAILABLE` (503) instead of crashing.
+
+### Streaming Resilience
+
+The AI streaming pipeline guarantees either streamed tokens or a final structured error event—never silent completion. On stream failure (429, timeout, network, provider error), the chat stream emits `{ "type": "error", "code": "AI_STREAM_FAILED", "provider", "model", "reason" }` and falls back to non-streaming completion. If the fallback also fails, the UI receives `AI_TEMPORARILY_UNAVAILABLE`. Frontend stream consumers (agent plan/execute hooks) handle empty stream, premature close, and error event frames; display a visible error instead of infinite loading.
 
 ---
 
@@ -278,9 +310,77 @@ Unnecessary or generated files are listed in `.gitignore` (e.g. `node_modules/`,
 
 ---
 
+## Architecture & API
+
+### Architecture
+
+Code Compass is a Next.js 15 app with:
+
+- **Frontend**: React, Tailwind, Radix UI, Monaco Editor
+- **Backend**: Next.js API routes, Supabase (auth + Postgres)
+- **AI**: Multi-provider LLM router (OpenRouter, OpenAI, Gemini, Ollama, LM Studio, etc.)
+- **Indexing**: Vector embeddings for semantic search, symbol graph for LSP
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Browser (React)                                                 │
+│  ├── App Shell (workspace selector, file tree, AI panel)         │
+│  ├── Editor Area (Monaco, LSP integration)                       │
+│  ├── Chat / Agent / Composer panels                             │
+│  └── Terminal panel                                             │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Next.js API Routes                                              │
+│  ├── requireAuth / requireWorkspaceAccess                        │
+│  ├── rate limiting (lib/api-rate-limit)                          │
+│  └── thin controllers → services                                │
+└─────────────────────────────────────────────────────────────────┘
+          ┌───────────────────┼───────────────────┐
+          ▼                   ▼                   ▼
+┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+│  Services        │ │  lib/llm/router   │ │  Supabase         │
+│  ├── agent       │ │  ├── invoke       │ │  ├── auth         │
+│  ├── chat        │ │  ├── providers    │ │  ├── workspaces   │
+│  ├── composer    │ │  └── budget guard │ │  ├── provider_keys│
+│  └── vector      │ │  Sandbox (lib/    │ │  └── embeddings   │
+└──────────────────┘ │  sandbox)        │ └──────────────────┘
+                     └──────────────────┘
+```
+
+**Key flows:**
+
+- **LLM**: Router (`lib/llm/router.ts`) → budget guard → task routing → providers. Per-user and per-workspace token limits; 429 when over.
+- **Agent**: Plan (`/api/agent/plan-stream`) → Execute (`/api/agent/execute-stream`) → sandbox with tools. Registry validates tool names and inputs.
+- **Chat**: Stream (`/api/chat/stream`) → messages + workspace context → LLM stream → SSE. Max 60s stream duration.
+
+Full details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+
+### API Reference
+
+- **Auth**: Protected routes use `requireAuth(request)` or `requireWorkspaceAccess(request, workspaceId)`. 401 = no session; 403 = forbidden.
+- **Rate limits**: Chat 60/min; agent, composer, inline-edit 30/min per user or IP. Returns 429 with `Retry-After` when over.
+- **Budget**: Per-user and per-workspace daily token limits. Returns 429 `BUDGET_EXCEEDED` when exceeded.
+
+| Route | Method | Auth | Description |
+|-------|--------|------|-------------|
+| `/api/chat/stream` | POST | yes | Streaming chat. Body: `{ messages, workspaceId?, ... }`. |
+| `/api/agent/plan-stream` | POST | yes | Streaming plan. Body: `{ instruction, workspaceId, scopeMode?, ... }`. |
+| `/api/agent/execute-stream` | POST | yes | Streaming execution. Body: `{ plan, workspaceId, ... }`. |
+| `/api/workspaces/[id]/debug-from-log` | POST | yes | Debug from error log. |
+| `/api/ci/propose-fixes` | POST | yes or CI token | Propose fixes from CI logs. |
+| `/api/health` | GET | no | Health check. |
+
+Full reference: [docs/API.md](docs/API.md)
+
+---
+
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for how to run locally, code style, and the PR checklist. API and architecture docs are in [docs/API.md](docs/API.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to run locally, code style, and the PR checklist.
+
+**Documentation**: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | [docs/API.md](docs/API.md) | [docs/PRODUCTION_HARDENING_CHANGES.md](docs/PRODUCTION_HARDENING_CHANGES.md)
 
 ---
 

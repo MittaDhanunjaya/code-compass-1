@@ -6,7 +6,8 @@ import { Button } from "@/components/ui/button";
 import { useEditor } from "@/lib/editor-context";
 import { useTerminal } from "@/lib/terminal-context";
 import { PROVIDERS, PROVIDER_LABELS, OPENROUTER_FREE_MODELS, type ProviderId } from "@/lib/llm/providers";
-import type { AgentPlan, PlanStep, FileEditStep, CommandStep, AgentExecuteResult, ScopeMode } from "@/lib/agent/types";
+import { useModelPreferences } from "@/hooks/use-model-preferences";
+import type { AgentPlan, FileEditStep, CommandStep, AgentExecuteResult, ScopeMode } from "@/lib/agent/types";
 import { SAFE_EDIT_MAX_FILES } from "@/lib/protected-paths";
 import type { AgentEvent } from "@/lib/agent-events";
 import { openFileInWorkspace } from "@/lib/open-file-in-workspace";
@@ -24,9 +25,18 @@ import {
   AgentExecutionResult,
   AgentConfirmDialogs,
   AgentReviewQueue,
+  AgentDebugPanel,
 } from "@/components/agent";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import type { LogAttachment } from "@/lib/chat/log-utils";
-import { useAgentPlan } from "@/hooks/useAgentPlan";
+import { useAgentPlan, type PlanDebugInfo } from "@/hooks/useAgentPlan";
 import { useAgentExecute } from "@/hooks/useAgentExecute";
 import { useUndoRedo } from "@/hooks/useUndoRedo";
 
@@ -75,6 +85,8 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
   const [pendingLargeEditEdits, setPendingLargeEditEdits] = useState<{ path: string; content: string }[]>([]);
   const [agentFullFileReplaceConfirmOpen, setAgentFullFileReplaceConfirmOpen] = useState(false);
   const [pendingFullFileReplaceEdits, setPendingFullFileReplaceEdits] = useState<{ path: string; content: string }[]>([]);
+  const [planDiffDialogOpen, setPlanDiffDialogOpen] = useState(false);
+  const [pendingPlanDiff, setPendingPlanDiff] = useState<{ previous: AgentPlan; new: AgentPlan } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [autoRetryIn, setAutoRetryIn] = useState<number | null>(null); // seconds until auto-retry, null when not scheduled
   const autoRetryCountRef = useRef(0);
@@ -116,6 +128,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
   const [scopeMode, setScopeModeState] = useState<ScopeMode>(getStoredScopeMode());
   const [aggressiveConfirmOpen, setAggressiveConfirmOpen] = useState(false);
   const [planContextUsed, setPlanContextUsed] = useState<string[] | null>(null);
+  const [planDebugInfo, setPlanDebugInfo] = useState<PlanDebugInfo | null>(null);
   const [largeFileConfirmOpen, setLargeFileConfirmOpen] = useState(false);
   const [largeFileCount, setLargeFileCount] = useState(0);
   const [protectedConfirmOpen, setProtectedConfirmOpen] = useState(false);
@@ -141,6 +154,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
   const [modelFallbackBanner, setModelFallbackBanner] = useState<{
     from: string;
     to: string;
+    reason?: "rate_limit" | "capability";
     availableFreeModels: { id: string; label: string }[];
   } | null>(null);
   const [modelsAvailable, setModelsAvailable] = useState<{
@@ -150,6 +164,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
   } | null>(null);
   const [modelSelection, setModelSelectionState] = useState<ModelSelection>({ type: "auto" });
   const [modelsManagerOpen, setModelsManagerOpen] = useState(false);
+  const { prefs: modelPrefs } = useModelPreferences();
   const [defaultGroupInfo, setDefaultGroupInfo] = useState<{
     groupId: string | null;
     isUserSaved: boolean;
@@ -374,7 +389,57 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
     return Array.isArray(data) ? data.map((f: { path: string }) => f.path) : [];
   }, [workspaceId]);
 
-  const { startPlan: startPlanFromHook, rejectPlan: rejectPlanFromHook } = useAgentPlan({
+  /** Step 7: Plan diffing - detect significant plan changes. */
+  const isPlanDiffSignificant = useCallback((prev: AgentPlan, next: AgentPlan): boolean => {
+    const prevPaths = new Set(
+      prev.steps
+        .filter((s): s is FileEditStep => s?.type === "file_edit")
+        .map((s) => s.path)
+    );
+    const nextPaths = new Set(
+      next.steps
+        .filter((s): s is FileEditStep => s?.type === "file_edit")
+        .map((s) => s.path)
+    );
+    if (prevPaths.size !== nextPaths.size) return true;
+    for (const p of nextPaths) if (!prevPaths.has(p)) return true;
+    for (const p of prevPaths) if (!nextPaths.has(p)) return true;
+    const prevCmds = prev.steps
+      .filter((s): s is CommandStep => s?.type === "command")
+      .map((s) => s.command);
+    const nextCmds = next.steps
+      .filter((s): s is CommandStep => s?.type === "command")
+      .map((s) => s.command);
+    if (prevCmds.length !== nextCmds.length) return true;
+    return prevCmds.some((c, i) => c !== nextCmds[i]);
+  }, []);
+
+  const handlePlanReceived = useCallback(
+    (newPlan: AgentPlan | null) => {
+      if (!newPlan?.steps?.length) {
+        setPlan(newPlan);
+        return;
+      }
+      setPlan((prev) => {
+        if (!prev?.steps?.length) return newPlan;
+        if (isPlanDiffSignificant(prev, newPlan)) {
+          setPendingPlanDiff({ previous: prev, new: newPlan });
+          setPlanDiffDialogOpen(true);
+          return prev; // Keep previous until user chooses
+        }
+        return newPlan;
+      });
+    },
+    [isPlanDiffSignificant]
+  );
+
+  const {
+    startPlan: startPlanFromHook,
+    rejectPlan: rejectPlanFromHook,
+    budgetExceededModal,
+    onBudgetExceededContinue,
+    onBudgetExceededDismiss,
+  } = useAgentPlan({
     workspaceId,
     instruction,
     provider,
@@ -382,7 +447,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
     modelSelection,
     scopeMode,
     fetchFileList,
-    onPlan: setPlan,
+    onPlan: handlePlanReceived,
     onPhase: setPhase,
     onError: setError,
     setAgentEvents,
@@ -391,6 +456,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
     setRunScope,
     setPlanUsage,
     setModelFallbackBanner,
+    setPlanDebugInfo,
     lastActivityRef,
     abortControllerRef,
     stuckTimeoutAbortRef,
@@ -538,6 +604,8 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
   const reset = useCallback(() => {
     setPlan(null);
     setExecuteResult(null);
+    setPlanDiffDialogOpen(false);
+    setPendingPlanDiff(null);
     setAgentReviewAccepted(new Set());
     setAgentReviewApplying(false);
     setPhase("idle");
@@ -603,7 +671,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
     : "Workspace: …";
 
   return (
-    <div className="flex flex-1 flex-col min-h-0 overflow-hidden">
+    <div className="flex flex-col min-w-0">
       <div className="flex shrink-0 flex-col gap-1 border-b border-border px-2 py-1.5 min-w-0">
         <p className="text-xs font-medium text-muted-foreground truncate" title={workspaceLabelText}>
           {workspaceLabelText}
@@ -656,20 +724,22 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
               Re-run same plan
             </Button>
           )}
-          <AgentModelSelector
-            modelSelection={modelSelection}
-            setModelSelection={setModelSelection}
-            modelsAvailable={modelsAvailable}
-            defaultGroupInfo={defaultGroupInfo}
-            defaultGroupSaving={defaultGroupSaving}
-            setDefaultGroupSaving={setDefaultGroupSaving}
-            setDefaultGroupInfo={setDefaultGroupInfo}
-            onModelsManagerOpen={() => setModelsManagerOpen(true)}
-          />
+          {modelPrefs?.showInAgent !== false && (
+            <AgentModelSelector
+              modelSelection={modelSelection}
+              setModelSelection={setModelSelection}
+              modelsAvailable={modelsAvailable}
+              defaultGroupInfo={defaultGroupInfo}
+              defaultGroupSaving={defaultGroupSaving}
+              setDefaultGroupSaving={setDefaultGroupSaving}
+              setDefaultGroupInfo={setDefaultGroupInfo}
+              onModelsManagerOpen={() => setModelsManagerOpen(true)}
+            />
+          )}
         </div>
       </div>
 
-      <div className="flex flex-1 flex-col min-h-0 overflow-y-auto overflow-x-hidden p-3 space-y-3">
+      <div className="flex flex-col p-3 space-y-3">
         <p className="text-[11px] text-muted-foreground/90 flex items-center gap-1.5 flex-wrap">
           <span>Rules: {rulesFile ?? "No rules file"}</span>
           <button
@@ -721,16 +791,20 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
           }}
         />
 
-        {/* Rate limit fallback banner */}
+        {/* Model switch banner (rate limit or capability) */}
         {phase === "plan_ready" && modelFallbackBanner && (
           <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
             <div className="flex items-start justify-between gap-2">
               <div className="space-y-1">
                 <p className="font-medium text-foreground">
-                  Rate limit reached — switched model
+                  {modelFallbackBanner.reason === "capability"
+                    ? "Model switched for compatibility"
+                    : "Model switched to complete task"}
                 </p>
                 <p className="text-muted-foreground">
-                  Daily limit was reached on <span className="font-mono text-foreground/90">{modelFallbackBanner.from}</span>. We used <span className="font-mono text-foreground/90">{modelFallbackBanner.to}</span> instead.
+                  {modelFallbackBanner.reason === "capability"
+                    ? <>Model <span className="font-mono text-foreground/90">{modelFallbackBanner.from}</span> doesn&apos;t support streaming. Using <span className="font-mono text-foreground/90">{modelFallbackBanner.to}</span> instead.</>
+                    : <>Model <span className="font-mono text-foreground/90">{modelFallbackBanner.from}</span> hit limits. Switched to <span className="font-mono text-foreground/90">{modelFallbackBanner.to}</span> to complete the task.</>}
                 </p>
                 {modelFallbackBanner.availableFreeModels.length > 0 && (
                   <p className="pt-1 text-muted-foreground">
@@ -764,13 +838,16 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
 
         {/* Plan review: constrained height so Approve/Reject stay visible */}
         {phase === "plan_ready" && plan && (
-          <AgentPlanReview
-            plan={plan}
-            runScope={runScope}
-            planUsage={planUsage}
-            planContextUsed={planContextUsed}
-            provider={provider}
-          />
+          <>
+            <AgentPlanReview
+              plan={plan}
+              runScope={runScope}
+              planUsage={planUsage}
+              planContextUsed={planContextUsed}
+              provider={provider}
+            />
+            <AgentDebugPanel debugInfo={planDebugInfo} />
+          </>
         )}
 
         {/* Agent Activity Feed - Shows real-time agent thinking and tool usage */}
@@ -823,6 +900,28 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
       />
 
       </div>
+
+      <Dialog open={!!budgetExceededModal} onOpenChange={(open) => { if (!open) onBudgetExceededDismiss(); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Token limit exceeded</DialogTitle>
+            <DialogDescription>
+              {budgetExceededModal?.message ?? "Daily token budget exceeded. Try again tomorrow."}
+              {budgetExceededModal?.scope === "workspace" && " You can continue using your personal token budget to complete this task."}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={onBudgetExceededDismiss}>
+              Dismiss
+            </Button>
+            {budgetExceededModal?.scope === "workspace" && (
+              <Button onClick={onBudgetExceededContinue}>
+                Continue with personal budget
+              </Button>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <AgentConfirmDialogs
         largeFileConfirmOpen={largeFileConfirmOpen}
@@ -895,7 +994,42 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
         onProtectedAllow={confirmProtectedExecute}
       />
 
+      {/* Step 7: Plan diff dialog - "Plan changed significantly" */}
+      <Dialog open={planDiffDialogOpen} onOpenChange={setPlanDiffDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Plan changed significantly</DialogTitle>
+            <DialogDescription>
+              The new plan differs from your previous one (different files or commands). You can reuse the previous plan for consistency or use the new plan.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setPlanDiffDialogOpen(false);
+                setPendingPlanDiff(null);
+              }}
+            >
+              Keep previous plan
+            </Button>
+            <Button
+              onClick={() => {
+                if (pendingPlanDiff) {
+                  setPlan(pendingPlanDiff.new);
+                  setPlanDiffDialogOpen(false);
+                  setPendingPlanDiff(null);
+                }
+              }}
+            >
+              Use new plan
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Phase F: review each file in diff before apply (like Composer) */}
+
       <AgentReviewQueue
         queue={agentReviewQueue}
         index={agentReviewIndex}

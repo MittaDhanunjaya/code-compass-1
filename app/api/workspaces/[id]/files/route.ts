@@ -47,7 +47,11 @@ export async function GET(
   }
 
   // List all files (paths and updated_at for tree) - Phase 6.1.3: cache file tree
+  const refreshParam = searchParams.get("refresh");
   const cacheKey = `filetree:${workspaceId}`;
+  if (refreshParam === "1" || refreshParam === "true") {
+    await invalidateCache(cacheKey);
+  }
   try {
     const data = await getOrSet(
       cacheKey,

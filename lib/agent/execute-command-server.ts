@@ -55,6 +55,7 @@ const ALLOWED_BASE_COMMANDS = [
   "pip",
   "pip3",
   "pytest",
+  "go",
   "docker",
   "docker-compose",
   "ls",

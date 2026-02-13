@@ -8,6 +8,7 @@ import { POST } from "./route";
 import { MOCK_STREAM_CONTENT } from "@/lib/test/mocks/handlers";
 
 const createMockSupabase = () => ({
+  rpc: vi.fn().mockResolvedValue({ error: null }),
   from: vi.fn(() => ({
     select: vi.fn().mockReturnThis(),
     eq: vi.fn().mockReturnThis(),
@@ -32,6 +33,15 @@ vi.mock("@/lib/api-rate-limit", () => ({
   getRateLimitIdentifier: vi.fn(() => "test-identifier"),
 }));
 
+vi.mock("@/lib/llm/budget-guard", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/llm/budget-guard")>();
+  return {
+    ...actual,
+    enforceAndRecordBudget: vi.fn().mockResolvedValue(undefined),
+    BudgetExceededError: actual.BudgetExceededError,
+  };
+});
+
 vi.mock("@/lib/encrypt", () => ({
   decrypt: vi.fn().mockResolvedValue("sk-mock-api-key"),
 }));
@@ -54,6 +64,24 @@ describe("POST /api/chat/stream", () => {
     });
     const res = await POST(req);
     expect(res.status).toBe(400);
+  });
+
+  it("returns 429 when budget exceeded", async () => {
+    const mod = await import("@/lib/llm/budget-guard");
+    vi.mocked(mod.enforceAndRecordBudget).mockRejectedValueOnce(
+      new mod.BudgetExceededError("Daily token budget exceeded.", "user")
+    );
+
+    const req = new Request("http://localhost/api/chat/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ role: "user", content: "Hello" }],
+      }),
+    });
+    const res = await POST(req);
+    expect(res.status).toBe(429);
+    expect(res.headers.get("Retry-After")).toBeDefined();
   });
 
   it("streams LLM response when valid body and API key available", async () => {

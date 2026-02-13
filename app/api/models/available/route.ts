@@ -55,6 +55,7 @@ export async function GET(request: Request) {
       { id: "inline-ollama", label: "Ollama (local)", provider: "ollama", model_slug: "qwen:latest", is_default: true, is_free: true, capabilities: { chat: true, code: true } },
       { id: "inline-openrouter", label: "OpenRouter Free", provider: "openrouter", model_slug: "openrouter/free", is_default: true, is_free: true, capabilities: { chat: true, code: true } },
       { id: "inline-gemini", label: "Google Gemini", provider: "gemini", model_slug: "gemini-2.0-flash", is_default: true, is_free: true, capabilities: { chat: true, code: true } },
+      { id: "inline-perplexity", label: "Perplexity Sonar", provider: "perplexity", model_slug: "sonar", is_default: true, is_free: false, capabilities: { chat: true, code: true } },
     ];
   }
 

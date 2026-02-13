@@ -303,7 +303,7 @@ export function AgentExecutionResult({
                 Review each file in diff
               </Button>
             </div>
-            <p className="text-[11px] text-muted-foreground">Or accept/reject per file below, then Apply accepted.</p>
+            <p className="text-[11px] text-muted-foreground">Or accept/reject per file below, then Apply accepted. Files will appear in the file tree (left sidebar) after you apply.</p>
             <ul className="space-y-1.5 max-h-48 overflow-y-auto">
               {fileEdits.map((edit, idx) => (
                 <li key={`${edit.path}-${idx}`} className="flex items-center gap-2 text-xs">

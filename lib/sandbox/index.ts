@@ -7,7 +7,9 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import type { FileEditStep } from "@/lib/agent/types";
 import { applyEdit } from "@/lib/agent/diff-engine";
 import { beautifyCode } from "@/lib/utils/code-beautifier";
+import { prepareEditContent } from "@/lib/formatters";
 import { getLintCommands, getTestCommands, getRunCommands, detectStack } from "./stack-commands";
+import { findAvailablePort } from "@/lib/agent/port-utils";
 import { recordFileOpDuration } from "@/lib/metrics";
 import { existsSync, readdirSync, readFileSync } from "fs";
 import { mkdir, writeFile } from "fs/promises";
@@ -139,15 +141,15 @@ export async function applyEditsToSandbox(
 
     if (!fileRow) {
       // New file: insert
-      // Beautify code before writing (convert \n to actual newlines, etc.)
-      const beautifiedContent = beautifyCode(edit.newContent, path);
-      
+      // Tooling vs AI: use deterministic formatter (Prettier/Black), not LLM
+      const preparedContent = await prepareEditContent(edit.newContent, path);
+
       const { error: insertError } = await supabase
         .from("sandbox_files")
         .insert({
           sandbox_run_id: sandboxRunId,
           path,
-          content: beautifiedContent,
+          content: preparedContent,
         });
 
       if (insertError) {
@@ -163,8 +165,8 @@ export async function applyEditsToSandbox(
 
     // Apply edit to existing file
     const currentContent = fileRow.content ?? "";
-    // Beautify new content before applying edit (convert \n to actual newlines, etc.)
-    const beautifiedNewContent = beautifyCode(edit.newContent, path);
+    // Tooling vs AI: use deterministic formatter (Prettier/Black), not LLM
+    const beautifiedNewContent = await prepareEditContent(edit.newContent, path);
     
     // IMPORTANT: Don't beautify oldContent - it needs to match the actual file content
     // The oldContent from the plan might have escaped newlines, but the actual file
@@ -418,8 +420,45 @@ export async function runSandboxChecks(
   }
 
   const packageJsonPath = join(sandboxDir, "package.json");
+  const requirementsPath = join(sandboxDir, "requirements.txt");
+  const pyProjectPath = join(sandboxDir, "pyproject.toml");
+  const setupPyPath = join(sandboxDir, "setup.py");
   const hasPackageJson = existsSync(packageJsonPath);
   const stack = detectStack(sandboxDir);
+
+  // Install dependencies before lint/test/run so checks have required packages
+  if (stack === "node" && hasPackageJson) {
+    const installResult = await executeCommandFn("npm install", sandboxDir);
+    if (!installResult.ok && installResult.exitCode !== null) {
+      console.log(`[Sandbox] npm install failed: ${installResult.stderr || installResult.stdout}`);
+    }
+  } else if (stack === "python") {
+    if (existsSync(requirementsPath)) {
+      const installResult = await executeCommandFn("pip install -r requirements.txt", sandboxDir);
+      if (!installResult.ok && installResult.exitCode !== null) {
+        const pip3Result = await executeCommandFn("pip3 install -r requirements.txt", sandboxDir);
+        if (!pip3Result.ok && pip3Result.exitCode !== null) {
+          console.log(`[Sandbox] pip install failed: ${installResult.stderr || installResult.stdout}`);
+        }
+      }
+    } else if (existsSync(pyProjectPath) || existsSync(setupPyPath)) {
+      const installResult = await executeCommandFn("pip install .", sandboxDir);
+      if (!installResult.ok && installResult.exitCode !== null) {
+        const pip3Result = await executeCommandFn("pip3 install .", sandboxDir);
+        if (!pip3Result.ok && pip3Result.exitCode !== null) {
+          console.log(`[Sandbox] pip install . failed: ${installResult.stderr || installResult.stdout}`);
+        }
+      }
+    }
+  } else if (stack === "go") {
+    const goModPath = join(sandboxDir, "go.mod");
+    if (existsSync(goModPath)) {
+      const installResult = await executeCommandFn("go mod download", sandboxDir);
+      if (!installResult.ok && installResult.exitCode !== null) {
+        console.log(`[Sandbox] go mod download failed: ${installResult.stderr || installResult.stdout}`);
+      }
+    }
+  }
 
   // Lint: use package.json scripts (test:unit, lint, etc.) or stack heuristic (pytest, go test, mvn, cargo)
   const lintCommands = getLintCommands(sandboxDir);
@@ -481,7 +520,9 @@ export async function runSandboxChecks(
 
   // Try to run the application to verify it actually works
   let runResult: { status: SandboxCheckStatus; logs: string; port?: number } = { status: "not_configured", logs: "" };
-  
+  // Use PORT 3001+ to avoid conflict with host (Code Compass dev server on 3000)
+  const sandboxPort = await findAvailablePort(3001, 20) ?? 3001;
+
   // Check for Docker-based projects
   const dockerComposePath = join(sandboxDir, "docker-compose.yml");
   const dockerComposeYamlPath = join(sandboxDir, "docker-compose.yaml");
@@ -574,15 +615,15 @@ export async function runSandboxChecks(
       const packageJsonContent = readFileSync(packageJsonPath, "utf-8");
       const packageJson = JSON.parse(packageJsonContent);
       const scripts = packageJson.scripts || {};
-      
+
       // Try common run commands
       const runCommands: Array<{ cmd: string; isServer: boolean }> = [];
-      if (scripts.start) runCommands.push({ cmd: `npm run start`, isServer: true });
-      if (scripts.dev) runCommands.push({ cmd: `npm run dev`, isServer: true });
-      if (scripts.serve) runCommands.push({ cmd: `npm run serve`, isServer: true });
+      if (scripts.start) runCommands.push({ cmd: `PORT=${sandboxPort} npm run start`, isServer: true });
+      if (scripts.dev) runCommands.push({ cmd: `PORT=${sandboxPort} npm run dev`, isServer: true });
+      if (scripts.serve) runCommands.push({ cmd: `PORT=${sandboxPort} npm run serve`, isServer: true });
       // Also try direct node commands if main/index exists
       if (packageJson.main) {
-        runCommands.push({ cmd: `node ${packageJson.main}`, isServer: true });
+        runCommands.push({ cmd: `PORT=${sandboxPort} node ${packageJson.main}`, isServer: true });
       }
       
       // Try to start the app and verify it runs (with short timeout for server commands)
@@ -738,7 +779,7 @@ export async function runSandboxChecks(
             : null;
           
           const pythonCmd = venvPython || "python3";
-          const cmd = `${pythonCmd} ${mainPyFile}`;
+          const cmd = `PORT=${sandboxPort} ${pythonCmd} ${mainPyFile}`;
           
           const timeoutPromise = new Promise<Awaited<ReturnType<typeof executeCommandFn>>>((resolve) => {
             setTimeout(() => {

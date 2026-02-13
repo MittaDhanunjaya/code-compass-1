@@ -27,6 +27,7 @@ export type DebugFromLogEdit = {
 export type DebugFromLogResult = {
   suspectedRootCause: string | null;
   explanation: string | null;
+  verificationCommand: string | null;
   edits: DebugFromLogEdit[];
 };
 
@@ -173,6 +174,7 @@ You MUST respond with ONLY a JSON object, no markdown, no code blocks:
 {
   "suspectedRootCause": "One clear sentence explaining the root cause",
   "explanation": "Brief explanation of what you found and what changes you made to fix it",
+  "verificationCommand": "Exact shell command to verify the fix (e.g. npm test, npm run dev, pytest)",
   "edits": [
     {
       "path": "exact file path from workspace (must match exactly)",
@@ -184,6 +186,7 @@ You MUST respond with ONLY a JSON object, no markdown, no code blocks:
 }
 
 **Rules:**
+- "verificationCommand" must be a concrete command the user can run to verify the fix (e.g. npm test, npm run dev, pytest tests/).
 - "path" must exactly match one of the workspace file paths provided.
 - For existing files: ALWAYS include "oldContent" with the exact code that exists.
 - For new files: omit "oldContent"; "newContent" is the full file.
@@ -245,6 +248,7 @@ export async function runDebugFromLog(
     return {
       suspectedRootCause: null,
       explanation: "Workspace not found.",
+      verificationCommand: null,
       edits: [],
     };
   }
@@ -414,6 +418,7 @@ ${fileContext}
     return {
       suspectedRootCause: null,
       explanation: "No API key configured for any provider. Add one in API Key settings.",
+      verificationCommand: null,
       edits: [],
     };
   }
@@ -427,6 +432,9 @@ ${fileContext}
       task: "debug",
       temperature: 0.35,
       candidates,
+      userId,
+      workspaceId,
+      supabase,
     });
 
     const trimmed = (content ?? "").trim();
@@ -440,6 +448,7 @@ ${fileContext}
       return {
         suspectedRootCause: null,
         explanation: "Could not parse model response as JSON.",
+        verificationCommand: null,
         edits: [],
       };
     }
@@ -447,6 +456,7 @@ ${fileContext}
     const validated = validateDebugFromLogOutput(parsed);
     const suspectedRootCause = validated.suspectedRootCause;
     const explanation = validated.explanation;
+    const verificationCommand = validated.verificationCommand;
     const rawEdits = validated.edits;
     const edits: DebugFromLogEdit[] = [];
     for (const e of rawEdits) {
@@ -466,6 +476,7 @@ ${fileContext}
     return {
       suspectedRootCause: suspectedRootCause ?? null,
       explanation: explanation ?? "Analysis complete.",
+      verificationCommand: verificationCommand ?? null,
       edits,
     };
   } catch (e) {
@@ -473,6 +484,7 @@ ${fileContext}
     return {
       suspectedRootCause: null,
       explanation: `Debug failed: ${msg}`,
+      verificationCommand: null,
       edits: [],
     };
   }

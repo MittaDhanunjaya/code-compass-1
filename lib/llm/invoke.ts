@@ -164,14 +164,17 @@ export async function invokeChatWithFallback(
       });
     } catch (e) {
       lastError = e;
-      if (!isFallbackableError(e) || candidates.indexOf(c) === candidates.length - 1) throw e;
+      const nextIdx = candidates.indexOf(c) + 1;
+      const next = candidates[nextIdx];
+      if (!isFallbackableError(e) || !next) throw e;
       if (process.env.NODE_ENV !== "test") {
         console.warn(
           JSON.stringify({
             event: "llm_invoke_fallback",
-            task: input.task,
-            from: c.providerId,
-            error: e instanceof Error ? e.message : String(e),
+            provider: c.providerId,
+            model: c.model ?? "default",
+            reason: e instanceof Error ? e.message : String(e),
+            retryingWith: next.providerId,
           })
         );
       }

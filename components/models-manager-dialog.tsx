@@ -9,8 +9,9 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
-import { Users, RefreshCw } from "lucide-react";
+import { Users, RefreshCw, Sparkles, Pencil } from "lucide-react";
 import { ErrorWithAction } from "@/components/error-with-action";
+import { suggestRoleAssignments, type SwarmRole } from "@/lib/models/role-suggestion";
 
 interface AvailableModel {
   id: string;
@@ -57,6 +58,9 @@ export function ModelsManagerDialog({ open, onOpenChange, modelsAvailable, onUpd
   const [groupLabel, setGroupLabel] = useState("");
   const [groupDescription, setGroupDescription] = useState("");
   const [groupModelIds, setGroupModelIds] = useState<string[]>([]);
+  const [assignedRoles, setAssignedRoles] = useState<{ modelId: string; role: SwarmRole }[]>([]);
+  const [modifyRoles, setModifyRoles] = useState(false);
+  const [setAsDefault, setSetAsDefault] = useState(false);
   const [groupSubmitting, setGroupSubmitting] = useState(false);
   const [groupError, setGroupError] = useState<string | null>(null);
 
@@ -107,39 +111,68 @@ export function ModelsManagerDialog({ open, onOpenChange, modelsAvailable, onUpd
     }
   };
 
+  const toggleGroupModel = (id: string) => {
+    setGroupModelIds((prev) => {
+      const next = prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id];
+      setAssignedRoles([]);
+      return next;
+    });
+  };
+
+  const handleAutoAssign = () => {
+    const selected = allModels.filter((m) => groupModelIds.includes(m.id));
+    if (selected.length === 0) return;
+    const suggested = suggestRoleAssignments(
+      selected.map((m) => ({ id: m.id, label: m.label, modelSlug: m.modelSlug }))
+    );
+    setAssignedRoles(suggested);
+    setModifyRoles(false);
+  };
+
   const handleCreateGroup = async () => {
     if (!groupLabel.trim()) return;
     setGroupError(null);
     setGroupSubmitting(true);
     try {
+      const body: { label: string; description?: string; modelIds?: string[]; modelRoles?: { modelId: string; role: string }[] } = {
+        label: groupLabel.trim(),
+        description: groupDescription.trim() || undefined,
+      };
+      if (assignedRoles.length > 0) {
+        body.modelRoles = assignedRoles;
+      } else {
+        body.modelIds = groupModelIds;
+      }
       const res = await fetch("/api/models/groups", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          label: groupLabel.trim(),
-          description: groupDescription.trim() || undefined,
-          modelIds: groupModelIds,
-        }),
+        body: JSON.stringify(body),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         setGroupError(data.error || "Failed to create group");
         return;
       }
+      if (setAsDefault && data.id) {
+        await fetch("/api/models/default-group", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ defaultModelGroupId: data.id }),
+        });
+      }
       setGroupLabel("");
       setGroupDescription("");
       setGroupModelIds([]);
+      setAssignedRoles([]);
+      setSetAsDefault(false);
       onUpdated();
     } finally {
       setGroupSubmitting(false);
     }
   };
 
-  const toggleGroupModel = (id: string) => {
-    setGroupModelIds((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
-    );
-  };
+  const roleLabels = { planner: "Planner", coder: "Coder", reviewer: "Reviewer" };
+  const modelById = new Map(allModels.map((m) => [m.id, m]));
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -210,9 +243,9 @@ export function ModelsManagerDialog({ open, onOpenChange, modelsAvailable, onUpd
               <Users className="h-4 w-4" /> Create group
             </h4>
             <p className="text-xs text-muted-foreground">
-              Combine models into a group: 1st = planner, 2nd = coder, 3rd = reviewer. Select models below in the order you want.
+              Select models, then click &quot;Auto-assign roles&quot; to let the app pick the best model for each role. You can modify the assignment if needed.
             </p>
-            <label className="text-xs font-medium text-muted-foreground block">Group name</label>
+            <label className="text-xs font-medium text-muted-foreground block">Models</label>
             <input
               type="text"
               placeholder="e.g. Planner + Coder"
@@ -227,7 +260,6 @@ export function ModelsManagerDialog({ open, onOpenChange, modelsAvailable, onUpd
               value={groupDescription}
               onChange={(e) => setGroupDescription(e.target.value)}
             />
-            <label className="text-xs font-medium text-muted-foreground block">Models in order (planner → coder → reviewer)</label>
             <div className="max-h-40 overflow-y-auto rounded border border-input p-2 space-y-1">
               {allModels.map((m) => (
                 <label key={m.id} className="flex items-center gap-2 cursor-pointer text-sm">
@@ -246,12 +278,109 @@ export function ModelsManagerDialog({ open, onOpenChange, modelsAvailable, onUpd
                 </p>
               )}
             </div>
+            {groupModelIds.length >= 1 && (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 text-xs gap-1"
+                    onClick={handleAutoAssign}
+                  >
+                    <Sparkles className="h-3 w-3" />
+                    Auto-assign roles
+                  </Button>
+                  {assignedRoles.length > 0 && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 text-xs gap-1"
+                      onClick={() => setModifyRoles(!modifyRoles)}
+                    >
+                      <Pencil className="h-3 w-3" />
+                      {modifyRoles ? "Done" : "Modify"}
+                    </Button>
+                  )}
+                </div>
+                {assignedRoles.length > 0 && (
+                  <div className="rounded border border-border bg-muted/30 p-2 space-y-1 text-xs">
+                    {(["planner", "coder", "reviewer"] as const).map((role) => {
+                      const entry = assignedRoles.find((r) => r.role === role);
+                      const model = entry ? modelById.get(entry.modelId) : null;
+                      return (
+                        <div key={role} className="flex items-center gap-2">
+                          <span className="font-medium text-muted-foreground w-16">{roleLabels[role]}:</span>
+                          {modifyRoles ? (
+                            <select
+                              className="flex-1 rounded border border-input bg-background px-2 py-1 text-xs"
+                              value={entry?.modelId ?? ""}
+                              onChange={(e) => {
+                                const newModelId = e.target.value;
+                                if (!newModelId) return;
+                                setAssignedRoles((prev) => {
+                                  const oldModelId = entry?.modelId;
+                                  const otherEntry = prev.find((r) => r.modelId === newModelId && r.role !== role);
+                                  return prev.map((r) => {
+                                    if (r.role === role) return { modelId: newModelId, role };
+                                    if (otherEntry && r.modelId === newModelId) return { modelId: oldModelId ?? r.modelId, role: r.role };
+                                    return r;
+                                  });
+                                });
+                              }}
+                            >
+                              <option value="">—</option>
+                              {allModels.filter((m) => groupModelIds.includes(m.id)).map((m) => (
+                                <option key={m.id} value={m.id}>{m.label}</option>
+                              ))}
+                            </select>
+                          ) : (
+                            <span>{model?.label ?? "—"}</span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+            <label className="text-xs font-medium text-muted-foreground block">Group name</label>
+            <input
+              type="text"
+              placeholder="e.g. My swarm"
+              className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              value={groupLabel}
+              onChange={(e) => setGroupLabel(e.target.value)}
+            />
+            <label className="text-xs font-medium text-muted-foreground block">Description (optional)</label>
+            <Textarea
+              placeholder="When to use this group"
+              className="min-h-[60px] text-sm"
+              value={groupDescription}
+              onChange={(e) => setGroupDescription(e.target.value)}
+            />
+            <label className="flex items-center gap-2 cursor-pointer text-xs">
+              <input
+                type="checkbox"
+                checked={setAsDefault}
+                onChange={(e) => setSetAsDefault(e.target.checked)}
+              />
+              Set as default group (use for Agent)
+            </label>
             {groupError && (
               <ErrorWithAction message={groupError} className="text-xs" />
             )}
-            <Button size="sm" onClick={handleCreateGroup} disabled={!groupLabel.trim() || groupSubmitting}>
+            <Button
+              size="sm"
+              onClick={handleCreateGroup}
+              disabled={!groupLabel.trim() || groupModelIds.length === 0 || groupSubmitting}
+            >
               {groupSubmitting ? "Creating…" : "Create group"}
             </Button>
+            {groupModelIds.length > 0 && assignedRoles.length === 0 && (
+              <p className="text-[11px] text-muted-foreground">
+                Tip: Click &quot;Auto-assign roles&quot; to let the app pick the best model for planning vs coding.
+              </p>
+            )}
           </div>
 
           {modelsAvailable?.groups?.length ? (

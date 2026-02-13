@@ -1,20 +1,22 @@
 import OpenAI from "openai";
 import type { ChatMessage, ChatOptions, LLMProvider, LLMUsage } from "./types";
 import { generateEmbeddings } from "./embeddings";
+import { OPENROUTER_FREE_MODELS } from "./openrouter-models";
 
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 
 const OPENROUTER_DEFAULT_MODEL = "openrouter/free";
 
+const KNOWN_FREE_IDS = new Set(OPENROUTER_FREE_MODELS.map((m) => m.id));
+
 /**
- * All OpenRouter ":free" model IDs are routed through openrouter/free so we never
- * hit 404s when OpenRouter changes or disables specific free endpoints (e.g.
- * deepseek/deepseek-chat:free, deepseek-chat-v3-0324:free). The router picks an
- * available free model automatically.
+ * Pass through known free models so users get their chosen model. Route unknown
+ * :free or empty to openrouter/free so we never 404 when OpenRouter changes endpoints.
  */
 function normalizeModel(model: string | undefined): string {
   if (!model) return OPENROUTER_DEFAULT_MODEL;
   if (model === OPENROUTER_DEFAULT_MODEL) return model;
+  if (KNOWN_FREE_IDS.has(model)) return model;
   if (model.endsWith(":free")) return OPENROUTER_DEFAULT_MODEL;
   return model;
 }
@@ -43,7 +45,10 @@ function buildMessages(
   }
 
   for (const m of messages) {
-    result.push({ role: m.role as "system" | "user" | "assistant", content: m.content });
+    result.push({
+      role: m.role as "system" | "user" | "assistant",
+      content: m.content,
+    });
   }
 
   return result;
@@ -64,12 +69,16 @@ export const openRouterProvider: LLMProvider = {
       },
     });
     const built = buildMessages(messages, options?.context);
-    const completion = await client.chat.completions.create({
-      model: normalizeModel(options?.model),
-      messages: built,
-      ...(options?.temperature != null && { temperature: options.temperature }),
-      ...(options?.maxTokens != null && { max_tokens: options.maxTokens }),
-    });
+    const completion = await client.chat.completions.create(
+      {
+        model: normalizeModel(options?.model),
+        messages: built,
+        ...(options?.temperature != null && { temperature: options.temperature }),
+        ...(options?.topP != null && { top_p: options.topP }),
+        ...(options?.maxTokens != null && { max_tokens: options.maxTokens }),
+      },
+      options?.signal ? { signal: options.signal } : undefined
+    );
     const content = completion.choices[0]?.message?.content ?? "";
     const usage: LLMUsage | undefined = completion.usage
       ? {
@@ -86,7 +95,7 @@ export const openRouterProvider: LLMProvider = {
     messages: ChatMessage[],
     apiKey: string,
     options?: ChatOptions
-  ): AsyncIterable<string> {
+  ): AsyncIterable<import("./types").StreamChunk> {
     const client = new OpenAI({
       apiKey,
       baseURL: OPENROUTER_BASE,
@@ -96,17 +105,34 @@ export const openRouterProvider: LLMProvider = {
       },
     });
     const built = buildMessages(messages, options?.context);
-    const stream = await client.chat.completions.create({
-      model: normalizeModel(options?.model),
-      messages: built,
-      stream: true,
-      ...(options?.temperature != null && { temperature: options.temperature }),
-      ...(options?.maxTokens != null && { max_tokens: options.maxTokens }),
-    });
+    const stream = await client.chat.completions.create(
+      {
+        model: normalizeModel(options?.model),
+        messages: built,
+        stream: true,
+        stream_options: { include_usage: true },
+        ...(options?.temperature != null && { temperature: options.temperature }),
+        ...(options?.topP != null && { top_p: options.topP }),
+        ...(options?.maxTokens != null && { max_tokens: options.maxTokens }),
+      },
+      options?.signal ? { signal: options.signal } : undefined
+    );
 
     for await (const chunk of stream) {
+      if (options?.signal?.aborted) break;
       const delta = chunk.choices[0]?.delta?.content;
       if (delta) yield delta;
+      if (chunk.usage) {
+        yield {
+          type: "usage",
+          usage: {
+            inputTokens: chunk.usage.prompt_tokens ?? undefined,
+            outputTokens: chunk.usage.completion_tokens ?? undefined,
+            totalTokens: chunk.usage.total_tokens ?? undefined,
+            raw: chunk.usage,
+          },
+        };
+      }
     }
   },
 

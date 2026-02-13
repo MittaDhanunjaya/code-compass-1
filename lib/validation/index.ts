@@ -25,11 +25,12 @@ export function validateAgentPlanOutput(parsed: unknown): { success: true; data:
   if (result.success) {
     return { success: true, data: result.data as import("@/lib/agent/types").AgentPlan };
   }
-  const err = result.error as { issues?: Array<{ path?: (string | number)[]; message?: string }> };
+  const err = result.error as { issues?: Array<{ path?: (string | number)[]; message?: unknown }> };
   const issues = err?.issues ?? [];
   const first = issues[0];
   const pathStr = first?.path?.length ? String(first.path.join(".")) : "plan";
-  const msg = first?.message ? `${pathStr}: ${first.message}` : "Invalid plan structure";
+  const rawMsg = first?.message;
+  const msg = typeof rawMsg === "string" ? `${pathStr}: ${rawMsg}` : rawMsg instanceof Error ? `${pathStr}: ${rawMsg.message}` : "Invalid plan structure";
   return { success: false, error: msg };
 }
 
@@ -60,6 +61,7 @@ export function validatePrAnalyzeOutput(parsed: unknown): { summary: string; ris
 export function validateDebugFromLogOutput(parsed: unknown): {
   suspectedRootCause: string | null;
   explanation: string | null;
+  verificationCommand: string | null;
   edits: Array<{ path?: string; description?: string; oldContent?: string; newContent?: string }>;
 } {
   const result = debugFromLogOutputSchema.safeParse(parsed);
@@ -68,8 +70,9 @@ export function validateDebugFromLogOutput(parsed: unknown): {
     return {
       suspectedRootCause: typeof d.suspectedRootCause === "string" && d.suspectedRootCause.trim() ? d.suspectedRootCause.trim() : null,
       explanation: typeof d.explanation === "string" && d.explanation.trim() ? d.explanation.trim() : null,
+      verificationCommand: typeof d.verificationCommand === "string" && d.verificationCommand.trim() ? d.verificationCommand.trim() : null,
       edits: Array.isArray(d.edits) ? d.edits : [],
     };
   }
-  return { suspectedRootCause: null, explanation: null, edits: [] };
+  return { suspectedRootCause: null, explanation: null, verificationCommand: null, edits: [] };
 }

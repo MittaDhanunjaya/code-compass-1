@@ -8,6 +8,10 @@ import { applyEdit } from "@/lib/agent/diff-engine";
 import { executeCommandInWorkspace, executeCommand } from "@/lib/agent/execute-command-server";
 import { classifyCommandKind, classifyCommandResult } from "@/lib/agent/command-classify";
 import { proposeFixSteps, buildTails } from "@/lib/agent/self-debug";
+import { getAllowedPaths, isPathAllowed } from "@/lib/agent/plan-lock";
+import { validatePathForPlan } from "@/lib/agent/file-safety";
+import { tryErrorRecovery } from "@/lib/agent/error-recovery";
+import { validatePlanConsistency } from "@/lib/agent/plan-validator";
 import { buildIntelligentContext } from "@/lib/indexing/intelligent-context";
 import { getProtectedPaths } from "@/lib/protected-paths";
 import { checkEditGuardrail, getGuardrailMode } from "@/lib/agent/guardrails";
@@ -22,13 +26,16 @@ import {
   type SandboxSource,
 } from "@/lib/sandbox";
 import { beautifyCode } from "@/lib/utils/code-beautifier";
+import { prepareEditContent } from "@/lib/formatters";
 import { safeEnqueue, safeClose, shouldStopStream, STREAM_UPSTREAM_TIMEOUT_MS } from "@/lib/stream-utils";
+import { enforceAndRecordBudget, BudgetExceededError, ServiceUnavailableError, STREAMING_RESERVE_TOKENS } from "@/lib/llm/budget-guard";
+import { acquireStreamSlot, releaseStreamSlot } from "@/lib/stream-caps";
 import { validateToolName, validateToolInput, acquireToolSlot, releaseToolSlot } from "@/services/tools/registry";
 import { agentExecuteStreamBodySchema } from "@/lib/validation/schemas";
 import { validateBody } from "@/lib/validation";
 import { logger, logAgentStarted, logAgentCompleted, getRequestId } from "@/lib/logger";
 import { captureException } from "@/lib/sentry";
-import { recordAgentExecuteDuration } from "@/lib/metrics";
+import { recordAgentExecuteDuration, recordLLMBudgetReserved, recordLLMBudgetExceeded } from "@/lib/metrics";
 
 function commandKindToActionLabel(kind: "setup" | "test" | "other"): import("@/lib/agent/types").LogActionLabel {
   if (kind === "setup") return "CMD-SETUP";
@@ -74,6 +81,10 @@ export async function POST(request: Request) {
     throw e;
   }
 
+  if (process.env.NODE_ENV === "production" && !user?.id) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const rl = await checkRateLimit(getRateLimitIdentifier(request, user.id), "agent-execute-stream", 30);
   if (!rl.ok) {
     return NextResponse.json(
@@ -113,6 +124,14 @@ export async function POST(request: Request) {
     );
   }
 
+  const streamCap = await acquireStreamSlot(user.id, workspaceId);
+  if (!streamCap.ok) {
+    return NextResponse.json(
+      { error: streamCap.reason },
+      { status: 429, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
   try {
     acquireToolSlot(user.id);
   } catch (e) {
@@ -128,6 +147,25 @@ export async function POST(request: Request) {
       const closed = { current: false };
       const safeEmit = (event: AgentEvent) => emitEvent(controller, encoder, event, closed);
       const requestId = getRequestId(request);
+
+      try {
+        await enforceAndRecordBudget(supabase, user.id, STREAMING_RESERVE_TOKENS, workspaceId, requestId);
+        recordLLMBudgetReserved(STREAMING_RESERVE_TOKENS);
+      } catch (e) {
+        if (e instanceof BudgetExceededError) {
+          recordLLMBudgetExceeded();
+          safeEmit(createAgentEvent("status", `Error: ${e.message}`));
+          safeClose(controller);
+          return;
+        }
+        if (e instanceof ServiceUnavailableError) {
+          safeEmit(createAgentEvent("status", `Error: ${e.message}`));
+          safeEnqueue(controller, encoder, `data: ${JSON.stringify({ type: "error", error: e.message })}\n\n`);
+          safeClose(controller);
+          return;
+        }
+        throw e;
+      }
 
       try {
         logAgentStarted({
@@ -231,10 +269,45 @@ export async function POST(request: Request) {
         }
         const filesEdited: string[] = [];
 
+        // Plan lock: only allow file paths declared in plan
+        const allowedPaths = getAllowedPaths(plan);
+
+        // Plan consistency validation
+        const fileContentsForValidation: Record<string, string> = {};
+        const pathsToCheck = plan.steps.filter((s): s is typeof s & { type: "file_edit" } => s.type === "file_edit").map((s) => s.path.trim());
+        if (pathsToCheck.length > 0) {
+          const { data: wf } = await supabase.from("workspace_files").select("path, content").eq("workspace_id", workspaceId).in("path", pathsToCheck);
+          for (const row of wf ?? []) {
+            fileContentsForValidation[row.path] = row.content ?? "";
+          }
+        }
+        const planValidation = validatePlanConsistency(plan, Object.keys(fileContentsForValidation).length > 0 ? fileContentsForValidation : undefined);
+        if (!planValidation.valid) {
+          safeEmit(createAgentEvent("status", `Plan validation warnings: ${planValidation.errors.join("; ")}`));
+          log.push({ stepIndex: -1, type: "info", status: "ok", message: planValidation.errors.join("; "), actionLabel: undefined, statusLine: "Plan validation warnings" });
+        }
+
         safeEmit( createAgentEvent('reasoning', `Executing ${plan.steps.length} step(s)...`));
 
-        // Separate file_edit steps from command steps for sandbox processing
-        const fileEditSteps = plan.steps.filter((s): s is typeof s & { type: "file_edit" } => s.type === "file_edit");
+        // Separate file_edit steps from command steps for sandbox processing; filter by plan lock + file safety
+        let fileEditSteps = plan.steps.filter((s): s is typeof s & { type: "file_edit" } => s.type === "file_edit");
+        const rejectedByLock: string[] = [];
+        const rejectedBySafety: string[] = [];
+        for (const step of fileEditSteps) {
+          const path = step.path.trim();
+          if (!allowedPaths.has(path)) rejectedByLock.push(path);
+          else if (!validatePathForPlan(path).ok) rejectedBySafety.push(path);
+        }
+        fileEditSteps = fileEditSteps.filter((s) => {
+          const p = s.path.trim();
+          return allowedPaths.has(p) && validatePathForPlan(p).ok;
+        });
+        if (rejectedByLock.length > 0) {
+          safeEmit(createAgentEvent("status", `Plan lock: skipped ${rejectedByLock.length} path(s) not in plan`));
+        }
+        if (rejectedBySafety.length > 0) {
+          safeEmit(createAgentEvent("status", `File safety: skipped ${rejectedBySafety.length} path(s)`));
+        }
 
         // Guardrails: filter steps that exceed large-replace ratio or line-delta threshold
         const guardrailMode = getGuardrailMode();
@@ -706,6 +779,27 @@ export async function POST(request: Request) {
                 stepIndex: i,
               }));
 
+              // Deterministic error recovery: rule-based fixes before LLM escalation
+              let recoveryAttempted = false;
+              if (classification.status === "failed") {
+                const recovery = await tryErrorRecovery(step.command, cmdResult.stderr ?? "", cmdResult.stdout ?? "");
+                if (recovery.fixed && recovery.retry) {
+                  recoveryAttempted = true;
+                  safeEmit(createAgentEvent("reasoning", `Auto-recovery: ${recovery.reason}`));
+                  const retryResult = await executeCommandInWorkspace(supabase, workspaceId, recovery.command);
+                  const retryClassification = classifyCommandResult(retryResult);
+                  if (retryClassification.status === "success") {
+                    commandEntry.autoFixAttempted = true;
+                    commandEntry.secondRunStatus = retryClassification.status;
+                    commandEntry.secondRunSummary = retryClassification.summary;
+                    commandEntry.statusLine = `${firstRunLine}; Auto-recovery: ${recovery.reason}, passed`;
+                    safeEmit(createAgentEvent("tool_result", `Auto-recovery succeeded: ${recovery.reason}`, { toolName: "run_command", command: step.command, stepIndex: i }));
+                    continue;
+                  }
+                  safeEmit(createAgentEvent("tool_result", `Auto-recovery failed: ${retryClassification.summary}`, { toolName: "run_command", command: step.command, stepIndex: i }));
+                }
+              }
+
               // Enhanced self-debug: multiple retry attempts for failed commands
               // Trigger for: test/setup failures, port conflicts, and other runtime errors
               const MAX_DEBUG_ATTEMPTS = 5;
@@ -715,6 +809,7 @@ export async function POST(request: Request) {
               
               if (
                 classification.status === "failed" &&
+                !recoveryAttempted &&
                 ((commandKind === "test" || commandKind === "setup") || isPortConflict)
               ) {
                 const creds = await getSelfDebugApiKey();
@@ -727,15 +822,16 @@ export async function POST(request: Request) {
                       .eq("path", path)
                       .single();
                     if (!fileRow) {
-                      const beautified = beautifyCode(newContent, path);
+                      const prepared = await prepareEditContent(newContent, path);
                       const { error } = await supabase
                         .from("workspace_files")
-                        .insert({ workspace_id: workspaceId, path, content: beautified });
+                        .insert({ workspace_id: workspaceId, path, content: prepared });
                       if (!error && !filesEdited.includes(path)) filesEdited.push(path);
                       return !error;
                     }
                     const currentContent = fileRow.content ?? "";
-                    const result = applyEdit(currentContent, newContent, oldContent);
+                    const preparedContent = await prepareEditContent(newContent, path);
+                    const result = applyEdit(currentContent, preparedContent, oldContent);
                     if (!result.ok) return false;
                     const { error } = await supabase
                       .from("workspace_files")
@@ -825,10 +921,20 @@ export async function POST(request: Request) {
                       break;
                     }
 
-                    safeEmit( createAgentEvent('tool_result', `Auto-fix attempt ${attempt}: applying ${fixSteps.length} edit(s)...`));
+                    // Plan lock: only apply fix steps whose path is in approved plan
+                    const allowedFixSteps = fixSteps.filter((f) => {
+                      const check = isPathAllowed(f.path.trim(), allowedPaths);
+                      if (!check.allowed) {
+                        safeEmit(createAgentEvent("reasoning", `Plan lock: skipping fix for ${f.path} (not in plan)`));
+                        return false;
+                      }
+                      return validatePathForPlan(f.path.trim()).ok;
+                    });
 
-                    // Apply fixes to workspace_files (self-debug edits)
-                    for (const fixStep of fixSteps) {
+                    safeEmit( createAgentEvent('tool_result', `Auto-fix attempt ${attempt}: applying ${allowedFixSteps.length} edit(s)...`));
+
+                    // Apply fixes to workspace_files (self-debug edits, plan-locked)
+                    for (const fixStep of allowedFixSteps) {
                       await applyFileEdit(
                         fixStep.path.trim(),
                         fixStep.newContent,
@@ -981,6 +1087,7 @@ export async function POST(request: Request) {
         }
         safeClose(controller);
       } finally {
+        releaseStreamSlot(user.id, workspaceId);
         releaseToolSlot(user.id);
         const durationMs = Date.now() - execStart;
         recordAgentExecuteDuration(durationMs);

@@ -12,10 +12,21 @@ const providerIdSchema = z.enum(PROVIDERS);
 
 const scopeModeSchema = z.enum(["conservative", "normal", "aggressive"]);
 
-// --- Chat message schema ---
+// --- Chat message schema (supports text + images for vision models) ---
+const contentPartSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("text"), text: z.string() }),
+  z.object({
+    type: z.literal("image_url"),
+    image_url: z.object({ url: z.string().min(1) }),
+  }),
+]);
+
 const chatMessageSchema = z.object({
   role: z.enum(["system", "user", "assistant"]),
-  content: z.string(),
+  content: z.union([
+    z.string(),
+    z.array(contentPartSchema).min(1),
+  ]),
 });
 
 const chatContextSchema = z
@@ -66,6 +77,9 @@ export const agentPlanOutputSchema = agentPlanSchema;
 
 const INSTRUCTION_MAX = 5000;
 
+/** Plan mode: reproducible (deterministic) vs exploratory. */
+export const planModeSchema = z.enum(["reproducible", "exploratory"]).optional();
+
 /** /api/agent/plan-stream */
 export const agentPlanStreamBodySchema = z.object({
   instruction: z
@@ -81,6 +95,7 @@ export const agentPlanStreamBodySchema = z.object({
   fileContents: z.record(z.string(), z.string()).optional(),
   useIndex: z.boolean().optional(),
   scopeMode: scopeModeSchema.optional(),
+  mode: planModeSchema,
 });
 
 /** /api/agent/execute-stream */
@@ -95,6 +110,7 @@ export const agentExecuteStreamBodySchema = z.object({
   skipProtected: z.boolean().optional(),
   scopeMode: scopeModeSchema.optional(),
   confirmedAggressive: z.boolean().optional(),
+  mode: planModeSchema,
 });
 
 /** /api/chat/stream */
@@ -242,6 +258,7 @@ export const prAnalyzeOutputSchema = z.object({
 export const debugFromLogOutputSchema = z.object({
   suspectedRootCause: z.string().nullable().optional(),
   explanation: z.string().nullable().optional(),
+  verificationCommand: z.string().nullable().optional(),
   edits: z.array(z.object({
     path: z.string().optional(),
     description: z.string().optional(),

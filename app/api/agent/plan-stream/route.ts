@@ -4,13 +4,20 @@ import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
 import { checkRateLimit, getRateLimitIdentifier } from "@/lib/api-rate-limit";
 import { getDevBypassUser } from "@/lib/auth-dev-bypass";
 import { getProvider, getModelForProvider, OPENROUTER_FREE_MODELS, PROVIDERS, PROVIDER_LABELS, type ProviderId } from "@/lib/llm/providers";
+import { getModelCapabilities, modelMeetsRequirement } from "@/lib/llm/model-capabilities";
 import { isRateLimitError } from "@/lib/llm/rate-limit";
 import type { AgentPlan, FileEditStep, CommandStep, PlanStep } from "@/lib/agent/types";
 import type { ScopeMode } from "@/lib/agent/types";
 import { computeRunScope, applyScopeCaps } from "@/lib/agent/scope";
 import { createAgentEvent, formatStreamEvent, type AgentEvent } from "@/lib/agent-events";
 import { detectErrorLogKind } from "@/lib/agent/error-log-utils";
-import { safeClose, safeEnqueue, shouldStopStream, STREAM_UPSTREAM_TIMEOUT_MS } from "@/lib/stream-utils";
+import { classifyErrorLog, getClassificationHint } from "@/lib/agent/error-classifier";
+import { safeClose, safeEnqueue, shouldStopStream, createStreamAbortSignal, STREAM_UPSTREAM_TIMEOUT_MS, MAX_STREAM_DURATION_MS } from "@/lib/stream-utils";
+
+/** Timeout for plan parse retry chat calls - prevents indefinite hang on slow/free models. */
+const PLAN_RETRY_TIMEOUT_MS = 90_000;
+import { enforceAndRecordBudget, refundBudget, BudgetExceededError, ServiceUnavailableError, STREAMING_RESERVE_TOKENS, estimateTokensFromChars } from "@/lib/llm/budget-guard";
+import { acquireStreamSlot, releaseStreamSlot } from "@/lib/stream-caps";
 import { resolveWorkspaceId } from "@/lib/workspaces/active-workspace";
 import { loadRules, formatRulesForPrompt } from "@/lib/rules";
 import { buildIntelligentContext, formatIntelligentContext } from "@/lib/indexing/intelligent-context";
@@ -22,13 +29,13 @@ import { agentPlanStreamBodySchema } from "@/lib/validation/schemas";
 import { validateBody, validateAgentPlanOutput } from "@/lib/validation";
 import { logger, logAgentStarted, logAgentCompleted, getRequestId } from "@/lib/logger";
 import { captureException } from "@/lib/sentry";
-import { recordAgentPlanDuration } from "@/lib/metrics";
+import { recordAgentPlanDuration, recordLLMBudgetReserved, recordLLMBudgetRefunded, recordLLMBudgetExceeded, recordLLMStreamAbortedTimeout, recordLLMStreamAbortedClient } from "@/lib/metrics";
 
 // Same system prompt as plan route, but with instruction to emit reasoning messages
 const PLAN_SYSTEM = `You are an intelligent coding agent planner. Your job is to understand the user's request, analyze the codebase, and create a plan that accomplishes the task.
 
-CRITICAL JSON OUTPUT RULES:
-1. **Output ONLY valid JSON** - no explanatory text before or after the JSON
+CRITICAL JSON OUTPUT RULES (NON-NEGOTIABLE):
+1. **Return ONLY valid JSON. No markdown. No commentary.** Your response must be a single JSON object.
 2. **No leading text** - Do NOT write "Looking at...", "Here's...", "I'll..." before the JSON
 3. **No trailing text** - Do NOT add explanations after the JSON
 4. **Use double quotes** - Never use single quotes for strings
@@ -36,7 +43,10 @@ CRITICAL JSON OUTPUT RULES:
 6. **No comments** - Do not include // or /* */ comments in JSON
 7. **Valid syntax** - Ensure all commas, braces, and brackets are properly balanced
 8. **DO NOT output code** - Do NOT output actual code files, functions, or implementations. Output ONLY a JSON plan with steps.
-9. **DO NOT output markdown** - Do NOT wrap the JSON in markdown code blocks. Output raw JSON only.
+9. **DO NOT output markdown** - Do NOT wrap the JSON in \`\`\` code blocks. Output raw JSON only.
+
+**REJECTION**: Responses containing non-JSON content, markdown fences, or commentary will be rejected.
+
 
 IMPORTANT - Show Your Thinking:
 As you plan and analyze the task, periodically emit short, user-friendly status messages describing what you are doing. These messages help users understand your reasoning in real-time. Examples:
@@ -59,7 +69,7 @@ Your approach:
 
 CONSISTENCY AND "THINK FIRST" (CRITICAL — same task must yield same plan every time):
 - **Enumerate before JSON**: Before outputting the JSON plan, in your reasoning messages explicitly list the exact set of file paths you will create or modify and the exact commands you will run. Example: "I will create: package.json, app/page.tsx, app/api/products/route.ts, ... and run: npm install, npm run dev." Then output a JSON plan that contains exactly those steps and no others.
-- **Canonical structure**: For project/application creation, determine the minimal complete set of deliverables required by the task (e.g. config, pages, API routes, data layer, tests). Use a fixed, canonical order: config first (package.json, tsconfig, etc.), then entry/app files, then routes/pages, then data/API, then tests, then commands (npm install, npm test, etc.). Same instruction must produce the same number of files and same paths on every run.
+- **Canonical structure**: For project/application creation, determine the minimal complete set of deliverables required by the task (e.g. config, pages, API routes, data layer, tests). Use a fixed, canonical order: config first (package.json, requirements.txt, tsconfig, etc.), then entry/app files, then routes/pages, then data/API, then tests, then install commands (npm install, pip install -r requirements.txt), then run/test commands. Same instruction must produce the same number of files and same paths on every run.
 - **No random variation**: Do not add optional files, extra pages, or alternate structures "for flexibility." Do not omit files that are required for the task. The plan must be deterministic: re-running the same user instruction should yield the same steps array (same paths and command list). Content inside files can vary; the list of deliverables (paths + commands) must not.
 - **One authoritative plan**: Produce exactly one complete plan. Do not output multiple alternatives or "option A / option B." Decide the minimal set that satisfies the task and output that set.
 
@@ -87,7 +97,7 @@ Rules:
 - path must be relative to workspace root (e.g. "src/app/page.tsx").
 - For file_edit: include oldContent only when replacing a specific snippet; omit for full file replace.
 - Order steps in dependency order (e.g. create file before editing it).
-- Use "command" steps for npm install, npm test, etc. Keep commands simple and allowlist-friendly.
+- Use "command" steps for npm install, pip install -r requirements.txt, npm test, etc. Keep commands simple and allowlist-friendly.
 - Output ONLY the JSON object, no surrounding text, no markdown code blocks, no Python syntax, no explanatory prefixes like "Looking at..." or "Here's the plan:".
 - Start directly with { and end with }. No text before { or after }.
 
@@ -113,7 +123,9 @@ When fixing errors or bugs (CRITICAL - minimal edits):
 
 When creating projects:
 - **Think about completeness**: Will this actually run? Include README or HOW_TO_RUN, dependencies, and verify steps in dependency order.
-- For any command step like "npm run <script>", ensure your plan includes a step that defines that script (e.g. in package.json) before the command runs.
+- **Node**: For any command step like "npm run <script>", ensure your plan includes a step that defines that script (e.g. in package.json) before the command runs. Always run "npm install" before "npm start" or "npm run dev". Check package.json scripts: use "npm start" if no "dev" script. For tests: use "npm test" or "npx jest" when no test script exists.
+- **Jest + TypeScript**: If adding Jest tests to a TypeScript project, include a jest.config.js step with: preset: 'ts-jest', testEnvironment: 'node' (or 'jsdom' for DOM/React tests), and moduleNameMapper for path aliases (e.g. '^@/(.*)$': '<rootDir>/src/$1'). Add ts-jest, @types/jest, and jest-environment-jsdom (required for testEnvironment: 'jsdom' since Jest 28) to devDependencies. Without this, Jest will fail with "unexpected token" or "jest-environment-jsdom cannot be found".
+- **Python**: Always include requirements.txt in the plan with all dependencies (e.g. flask, fastapi, requests). Create requirements.txt before any Python code that imports those packages. Run "pip install -r requirements.txt" (or "pip3 install -r requirements.txt") before running the app or tests. Order: requirements.txt, app code, then pip install, then python app.py or pytest.
 - Use existing codebase patterns and structure.
 
 Remember: Your goal is to create working, maintainable solutions. Think through the problem systematically and use the codebase context to inform your decisions.`;
@@ -137,6 +149,10 @@ export async function POST(request: Request) {
     const res = withAuthResponse(e);
     if (res) return res;
     throw e;
+  }
+
+  if (process.env.NODE_ENV === "production" && !user?.id) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   const rl = await checkRateLimit(getRateLimitIdentifier(request, user.id), "agent-plan-stream", 30);
@@ -175,11 +191,65 @@ export async function POST(request: Request) {
     );
   }
 
+  const streamCap = await acquireStreamSlot(user.id, workspaceId);
+  if (!streamCap.ok) {
+    return NextResponse.json(
+      { error: streamCap.reason },
+      { status: 429, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  // Budget check before stream: return 429 with structured body when workspace limit exceeded (enables modal + retry)
+  const skipWorkspaceBudget = request.headers.get("X-Budget-Fallback") === "user-only";
+  const requestId = getRequestId(request);
+  try {
+    await enforceAndRecordBudget(supabase, user.id, STREAMING_RESERVE_TOKENS, workspaceId, requestId, {
+      skipWorkspaceBudget: skipWorkspaceBudget || undefined,
+    });
+    recordLLMBudgetReserved(STREAMING_RESERVE_TOKENS);
+  } catch (e) {
+    if (e instanceof BudgetExceededError) {
+      recordLLMBudgetExceeded();
+      if (e.scope === "workspace" && !skipWorkspaceBudget) {
+        return NextResponse.json(
+          {
+            error: e.message,
+            code: "BUDGET_EXCEEDED",
+            scope: "workspace",
+            canFallbackToUser: true,
+            retryAfter: 86400,
+          },
+          {
+            status: 429,
+            headers: {
+              "Content-Type": "application/json",
+              "Retry-After": "86400",
+            },
+          }
+        );
+      }
+      return NextResponse.json(
+        { error: e.message, code: "BUDGET_EXCEEDED", scope: e.scope, retryAfter: 86400 },
+        { status: 429, headers: { "Content-Type": "application/json", "Retry-After": "86400" } }
+      );
+    }
+    if (e instanceof ServiceUnavailableError) {
+      return NextResponse.json(
+        { error: e.message },
+        { status: 503, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    throw e;
+  }
+
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
       const planStart = Date.now();
       let planError: Error | null = null;
+      let plan: AgentPlan | null = null;
+      let raw = "";
+      let usage: { inputTokens?: number; outputTokens?: number } | null = null;
       let eventMeta: { modelId?: string; modelLabel?: string; modelGroupId?: string; modelRole?: "planner" | "coder" | "reviewer" } = {};
       const emit = (event: AgentEvent) => {
         if (Object.keys(eventMeta).length > 0) {
@@ -188,7 +258,7 @@ export async function POST(request: Request) {
         emitEvent(controller, encoder, event);
       };
 
-      const requestId = getRequestId(request);
+      let abortReason: "timeout" | "client" | null = null;
       try {
         logAgentStarted({
           phase: "plan",
@@ -202,8 +272,10 @@ export async function POST(request: Request) {
         emit(createAgentEvent('status', 'Agent started planning...'));
 
         const messageKind = detectErrorLogKind(instruction);
+        let errorClassification: string | null = null;
         if (messageKind === "error_log") {
-          emit(createAgentEvent('reasoning', 'Detected runtime logs; will plan fixes from error context.', { kind: 'error_log' }));
+          errorClassification = classifyErrorLog(instruction);
+          emit(createAgentEvent('reasoning', `Detected error logs (${errorClassification}). Will plan minimal fix from error context.`, { kind: 'error_log' }));
         }
 
         let apiKey: string | null = null;
@@ -237,6 +309,18 @@ export async function POST(request: Request) {
         apiKey = inv.apiKey || "";
         providerId = inv.providerId;
         const modelOpt = inv.modelSlug;
+        // When user has only one config, fetch all available models for rate-limit fallback
+        if (configs.length === 1) {
+          const { resolveDefaultGroup } = await import("@/lib/models/invocation-config");
+          const fallbackConfigs = await resolveDefaultGroup(supabase, user.id);
+          const currentSlug = inv.modelSlug;
+          const extra = fallbackConfigs.filter(
+            (c) => (c.apiKey || c.providerId === "ollama") && c.modelSlug !== currentSlug
+          );
+          if (extra.length > 0) {
+            configs = [inv, ...extra];
+          }
+        }
         eventMeta = {
           modelId: inv.modelId,
           modelLabel: inv.modelLabel,
@@ -267,7 +351,30 @@ export async function POST(request: Request) {
         }
 
         let userContent = `Instruction: ${instruction}`;
-        
+
+        // Error-log aware context: structured errorLogs + environment for agent reasoning
+        if (messageKind === "error_log" && errorClassification) {
+          const env = { os: process.platform, nodeVersion: process.version, framework: "unknown" };
+          const hint = getClassificationHint(errorClassification as import("@/lib/agent/error-classifier").ErrorClassification);
+          userContent = `**ERROR LOG ANALYSIS REQUEST**
+
+Error classification: ${errorClassification}
+Hint: ${hint}
+
+Environment: ${JSON.stringify(env)}
+
+**Error logs (terminal output / stack trace):**
+\`\`\`
+${instruction.slice(0, 8000)}
+\`\`\`
+
+**Your task:**
+1. Analyze the error and identify the root cause.
+2. Propose a MINIMAL fix (surgical edits only).
+3. Explain the root cause in each step's description.
+4. Apply the patch via file_edit steps with exact oldContent/newContent.`;
+        }
+
         // Index search
         let indexedFiles: { path: string; line?: number; preview?: string }[] = [];
         if (body.useIndex && workspaceId) {
@@ -504,16 +611,67 @@ export async function POST(request: Request) {
 
         emit(createAgentEvent('reasoning', 'Generating plan...'));
         
-        const provider = getProvider(providerId);
-        const freeModelIds = OPENROUTER_FREE_MODELS.map((m) => m.id);
-        const modelsToTry: string[] =
-          providerId === "openrouter" && resolvedModel && (freeModelIds as readonly string[]).includes(resolvedModel)
-            ? [...freeModelIds]
-            : resolvedModel
-              ? [resolvedModel]
-              : [];
-        let modelUsed = resolvedModel ?? undefined;
-        let modelFallback: { from: string; to: string } | null = null;
+        // Build configs for fallback: when one model hits rate limit, try next available model from user's account
+        type ConfigTry = { providerId: ProviderId; apiKey: string; modelSlug: string; modelLabel: string };
+        const configsToTry: ConfigTry[] = [];
+        if (configs.length > 1) {
+          // Use all configs for fallback (different providers/models)
+          for (const c of configs) {
+            if (c.apiKey || c.providerId === "ollama") {
+              configsToTry.push({
+                providerId: c.providerId,
+                apiKey: c.apiKey ?? "",
+                modelSlug: c.modelSlug ?? getModelForProvider(c.providerId, null) ?? "openrouter/free",
+                modelLabel: c.modelLabel,
+              });
+            }
+          }
+        }
+        if (configsToTry.length === 0) {
+          const freeModelIds = OPENROUTER_FREE_MODELS.map((m) => m.id);
+          const modelsForProvider =
+            providerId === "openrouter" && resolvedModel && (freeModelIds as readonly string[]).includes(resolvedModel)
+              ? [...freeModelIds]
+              : resolvedModel
+                ? [resolvedModel]
+                : [];
+          for (const m of modelsForProvider) {
+            configsToTry.push({
+              providerId: providerId!,
+              apiKey: apiKey ?? "",
+              modelSlug: m,
+              modelLabel: inv.modelLabel,
+            });
+          }
+        }
+        // Reorder: prefer models that support streaming + planning (per capability registry)
+        const PLANNING_REQUIREMENTS = ["streaming", "planning"] as const;
+        configsToTry.sort((a, b) => {
+          const aMeets = PLANNING_REQUIREMENTS.every((r) => modelMeetsRequirement(a.providerId, a.modelSlug, r));
+          const bMeets = PLANNING_REQUIREMENTS.every((r) => modelMeetsRequirement(b.providerId, b.modelSlug, r));
+          if (aMeets && !bMeets) return -1;
+          if (!aMeets && bMeets) return 1;
+          return 0;
+        });
+        let modelFallback: { from: string; to: string; reason?: "rate_limit" | "capability" } | null = null;
+        const providerErrors: string[] = [];
+        // Proactive switch: if first model doesn't support streaming, switch to one that does
+        const first = configsToTry[0];
+        if (first && !modelMeetsRequirement(first.providerId, first.modelSlug, "streaming")) {
+          const capable = configsToTry.find((c) => modelMeetsRequirement(c.providerId, c.modelSlug, "streaming"));
+          if (capable && capable !== first) {
+            const idx = configsToTry.indexOf(capable);
+            if (idx > 0) {
+              [configsToTry[0], configsToTry[idx]] = [configsToTry[idx], configsToTry[0]];
+              emit(createAgentEvent("reasoning", `Model ${first.modelLabel} doesn't support streaming. Using ${capable.modelLabel} instead.`));
+              emit(createAgentEvent("status", `Model ${first.modelLabel} doesn't support streaming. Using ${capable.modelLabel} instead.`));
+              modelFallback = { from: first.modelLabel, to: capable.modelLabel, reason: "capability" };
+            }
+          }
+        }
+        const provider = getProvider(configsToTry[0]?.providerId ?? providerId!);
+        let modelUsed = configsToTry[0]?.modelSlug ?? resolvedModel ?? undefined;
+        let winningConfig: ConfigTry | null = configsToTry[0] ?? null;
 
         // Load project rules
         const rules = await loadRules(supabase, workspaceId);
@@ -545,8 +703,6 @@ export async function POST(request: Request) {
               lowerInstruction.includes("e-commerce") ||
               lowerInstruction.includes("3-tier") ||
               lowerInstruction.includes("tier")));
-
-        let plan: AgentPlan | null = null;
 
         // Only for rare, genuinely complex creation tasks: use chain-of-thought. Otherwise use fast direct planning.
         if (!isComplexTask && (looksLikeErrorFix || looksLikeSimpleRequest)) {
@@ -598,10 +754,8 @@ export async function POST(request: Request) {
         }
 
         // Use streaming to get real-time output (if plan not already generated)
-        let raw = "";
         let buffer = "";
         let lastEmitTime = Date.now();
-        let usage: { inputTokens?: number; outputTokens?: number } | null = null;
         
         if (!plan) {
           // Validate API key before attempting to call provider
@@ -610,26 +764,31 @@ export async function POST(request: Request) {
           }
 
           let streamDone = false;
-          for (let i = 0; i < modelsToTry.length && !streamDone; i++) {
-            const tryModel = modelsToTry[i];
+          for (let i = 0; i < configsToTry.length && !streamDone; i++) {
+            const cfg = configsToTry[i];
+            const tryProvider = getProvider(cfg.providerId);
+            const tryModel = cfg.modelSlug;
             if (i > 0) {
-              emit(createAgentEvent("reasoning", `Rate limit reached on ${modelsToTry[i - 1]}, trying ${tryModel}...`));
-              emit(createAgentEvent("status", `Trying alternative free model: ${tryModel}`));
-              modelFallback = { from: modelsToTry[0], to: tryModel };
+              const prevLabel = configsToTry[i - 1].modelLabel;
+              providerErrors.push(`${prevLabel}: rate limit or quota exceeded`);
+              emit(createAgentEvent("reasoning", `Model ${prevLabel} hit limits. Switched to ${cfg.modelLabel} to complete the task.`));
+              emit(createAgentEvent("status", `Model ${prevLabel} hit limits. Switched to ${cfg.modelLabel} to complete the task.`));
+              modelFallback = { from: configsToTry[0].modelLabel, to: cfg.modelLabel, reason: "rate_limit" };
             }
             raw = "";
             buffer = "";
             lastEmitTime = Date.now();
             const streamStartTime = Date.now();
             usage = null;
+            const streamAbortSignal = createStreamAbortSignal(request, MAX_STREAM_DURATION_MS, (r) => { abortReason = r; });
             try {
-            for await (const chunk of provider.stream(
+            for await (const chunk of tryProvider.stream(
             [
               { role: "system", content: systemPromptWithRules },
               { role: "user", content: userContent },
             ],
-            apiKey,
-            { model: tryModel, temperature: 0 }
+            cfg.apiKey,
+            { model: tryModel, temperature: 0, topP: 1, signal: streamAbortSignal }
           )) {
             if (shouldStopStream(request, streamStartTime, STREAM_UPSTREAM_TIMEOUT_MS)) break;
             raw += chunk;
@@ -720,31 +879,33 @@ export async function POST(request: Request) {
             }
           }
             modelUsed = tryModel;
+            winningConfig = cfg;
             streamDone = true;
             } catch (streamError) {
               const streamErrorMsg = streamError instanceof Error ? streamError.message : "Unknown stream error";
               if (streamErrorMsg.includes("API key") || streamErrorMsg.includes("authentication") || streamErrorMsg.includes("401") || streamErrorMsg.includes("403")) {
                 throw new Error(`API authentication failed: ${streamErrorMsg}. Please check your API key in Settings → API Keys.`);
               }
-              if (isRateLimitError(streamError) && i < modelsToTry.length - 1) {
+              if (isRateLimitError(streamError) && i < configsToTry.length - 1) {
                 continue;
               }
               emit(createAgentEvent('reasoning', `Streaming failed: ${streamErrorMsg}. Trying non-streaming mode...`));
               try {
-                const fallback = await provider.chat(
+                const fallback = await tryProvider.chat(
                   [
                     { role: "system", content: systemPromptWithRules },
                     { role: "user", content: userContent },
                   ],
-                  apiKey,
-                  { model: tryModel }
+                  cfg.apiKey,
+                  { model: tryModel, temperature: 0, topP: 1 }
                 );
                 raw = fallback.content;
                 usage = fallback.usage ?? null;
                 modelUsed = tryModel;
+                winningConfig = cfg;
                 streamDone = true;
               } catch (fallbackError) {
-                if (isRateLimitError(fallbackError) && i < modelsToTry.length - 1) {
+                if (isRateLimitError(fallbackError) && i < configsToTry.length - 1) {
                   continue;
                 }
                 const fallbackMsg = fallbackError instanceof Error ? fallbackError.message : "Unknown fallback error";
@@ -768,103 +929,69 @@ export async function POST(request: Request) {
           }
 
           emit(createAgentEvent('reasoning', 'Parsing plan response...'));
-          
-          /** Extract first complete JSON object by balanced braces; respects both double- and single-quoted strings (all providers). */
-          function extractJsonObject(text: string): string | null {
-            const start = text.indexOf("{");
-            if (start === -1) return null;
-            let depth = 0;
-            let stringChar: '"' | "'" | null = null;
-            let escape = false;
-            for (let i = start; i < text.length; i++) {
-              const c = text[i];
-              if (escape) {
-                escape = false;
-                continue;
-              }
-              if (c === "\\" && stringChar !== null) {
-                escape = true;
-                continue;
-              }
-              if (stringChar !== null) {
-                if (c === stringChar) stringChar = null;
-                continue;
-              }
-              if (c === '"' || c === "'") {
-                stringChar = c;
-                continue;
-              }
-              if (c === "{") depth++;
-              else if (c === "}") {
-                depth--;
-                if (depth === 0) return text.slice(start, i + 1);
-              }
-            }
-            return null;
-          }
-          
-          // First, try to parse JSON using robust parser (handles code blocks, single quotes, all providers)
-          const { parseJSONRobust } = await import("@/lib/utils/json-parser");
+
+          const { extractAgentPlanJSON } = await import("@/lib/utils/json-parser");
           const { logError, createStructuredError } = await import("@/lib/utils/error-handler");
-          
-          let parseResult: { success: boolean; data: AgentPlan | null; error?: string; raw?: string };
-          try {
-            parseResult = parseJSONRobust<AgentPlan>(trimmed, ["steps"]);
-          } catch (parseErr) {
-            const parseErrMsg = parseErr instanceof Error ? parseErr.message : String(parseErr);
-            if (/maximum call stack size exceeded|rangeerror|stack overflow/i.test(parseErrMsg)) {
-              emit(createAgentEvent('status', 'Error: Plan response was too large or complex to parse. Try a shorter task or a different model.'));
-              emit(createAgentEvent('reasoning', 'The parser hit a limit. Try rephrasing the task or splitting it into smaller steps.'));
-              safeClose(controller);
-              return;
-            }
-            throw parseErr;
-          }
 
-          if (!parseResult.success) {
-            emit(createAgentEvent('status', 'Retrying plan parsing…'));
-          }
+          const safeErrorStr = (err: unknown): string =>
+            typeof err === "string" ? err : err instanceof Error ? err.message : err != null ? JSON.stringify(err) : "Unknown error";
 
-          // If that fails, try extracting JSON object first (double- or single-quoted "steps")
-          if (!parseResult.success) {
-            const extracted = extractJsonObject(trimmed);
-            const hasSteps = extracted && (extracted.includes('"steps"') || extracted.includes("'steps'"));
-            if (extracted && hasSteps) {
-              parseResult = parseJSONRobust<AgentPlan>(extracted, ["steps"]);
-            }
-          }
-          // Last resort: strip common leading prose and retry (e.g. "Here is the plan:\n\n{...}")
-          if (!parseResult.success && parseResult.error?.includes("No JSON object or array")) {
-            const jsonStart = trimmed.search(/\{\s*["']steps["']\s*:/i);
-            if (jsonStart > 0) {
-              parseResult = parseJSONRobust<AgentPlan>(trimmed.slice(jsonStart), ["steps"]);
-            }
-          }
-          if (!parseResult.success && trimmed.includes("{")) {
-            const firstBrace = trimmed.indexOf("{");
-            parseResult = parseJSONRobust<AgentPlan>(trimmed.slice(firstBrace), ["steps"]);
-          }
-          // Repair common LLM mistakes (trailing commas) and retry once
-          if (!parseResult.success) {
-            const toRepair = extractJsonObject(trimmed) ?? trimmed.replace(/^[\s\S]*?(\{[\s\S]*\})\s*$/, "$1");
-            if (toRepair) {
-              const repaired = toRepair.replace(/,(\s*[}\]])/g, "$1");
-              const repairResult = parseJSONRobust<AgentPlan>(repaired, ["steps"]);
-              if (repairResult.success && repairResult.data) parseResult = repairResult;
-            }
-          }
-          
-          // If we successfully parsed JSON, validate schema and use it
-          if (parseResult.success && parseResult.data) {
-            const schemaValidation = validateAgentPlanOutput(parseResult.data);
-            if (schemaValidation.success) {
-              plan = schemaValidation.data;
+          let currentRaw = trimmed;
+          let parseResult = extractAgentPlanJSON<AgentPlan>(currentRaw, ["steps"]);
+          let lastError = safeErrorStr(parseResult.error);
+
+          // Phase 3: Retry-on-parse-failure loop (up to 3 retries with validation error + raw output)
+          const MAX_PARSE_RETRIES = 3;
+          for (let retry = 0; retry <= MAX_PARSE_RETRIES; retry++) {
+            if (parseResult.success && parseResult.data) {
+              const schemaValidation = validateAgentPlanOutput(parseResult.data);
+              if (schemaValidation.success && schemaValidation.data.steps?.length) {
+                plan = schemaValidation.data;
+                if (retry > 0) emit(createAgentEvent('reasoning', `Retry ${retry} succeeded: got valid JSON plan.`));
+                break;
+              }
+              lastError = schemaValidation.error;
             } else {
-              parseResult = { success: false, data: null, error: schemaValidation.error, raw: parseResult.raw };
+              lastError = safeErrorStr(parseResult.error);
+            }
+
+            if (plan) break;
+            if (retry < MAX_PARSE_RETRIES && winningConfig) {
+              emit(createAgentEvent('status', `Plan parse failed; retrying (${retry + 1}/${MAX_PARSE_RETRIES})...`));
+              const fixHint = `\n\n[System: Your previous response had invalid JSON or schema errors. Fix and output ONLY valid JSON. No markdown. No commentary.\nError: ${lastError}\nRaw output (first 2000 chars):\n${currentRaw.slice(0, 2000)}]\n\n`;
+              const retryModel = modelUsed || winningConfig.modelSlug;
+              const retryProvider = getProvider(winningConfig.providerId);
+              const retryAbort = new AbortController();
+              const retryTimeout = setTimeout(() => retryAbort.abort(), PLAN_RETRY_TIMEOUT_MS);
+              try {
+                const retryResponse = await retryProvider.chat(
+                  [
+                    { role: "system", content: systemPromptWithRules },
+                    { role: "user", content: userContent + fixHint },
+                  ],
+                  winningConfig.apiKey,
+                  { model: retryModel, temperature: 0, topP: 1, signal: retryAbort.signal }
+                );
+                clearTimeout(retryTimeout);
+                currentRaw = (retryResponse.content || "").trim();
+                if (!currentRaw) {
+                  emit(createAgentEvent('reasoning', 'Retry returned empty response.'));
+                  break;
+                }
+                parseResult = extractAgentPlanJSON<AgentPlan>(currentRaw, ["steps"]);
+              } catch (retryErr) {
+                clearTimeout(retryTimeout);
+                const msg = retryErr instanceof Error ? retryErr.message : "Unknown error";
+                const isTimeout = /abort|timeout|timed out/i.test(msg);
+                console.warn("Plan parse retry failed:", retryErr);
+                emit(createAgentEvent('reasoning', `Retry ${retry + 1} failed: ${isTimeout ? "Request timed out. Try a different model." : msg}`));
+                break;
+              }
             }
           }
+
           if (!plan) {
-            // Only now check if it looks like code (and no JSON was found)
+            // Reject: code instead of JSON (no JSON object found)
             const looksLikeCode = (
               trimmed.includes("margin:") ||
               trimmed.includes("font-family:") ||
@@ -877,96 +1004,56 @@ export async function POST(request: Request) {
               trimmed.includes("require(") ||
               trimmed.includes("from ")
             );
-            
-            const hasNoJson = (
-              trimmed.startsWith("{") === false &&
-              trimmed.startsWith("[") === false &&
-              !trimmed.includes('"steps"') &&
-              !trimmed.includes("'steps'") &&
-              trimmed.indexOf("{") === -1
-            );
-            
+            const hasNoJson = trimmed.indexOf("{") === -1;
             if (looksLikeCode && hasNoJson) {
               emit(createAgentEvent('status', 'Error: LLM returned code instead of JSON plan'));
-              emit(createAgentEvent('reasoning', 'The model returned code instead of a JSON plan. This might happen if:'));
-              emit(createAgentEvent('reasoning', '1. The instruction was unclear or asked for code directly'));
-              emit(createAgentEvent('reasoning', '2. The model misunderstood the task'));
-              emit(createAgentEvent('reasoning', 'Try: Rephrasing your instruction as a task request (e.g., "Create a file X" or "Add feature Y")'));
-              emit(createAgentEvent('reasoning', `Response preview: ${trimmed.slice(0, 200)}`));
-              safeClose(controller);
-              return;
-            }
-            
-            // One retry: ask model to fix JSON syntax (include broken JSON so it can repair it)
-            const hasStepsKeyword = trimmed.includes('"steps"') || trimmed.includes("'steps'");
-            if (!plan && hasStepsKeyword && apiKey) {
-              emit(createAgentEvent('status', 'Plan JSON had syntax errors; retrying once for corrected output...'));
-              try {
-                const brokenJson = (extractJsonObject(trimmed) ?? trimmed.replace(/^[\s\S]*?(\{[\s\S]*\})\s*$/, "$1") ?? trimmed).slice(0, 25000);
-                const fixHint = "\n\n[System: Your previous response had invalid JSON. Fix the syntax errors (unescaped quotes in strings, missing commas, trailing commas) and output ONLY the corrected JSON object with a \"steps\" array. No markdown, no extra text.]\n\nBroken JSON to fix:\n" + brokenJson;
-                const retryModel = modelUsed || modelsToTry[0];
-                const retryResponse = await provider.chat(
-                  [
-                    { role: "system", content: systemPromptWithRules },
-                    { role: "user", content: userContent + fixHint },
-                  ],
-                  apiKey,
-                  { model: retryModel, temperature: 0 }
-                );
-                const retryRaw = (retryResponse.content || "").trim();
-                const jsonMatch = retryRaw.match(/\{[\s\S]*\}/);
-                const toParse = jsonMatch ? jsonMatch[0] : retryRaw;
-                if (toParse) {
-                  const retryResult = parseJSONRobust<AgentPlan>(toParse, ["steps"]);
-                  if (retryResult.success && retryResult.data) {
-                    const schemaCheck = validateAgentPlanOutput(retryResult.data);
-                    if (schemaCheck.success && schemaCheck.data.steps?.length) {
-                      plan = schemaCheck.data;
-                      emit(createAgentEvent('reasoning', 'Retry succeeded: got valid JSON plan.'));
-                    }
-                  }
-                }
-              } catch (retryErr) {
-                console.warn("JSON-syntax retry failed:", retryErr);
-              }
+              emit(createAgentEvent('reasoning', 'The model returned code instead of a JSON plan. Try rephrasing as a task request (e.g., "Create a file X" or "Add feature Y").'));
             }
 
-            if (!plan) {
-              logError(
-                createStructuredError(
-                  `Plan JSON parse failed: ${parseResult.error}`,
-                  "parsing",
-                  "high",
-                  { raw: parseResult.raw || trimmed.slice(0, 500), originalLength: trimmed.length }
-                )
-              );
-              emit(createAgentEvent('status', `Error: Failed to parse JSON plan. ${parseResult.error}`));
-              emit(createAgentEvent('reasoning', `Parse error: ${parseResult.error}. Raw preview (first 500 chars): ${parseResult.raw || trimmed.slice(0, 500)}`));
-              safeClose(controller);
-              return;
-            }
+            // Phase 5: Hard failure with structured INVALID_AGENT_PLAN error
+            logError(
+              createStructuredError(
+                `Plan JSON parse failed after ${MAX_PARSE_RETRIES + 1} attempts: ${lastError}`,
+                "parsing",
+                "high",
+                { raw: parseResult.raw || currentRaw.slice(0, 500), originalLength: currentRaw.length }
+              )
+            );
+            const structuredError = {
+              type: "error",
+              code: "AGENT_PROTOCOL_FAILURE",
+              message: "The AI failed to produce a valid execution plan. Try a different model or provider.",
+            };
+            emit(createAgentEvent('status', `Error: ${structuredError.message}`));
+            safeEnqueue(controller, encoder, `data: ${JSON.stringify(structuredError)}\n\n`);
+            safeClose(controller);
+            return;
           }
         } // End of "if (!plan)" parsing block
 
         // Retry once when model returns valid JSON but empty steps (common with some OpenRouter/free models)
-        if (plan && Array.isArray(plan.steps) && plan.steps.length === 0 && apiKey) {
+        if (plan && Array.isArray(plan.steps) && plan.steps.length === 0 && winningConfig) {
           const retrySuffix = "\n\n[System: Your previous response had an empty \"steps\" array. You MUST output a JSON object with a non-empty \"steps\" array. Each step must be an object with \"type\" (\"file_edit\" or \"command\"), and for file_edit: \"path\" and \"newContent\"; for command: \"command\". Output ONLY valid JSON, no markdown or extra text.]";
           emit(createAgentEvent('status', 'Model returned empty steps; retrying once with stronger prompt...'));
           emit(createAgentEvent('reasoning', 'Retrying plan generation (empty steps array).'));
+          const emptyStepsAbort = new AbortController();
+          const emptyStepsTimeout = setTimeout(() => emptyStepsAbort.abort(), PLAN_RETRY_TIMEOUT_MS);
           try {
-            const retryModel = modelUsed || modelsToTry[0];
-            const retryResponse = await provider.chat(
+            const retryModel = modelUsed || winningConfig.modelSlug;
+            const retryProvider = getProvider(winningConfig.providerId);
+            const retryResponse = await retryProvider.chat(
               [
                 { role: "system", content: systemPromptWithRules },
                 { role: "user", content: userContent + retrySuffix },
               ],
-              apiKey,
-              { model: retryModel }
+              winningConfig.apiKey,
+              { model: retryModel, temperature: 0, topP: 1, signal: emptyStepsAbort.signal }
             );
+            clearTimeout(emptyStepsTimeout);
             const retryRaw = (retryResponse.content || "").trim();
             if (retryRaw) {
-              const { parseJSONRobust } = await import("@/lib/utils/json-parser");
-              const retryResult = parseJSONRobust<AgentPlan>(retryRaw, ["steps"]);
+              const { extractAgentPlanJSON } = await import("@/lib/utils/json-parser");
+              const retryResult = extractAgentPlanJSON<AgentPlan>(retryRaw, ["steps"]);
               if (retryResult.success && retryResult.data) {
                 const schemaCheck = validateAgentPlanOutput(retryResult.data);
                 if (schemaCheck.success && schemaCheck.data.steps?.length) {
@@ -976,6 +1063,7 @@ export async function POST(request: Request) {
               }
             }
           } catch (retryErr) {
+            clearTimeout(emptyStepsTimeout);
             console.warn("Empty-steps retry failed:", retryErr);
             emit(createAgentEvent('reasoning', 'Retry failed; will report empty plan.'));
           }
@@ -1004,7 +1092,7 @@ export async function POST(request: Request) {
           return missing;
         }
 
-        if (plan && Array.isArray(plan.steps) && plan.steps.length > 0 && apiKey) {
+        if (plan && Array.isArray(plan.steps) && plan.steps.length > 0 && winningConfig) {
           const missing = missingNpmScripts(plan);
           if (missing.length > 0) {
             const scriptsList = missing.join(", ");
@@ -1012,21 +1100,20 @@ export async function POST(request: Request) {
             const scriptsForPrompt = missing.map((s) => '"' + s + '"').join(", ");
             const hint = "\n\n[System: Your plan includes command(s) \"npm run " + scriptsList + "\" but no file_edit step that adds " + (missing.length === 1 ? "this script" : "these scripts") + " to package.json. Add or adjust a package.json step so that \"scripts\" includes " + scriptsForPrompt + " (e.g. \"dev\": \"next dev\" or \"vite\"). Then output the corrected JSON plan only.]";
             try {
-              const retryModel = modelUsed || modelsToTry[0];
-              const retryResponse = await provider.chat(
+              const retryModel = modelUsed || winningConfig.modelSlug;
+              const retryProvider = getProvider(winningConfig.providerId);
+              const retryResponse = await retryProvider.chat(
                 [
                   { role: "system", content: systemPromptWithRules },
                   { role: "user", content: userContent + hint },
                 ],
-                apiKey,
-                { model: retryModel, temperature: 0 }
+                winningConfig.apiKey,
+                { model: retryModel, temperature: 0, topP: 1 }
               );
               const retryRaw = (retryResponse.content || "").trim();
-              const jsonMatch = retryRaw.match(/\{[\s\S]*\}/);
-              const toParse = jsonMatch ? jsonMatch[0] : retryRaw;
-              if (toParse) {
-                const { parseJSONRobust } = await import("@/lib/utils/json-parser");
-                const retryResult = parseJSONRobust<AgentPlan>(toParse, ["steps"]);
+              if (retryRaw) {
+                const { extractAgentPlanJSON } = await import("@/lib/utils/json-parser");
+                const retryResult = extractAgentPlanJSON<AgentPlan>(retryRaw, ["steps"]);
                 if (retryResult.success && retryResult.data) {
                   const schemaCheck = validateAgentPlanOutput(retryResult.data);
                   if (schemaCheck.success && schemaCheck.data.steps?.length) {
@@ -1126,25 +1213,24 @@ export async function POST(request: Request) {
         
         // Check if steps are strings (descriptions) instead of objects - common LLM mistake
         const allStepsAreStrings = plan.steps.length > 0 && plan.steps.every((s: unknown) => typeof s === "string");
-        if (allStepsAreStrings && apiKey) {
+        if (allStepsAreStrings && winningConfig) {
           emit(createAgentEvent('status', 'Steps were plain text; retrying with hint for proper step objects...'));
           const hint = "\n\n[System: Your previous response had \"steps\" as an array of STRINGS (e.g. [\"Create file X\", \"Run npm install\"]). WRONG. Each step MUST be an OBJECT: {\"type\": \"file_edit\", \"path\": \"...\", \"newContent\": \"...\"} or {\"type\": \"command\", \"command\": \"...\"}. Output ONLY valid JSON with step objects.]";
           try {
-            const retryModel = modelUsed || modelsToTry[0];
-            const retryResponse = await provider.chat(
+            const retryModel = modelUsed || winningConfig.modelSlug;
+            const retryProvider = getProvider(winningConfig.providerId);
+            const retryResponse = await retryProvider.chat(
               [
                 { role: "system", content: systemPromptWithRules },
                 { role: "user", content: userContent + hint },
               ],
-              apiKey,
-              { model: retryModel, temperature: 0 }
+              winningConfig.apiKey,
+              { model: retryModel, temperature: 0, topP: 1 }
             );
             const retryRaw = (retryResponse.content || "").trim();
-            const jsonMatch = retryRaw.match(/\{[\s\S]*\}/);
-            const toParse = jsonMatch ? jsonMatch[0] : retryRaw;
-            if (toParse) {
-              const { parseJSONRobust } = await import("@/lib/utils/json-parser");
-              const retryResult = parseJSONRobust<AgentPlan>(toParse, ["steps"]);
+            if (retryRaw) {
+              const { extractAgentPlanJSON } = await import("@/lib/utils/json-parser");
+              const retryResult = extractAgentPlanJSON<AgentPlan>(retryRaw, ["steps"]);
               if (retryResult.success && retryResult.data) {
                 const schemaCheck = validateAgentPlanOutput(retryResult.data);
                 if (schemaCheck.success && schemaCheck.data.steps?.length) {
@@ -1319,6 +1405,7 @@ export async function POST(request: Request) {
 
         const fileEditStepsForScope = plan.steps.filter((s): s is FileEditStep => s.type === "file_edit");
         const finalScope = computeRunScope(fileEditStepsForScope);
+        const durationMs = Date.now() - planStart;
 
         // Send the plan as a final event (include model info for free-model fallback UI)
         safeEnqueue(controller, encoder, `data: ${JSON.stringify({
@@ -1331,6 +1418,9 @@ export async function POST(request: Request) {
           contextUsed: contextUsedFilePaths.length > 0 ? { filePaths: contextUsedFilePaths } : undefined,
           scope: { fileCount: finalScope.fileCount, approxLinesChanged: finalScope.approxLinesChanged },
           scopeMode: scopeMode ?? "normal",
+          durationMs,
+          tokensReserved: STREAMING_RESERVE_TOKENS,
+          providerErrors: providerErrors.length > 0 ? providerErrors : undefined,
         })}\n\n`);
         safeClose(controller);
       } catch (e) {
@@ -1358,6 +1448,17 @@ export async function POST(request: Request) {
         
         safeClose(controller);
       } finally {
+        releaseStreamSlot(user.id, workspaceId);
+        if (abortReason === "timeout") recordLLMStreamAbortedTimeout();
+        if (abortReason === "client") recordLLMStreamAbortedClient();
+        if (raw && raw.length > 0) {
+          const tokensUsed = estimateTokensFromChars(raw.length);
+          const toRefund = Math.max(0, STREAMING_RESERVE_TOKENS - tokensUsed);
+          if (toRefund > 0) {
+            refundBudget(supabase, user.id, toRefund, workspaceId).catch(() => {});
+            recordLLMBudgetRefunded(toRefund);
+          }
+        }
         const durationMs = Date.now() - planStart;
         recordAgentPlanDuration(durationMs);
         logAgentCompleted({

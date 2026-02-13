@@ -2,6 +2,9 @@ import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
 import { pushEditBatch } from "@/lib/edit-history";
+import { invalidateCache } from "@/lib/cache";
+import { logger } from "@/lib/logger";
+import { prepareEditContent } from "@/lib/formatters";
 
 type RouteParams = { params: Promise<{ id: string }> };
 
@@ -63,6 +66,9 @@ export async function POST(request: Request, { params }: RouteParams) {
     const trimmedPath = (path ?? "").trim();
     if (!trimmedPath) continue;
 
+    // Tooling vs AI: use deterministic formatter (Prettier/Black), not LLM
+    const preparedContent = await prepareEditContent(content ?? "", trimmedPath);
+
     const { data: existing } = await supabase
       .from("workspace_files")
       .select("id, content")
@@ -73,7 +79,7 @@ export async function POST(request: Request, { params }: RouteParams) {
     if (existing) {
       const originalContent = (existing.content as string) ?? "";
       const originalLines = originalContent.split("\n").length;
-      const newLines = (content ?? "").split("\n").length;
+      const newLines = preparedContent.split("\n").length;
       const maxLines = Math.max(originalLines, 1);
       const changeRatio = Math.abs(originalLines - newLines) / maxLines;
       if (changeRatio >= FULL_FILE_REPLACE_RATIO && !confirmFullFileReplace) {
@@ -86,12 +92,20 @@ export async function POST(request: Request, { params }: RouteParams) {
       }
       const { error } = await supabase
         .from("workspace_files")
-        .update({ content: content ?? "", updated_at: new Date().toISOString() })
+        .update({ content: preparedContent, updated_at: new Date().toISOString() })
         .eq("workspace_id", workspaceId)
         .eq("path", trimmedPath);
       if (!error) {
         applied.push(trimmedPath);
-        editHistoryBatch.push({ path: trimmedPath, oldContent: originalContent, newContent: content ?? "" });
+        editHistoryBatch.push({ path: trimmedPath, oldContent: originalContent, newContent: preparedContent });
+        logger.info({
+          event: "agent_file_write",
+          reason: "overwrite",
+          path: trimmedPath,
+          workspaceId,
+          userId: user.id,
+          lineCount: preparedContent.split("\n").length,
+        });
       }
     } else {
       const { error } = await supabase
@@ -99,17 +113,26 @@ export async function POST(request: Request, { params }: RouteParams) {
         .insert({
           workspace_id: workspaceId,
           path: trimmedPath,
-          content: content ?? "",
+          content: preparedContent,
         });
       if (!error) {
         applied.push(trimmedPath);
-        editHistoryBatch.push({ path: trimmedPath, oldContent: "", newContent: content ?? "" });
+        editHistoryBatch.push({ path: trimmedPath, oldContent: "", newContent: preparedContent });
+        logger.info({
+          event: "agent_file_write",
+          reason: "create",
+          path: trimmedPath,
+          workspaceId,
+          userId: user.id,
+          lineCount: preparedContent.split("\n").length,
+        });
       }
     }
   }
 
   if (editHistoryBatch.length > 0) {
     pushEditBatch(workspaceId, editHistoryBatch);
+    await invalidateCache(`filetree:${workspaceId}`);
   }
 
   if (fullFileReplacePaths.length > 0) {

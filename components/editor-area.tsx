@@ -17,6 +17,7 @@ import { TabBar } from "@/components/tab-bar";
 import { TerminalPanel } from "@/components/terminal-panel";
 import { useEditor } from "@/lib/editor-context";
 import { ErrorWithAction } from "@/components/error-with-action";
+import { BeautifyCodeButton } from "@/components/beautify-code-button";
 
 const MonacoEditor = dynamic(
   () => import("@monaco-editor/react").then((mod) => mod.default),
@@ -580,6 +581,7 @@ export function EditorArea() {
               <Pencil className="h-3.5 w-3.5" />
               Rename
             </Button>
+            <BeautifyCodeButton variant="compact" />
             <Button
               variant={terminalVisible ? "default" : "outline"}
               size="sm"
@@ -707,6 +709,15 @@ export function EditorArea() {
                 onChange={(value) => updateContent(tab.path, value ?? "")}
                 onMount={(editor, monaco) => {
                   editorRef.current = editor;
+                  // Ensure find widget is closed on mount; it only appears when user presses Ctrl/Cmd+F
+                  try {
+                    const findController = editor.getContribution?.("editor.contrib.findController");
+                    if (typeof findController?.closeFindWidget === "function") {
+                      findController.closeFindWidget();
+                    }
+                  } catch {
+                    /* ignore */
+                  }
                   editor.addAction({
                     id: "go-to-definition",
                     label: "Go to Definition",
@@ -992,18 +1003,25 @@ export function EditorArea() {
                 }}
                 theme="vs-dark"
                 options={{
-                  minimap: { enabled: true },
-                  lineNumbers: "on",
+                  minimap: { enabled: false },
+                  lineNumbers: "off",
+                  lineNumbersMinChars: 0,
+                  lineDecorationsWidth: 0,
+                  glyphMargin: false,
+                  renderOverviewRuler: false,
+                  stickyScroll: { enabled: false },
+                  folding: false,
+                  showFoldingControls: "never",
                   fontSize: 14,
                   wordWrap: "on",
                   scrollBeyondLastLine: false,
                   automaticLayout: true,
                   bracketPairColorization: { enabled: true },
                   matchBrackets: "always",
-                  folding: true,
-                  showFoldingControls: "mouseover",
                   inlineSuggest: { enabled: true },
                   tabCompletion: "on",
+                  cursorStyle: "block",
+                  cursorBlinking: "blink",
                 }}
               />
             </div>
@@ -1020,8 +1038,9 @@ export function EditorArea() {
         </div>
       ) : (
         <div className={`flex flex-1 flex-col overflow-hidden ${terminalVisible ? "" : ""}`}>
-          <div className={`flex flex-1 items-center justify-center p-8 text-muted-foreground ${terminalVisible ? "flex-1" : ""}`}>
+          <div className={`flex flex-1 flex-col items-center justify-center gap-4 p-8 text-muted-foreground ${terminalVisible ? "flex-1" : ""}`}>
             <p className="text-sm">Open a file from the file tree</p>
+            <BeautifyCodeButton variant="compact" />
           </div>
           {terminalVisible && (
             <div className="h-64 shrink-0 border-t border-border">

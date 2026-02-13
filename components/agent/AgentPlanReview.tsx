@@ -19,12 +19,15 @@ const PlanStepItem = React.memo(function PlanStepItem({
       : (step.command || "(no command specified)");
   return (
     <li className="flex items-start gap-2">
+      <span className="shrink-0 flex h-5 w-5 items-center justify-center rounded bg-muted/80 text-[10px] font-medium text-muted-foreground">
+        {index + 1}
+      </span>
       {step.type === "file_edit" ? (
         <FileEdit className="h-4 w-4 shrink-0 mt-0.5 text-muted-foreground" />
       ) : (
         <Terminal className="h-4 w-4 shrink-0 mt-0.5 text-muted-foreground" />
       )}
-      <span className="flex-1">
+      <span className="flex-1 min-w-0">
         <span
           className={
             !(step as FileEditStep).path && !(step as CommandStep).command
@@ -35,7 +38,7 @@ const PlanStepItem = React.memo(function PlanStepItem({
           {stepContent}
         </span>
         {step.description && (
-          <span className="text-muted-foreground"> — {step.description}</span>
+          <span className="block text-muted-foreground text-[11px] mt-0.5">Why: {step.description}</span>
         )}
         {step.type === "file_edit" && !step.path && (
           <span className="text-destructive/70 text-xs ml-1">
@@ -72,7 +75,8 @@ export function AgentPlanReview({
       <div className="shrink-0 space-y-2">
         <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground flex-wrap">
           <span className="font-medium">
-            Plan ({plan.steps.length} steps){runScope ? ` • Planned: ${runScope.fileCount} file(s), ≈${runScope.approxLinesChanged} lines` : ""} • {PROVIDER_LABELS[provider]}
+            Plan ({plan.steps.length} steps) — runs in order 1→{plan.steps.length}
+            {runScope ? ` • ${runScope.fileCount} file(s), ≈${runScope.approxLinesChanged} lines` : ""} • {PROVIDER_LABELS[provider]}
           </span>
           {planUsage && (
             <span className="rounded bg-background/60 px-2 py-0.5">

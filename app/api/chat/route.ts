@@ -3,10 +3,12 @@ import { createClient } from "@/lib/supabase/server";
 import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
 import { type ProviderId } from "@/lib/llm/providers";
 import type { ChatMessage, ChatContext } from "@/lib/llm/types";
+import { getTextFromContent } from "@/lib/llm/types";
 import { detectErrorLogKind } from "@/lib/agent/error-log-utils";
 import { resolveWorkspaceId } from "@/lib/workspaces/active-workspace";
 import { loadChatHistory } from "@/lib/chat-memory";
 import { chatCompletion, ChatServiceError } from "@/services/chat.service";
+import { getLLMUserFriendlyError, isAllModelsExhaustedError, errorResponse } from "@/lib/errors";
 
 export async function GET(request: Request) {
   let user: { id: string };
@@ -79,7 +81,7 @@ export async function POST(request: Request) {
   );
 
   if (body.classifyOnly === true && lastMessage?.role === "user") {
-    const text = typeof lastMessage.content === "string" ? lastMessage.content : "";
+    const text = getTextFromContent(lastMessage.content ?? "");
     const kind = detectErrorLogKind(text);
     return NextResponse.json({
       kind,
@@ -89,8 +91,8 @@ export async function POST(request: Request) {
     });
   }
 
-  if (body.treatAsNormal !== true && lastMessage?.role === "user" && typeof lastMessage.content === "string") {
-    const kind = detectErrorLogKind(lastMessage.content);
+  if (body.treatAsNormal !== true && lastMessage?.role === "user") {
+    const kind = detectErrorLogKind(getTextFromContent(lastMessage.content ?? ""));
     if (kind === "error_log" && workspaceId) {
       return NextResponse.json({
         kind: "error_log",
@@ -130,9 +132,12 @@ export async function POST(request: Request) {
         { status: 400 }
       );
     }
-    const err = e as Error & { statusCode?: number; retryAfter?: number };
-    const status = err.statusCode === 429 ? 429 : 502;
-    const msg = err instanceof Error ? err.message : "LLM request failed";
+    if (isAllModelsExhaustedError(e)) {
+      return errorResponse(e, { statusCode: 503 });
+    }
+    const err = e as Error & { statusCode?: number; status?: number; retryAfter?: number };
+    const status = err.statusCode === 429 || err.status === 429 ? 429 : 502;
+    const msg = getLLMUserFriendlyError(e, body.provider as string | undefined);
     console.error("[POST /api/chat]", e);
     const userMessage = msg.length > 300 ? `${msg.slice(0, 200)}…` : msg;
     const headers: Record<string, string> = {};

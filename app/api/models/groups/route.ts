@@ -65,7 +65,8 @@ export async function GET(request: Request) {
 
 /**
  * POST /api/models/groups
- * Body: { label: string, description?: string, modelIds: string[] }
+ * Body: { label: string, description?: string, modelIds: string[], modelRoles?: { modelId: string; role: string }[] }
+ * If modelRoles provided, use those; else assign by position (1st=planner, 2nd=coder, 3rd=reviewer).
  */
 export async function POST(request: Request) {
   let user: { id: string };
@@ -80,7 +81,7 @@ export async function POST(request: Request) {
     throw e;
   }
 
-  let body: { label?: string; description?: string; modelIds?: string[] };
+  let body: { label?: string; description?: string; modelIds?: string[]; modelRoles?: { modelId: string; role: string }[] };
   try {
     body = await request.json();
   } catch {
@@ -93,7 +94,26 @@ export async function POST(request: Request) {
   }
 
   const modelIds = Array.isArray(body.modelIds) ? body.modelIds : [];
+  const modelRoles = Array.isArray(body.modelRoles) ? body.modelRoles : [];
   const description = body.description != null ? String(body.description).trim() || null : null;
+
+  const roleOrder = ["planner", "coder", "reviewer"];
+  const buildInserts = () => {
+    if (modelRoles.length > 0) {
+      return modelRoles.slice(0, 10).map((r, i) => ({
+        group_id: "",
+        model_id: r.modelId,
+        role: r.role && roleOrder.includes(r.role) ? r.role : roleOrder[i] ?? "coder",
+        priority: i,
+      }));
+    }
+    return modelIds.slice(0, 10).map((modelId, i) => ({
+      group_id: "",
+      model_id: modelId,
+      role: roleOrder[i] ?? "coder",
+      priority: i,
+    }));
+  };
 
   const { data: group, error: groupError } = await supabase
     .from("model_groups")
@@ -110,13 +130,8 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: groupError?.message ?? "Failed to create group" }, { status: 500 });
   }
 
-  const roleOrder = ["planner", "coder", "reviewer"];
-  const inserts = modelIds.slice(0, 10).map((modelId, i) => ({
-    group_id: group.id,
-    model_id: modelId,
-    role: roleOrder[i] ?? "coder",
-    priority: i,
-  }));
+  const rawInserts = buildInserts();
+  const inserts = rawInserts.map((i) => ({ ...i, group_id: group.id }));
 
   if (inserts.length > 0) {
     const { error: memError } = await supabase.from("model_group_members").insert(inserts);

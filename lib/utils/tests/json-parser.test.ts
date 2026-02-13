@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { parseJSONRobust, extractMultipleJSON } from "../json-parser";
+import { parseJSONRobust, extractMultipleJSON, extractAgentPlanJSON } from "../json-parser";
 
 describe("JSON Parser", () => {
   describe("parseJSONRobust", () => {
@@ -46,6 +46,30 @@ describe("JSON Parser", () => {
       const result = parseJSONRobust(json);
       expect(result.success).toBe(false);
       expect(result.error).toBeDefined();
+    });
+  });
+
+  describe("extractAgentPlanJSON (Phase 1)", () => {
+    it("strips markdown fences and extracts first valid JSON object", () => {
+      const content = "Here is the plan:\n\n```json\n{\"steps\": [{\"type\": \"command\", \"command\": \"npm start\"}]}\n```";
+      const result = extractAgentPlanJSON(content, ["steps"]);
+      expect(result.success).toBe(true);
+      expect(result.data).toHaveProperty("steps");
+      expect((result.data as { steps: unknown[] }).steps).toHaveLength(1);
+    });
+
+    it("rejects when no JSON object found", () => {
+      const content = "I cannot create a plan for this.";
+      const result = extractAgentPlanJSON(content, ["steps"]);
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("No JSON object");
+    });
+
+    it("extracts JSON from mixed text (leading prose)", () => {
+      const content = "Looking at the codebase, here's my plan:\n\n{\"steps\": [{\"type\": \"file_edit\", \"path\": \"a.ts\", \"newContent\": \"x\"}], \"summary\": \"ok\"}";
+      const result = extractAgentPlanJSON(content, ["steps"]);
+      expect(result.success).toBe(true);
+      expect((result.data as { steps: unknown[] }).steps).toHaveLength(1);
     });
   });
 

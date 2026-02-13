@@ -7,6 +7,9 @@ import {
   getUserFriendlyMessage,
   classifyError,
   parseApiErrorForDisplay,
+  AI_TEMPORARILY_UNAVAILABLE,
+  isAiTemporarilyUnavailableError,
+  errorResponse,
   type ErrorCategory,
 } from "./errors";
 
@@ -97,6 +100,23 @@ describe("lib/errors", () => {
 
     it("returns original message for unknown status", () => {
       expect(parseApiErrorForDisplay("Special error", 418)).toBe("Special error");
+    });
+  });
+
+  describe("AI_TEMPORARILY_UNAVAILABLE", () => {
+    it("isAiTemporarilyUnavailableError returns true for errors with code", () => {
+      expect(isAiTemporarilyUnavailableError({ code: AI_TEMPORARILY_UNAVAILABLE })).toBe(true);
+      expect(isAiTemporarilyUnavailableError(new Error("x"))).toBe(false);
+    });
+
+    it("errorResponse returns 503 with code for AI_TEMPORARILY_UNAVAILABLE", async () => {
+      const err = new Error("All AI providers failed") as Error & { code?: string };
+      err.code = AI_TEMPORARILY_UNAVAILABLE;
+      const res = errorResponse(err);
+      expect(res.status).toBe(503);
+      const body = await res.json();
+      expect(body.code).toBe(AI_TEMPORARILY_UNAVAILABLE);
+      expect(body.error).toContain("temporarily unavailable");
     });
   });
 });

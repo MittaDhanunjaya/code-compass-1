@@ -13,6 +13,7 @@ import { classifyCommandKind, classifyCommandResult } from "@/lib/agent/command-
 import { proposeFixSteps, buildTails } from "@/lib/agent/self-debug";
 import { getProtectedPaths } from "@/lib/protected-paths";
 import { beautifyCode } from "@/lib/utils/code-beautifier";
+import { prepareEditContent } from "@/lib/formatters";
 import type { SearchResult } from "@/lib/indexing/types";
 import { resolveWorkspaceId } from "@/lib/workspaces/active-workspace";
 import { loadRules, formatRulesForPrompt } from "@/lib/rules";
@@ -446,10 +447,10 @@ export async function executeAgentPlan(input: ExecuteAgentInput): Promise<Execut
         .single();
 
       if (!fileRow) {
-        const beautifiedContent = beautifyCode(step.newContent, path);
+        const preparedContent = await prepareEditContent(step.newContent, path);
         const { error: insertError } = await supabase
           .from("workspace_files")
-          .insert({ workspace_id: workspaceId, path, content: beautifiedContent });
+          .insert({ workspace_id: workspaceId, path, content: preparedContent });
 
         if (insertError) {
           log.push({
@@ -477,7 +478,7 @@ export async function executeAgentPlan(input: ExecuteAgentInput): Promise<Execut
       }
 
       const currentContent = fileRow.content ?? "";
-      const beautifiedNewContent = beautifyCode(step.newContent, path);
+      const beautifiedNewContent = await prepareEditContent(step.newContent, path);
       let oldContentToMatch = step.oldContent;
       let contentToMatchAgainst = currentContent;
 

@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { beautifyCode, detectFileType } from "../code-beautifier";
+import { beautifyCode, detectFileType, detectLanguageFromContent } from "../code-beautifier";
 
 describe("Code Beautifier", () => {
   describe("beautifyCode", () => {
@@ -106,6 +106,30 @@ describe("Code Beautifier", () => {
     it("should return 'text' for unknown extensions", () => {
       expect(detectFileType("test.unknown")).toBe("text");
       expect(detectFileType("test")).toBe("text");
+    });
+  });
+
+  describe("detectLanguageFromContent", () => {
+    it("should detect Python from def and colons", () => {
+      expect(detectLanguageFromContent("def foo():\n    return 1")).toBe("python");
+    });
+
+    it("should detect JSON from braces and quotes", () => {
+      expect(detectLanguageFromContent('{"key": "value"}')).toBe("json");
+    });
+
+    it("should detect HTML from doctype", () => {
+      expect(detectLanguageFromContent("<!DOCTYPE html><html></html>")).toBe("html");
+    });
+
+    it("should detect JavaScript from require", () => {
+      expect(detectLanguageFromContent("const x = require('fs');")).toBe("javascript");
+      expect(detectLanguageFromContent("const path = require('path');")).toBe("javascript");
+    });
+
+    it("should return plaintext for empty or ambiguous content", () => {
+      expect(detectLanguageFromContent("")).toBe("plaintext");
+      expect(detectLanguageFromContent("   ")).toBe("plaintext");
     });
   });
 });

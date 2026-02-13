@@ -5,7 +5,7 @@ const isDev = process.env.NODE_ENV === "development";
 // Phase 10.1: Content Security Policy - restrict script/style/connect sources
 const cspHeader = [
   "default-src 'self'",
-  "script-src 'self' 'unsafe-inline'" + (isDev ? " 'unsafe-eval'" : ""),
+  "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net" + (isDev ? " 'unsafe-eval'" : ""),
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' blob: data: https:",
   "font-src 'self' data:",

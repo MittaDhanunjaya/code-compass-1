@@ -47,6 +47,28 @@ export function beautifyCode(content: string, _filePath?: string): string {
 }
 
 /**
+ * Detect language from code content (heuristics).
+ * Used for validation when user pastes code and selects a language.
+ */
+export function detectLanguageFromContent(content: string): string {
+  if (!content || typeof content !== "string") return "plaintext";
+  const trimmed = content.trim();
+  if (!trimmed) return "plaintext";
+  if (trimmed.startsWith("<!DOCTYPE") || trimmed.startsWith("<html")) return "html";
+  if (trimmed.startsWith("<?xml") || (trimmed.startsWith("<") && !trimmed.startsWith("<!"))) return "xml";
+  if (/^\s*[{[]/.test(trimmed) && trimmed.includes('"')) return "json";
+  if ((trimmed.includes("def ") || trimmed.includes("import ")) && trimmed.includes(":") && !trimmed.includes("{")) return "python";
+  if (trimmed.includes("func ") && trimmed.includes("{")) return "go";
+  if (trimmed.includes("public class") || trimmed.includes("private ")) return "java";
+  if (trimmed.includes("namespace ") || trimmed.includes("using ")) return "csharp";
+  if (trimmed.includes("fn ") && trimmed.includes("->")) return "rust";
+  if (trimmed.includes("<?php") || trimmed.includes("$")) return "php";
+  if (trimmed.includes("require(") || trimmed.includes("require ") || trimmed.includes("module.exports") || (trimmed.includes("import ") && trimmed.includes("from "))) return "javascript";
+  if (trimmed.includes("interface ") || trimmed.includes("type ") && trimmed.includes("=") && trimmed.includes("{")) return "typescript";
+  return "plaintext";
+}
+
+/**
  * Detect file type from file path/extension.
  */
 export function detectFileType(filePath: string): string {

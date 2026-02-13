@@ -13,3 +13,4 @@ export { AgentEventsLog } from "./AgentEventsLog";
 export { AgentExecutionResult } from "./AgentExecutionResult";
 export { AgentConfirmDialogs } from "./AgentConfirmDialogs";
 export { AgentReviewQueue } from "./AgentReviewQueue";
+export { AgentDebugPanel } from "./AgentDebugPanel";

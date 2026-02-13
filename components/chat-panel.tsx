@@ -2,7 +2,7 @@
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
-import { Send, Loader2, Sparkles, Check, ChevronDown, ChevronRight, GitPullRequest } from "lucide-react";
+import { Send, Loader2, Sparkles, Check, ChevronDown, ChevronRight, GitPullRequest, ImagePlus, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -21,6 +21,9 @@ import {
 import { useEditor } from "@/lib/editor-context";
 import { useWorkspaceLabel } from "@/lib/use-workspace-label";
 import { PROVIDERS, PROVIDER_LABELS, OPENROUTER_FREE_MODELS, type ProviderId } from "@/lib/llm/providers";
+import { useModelPreferences } from "@/hooks/use-model-preferences";
+import { MODEL_CATALOG } from "@/lib/llm/model-catalog";
+import { getModelsForDropdown } from "@/lib/llm/model-preferences";
 const AgentPanel = dynamic(() => import("@/components/agent-panel").then((m) => ({ default: m.AgentPanel })), {
   loading: () => <div className="flex flex-1 items-center justify-center p-4 text-sm text-muted-foreground">Loading Agent…</div>,
 });
@@ -33,6 +36,7 @@ import { COPY } from "@/lib/copy";
 import { ErrorWithAction } from "@/components/error-with-action";
 import { FeedbackPrompt } from "@/components/feedback-prompt";
 import type { LogAttachment } from "@/lib/chat/log-utils";
+import type { ContentPart } from "@/lib/llm/types";
 import { looksLikeLog, createLogAttachment } from "@/lib/chat/log-utils";
 import { Skeleton } from "@/components/ui/skeleton";
 
@@ -49,6 +53,13 @@ type DebugReviewStep = {
   description?: string;
 };
 
+function getDisplayContent(content: string | ContentPart[]): { text: string; images: string[] } {
+  if (typeof content === "string") return { text: content, images: [] };
+  const text = content.filter((p): p is { type: "text"; text: string } => p.type === "text").map((p) => p.text).join("\n");
+  const images = content.filter((p): p is { type: "image_url"; image_url: { url: string } } => p.type === "image_url").map((p) => p.image_url.url);
+  return { text, images };
+}
+
 const ChatMessageItem = React.memo(function ChatMessageItem({
   id,
   role,
@@ -59,11 +70,12 @@ const ChatMessageItem = React.memo(function ChatMessageItem({
 }: {
   id: string;
   role: "user" | "assistant";
-  content: string;
+  content: string | ContentPart[];
   logAttachment?: LogAttachment;
   isExpanded: boolean;
   onToggleLog: (id: string) => void;
 }) {
+  const { text, images } = getDisplayContent(content);
   return (
     <div
       className={`rounded-lg px-3 py-2 text-sm ${
@@ -72,7 +84,14 @@ const ChatMessageItem = React.memo(function ChatMessageItem({
           : "mr-4 bg-muted"
       }`}
     >
-      <div className="whitespace-pre-wrap break-words">{content}</div>
+      {images.length > 0 && (
+        <div className="flex flex-wrap gap-1.5 mb-2">
+          {images.map((url, i) => (
+            <img key={i} src={url} alt="" className="max-h-32 rounded border border-border/50 object-contain" />
+          ))}
+        </div>
+      )}
+      <div className="whitespace-pre-wrap break-words">{text}</div>
       {logAttachment && (
         <div className="mt-1.5 text-xs">
           <button
@@ -115,7 +134,7 @@ function getLanguage(path: string): string {
 type Message = {
   id: string;
   role: "user" | "assistant";
-  content: string;
+  content: string | ContentPart[];
   logAttachment?: LogAttachment;
 };
 
@@ -151,6 +170,7 @@ export function ChatPanel({
   const [debugLoading, setDebugLoading] = useState(false);
   const [debugSummary, setDebugSummary] = useState<string | null>(null);
   const [debugRootCause, setDebugRootCause] = useState<string | null>(null);
+  const [debugVerificationCommand, setDebugVerificationCommand] = useState<string | null>(null);
   const [debugReviewSteps, setDebugReviewSteps] = useState<DebugReviewStep[]>([]);
   const [debugSandboxChecks, setDebugSandboxChecks] = useState<import("@/lib/sandbox").SandboxCheckResult | null>(null);
   const [debugSelectedPaths, setDebugSelectedPaths] = useState<Set<string>>(new Set());
@@ -183,6 +203,7 @@ export function ChatPanel({
   // Use fixed initial state so server and client match (avoid hydration error from localStorage)
   const [provider, setProviderState] = useState<ProviderId>("openrouter");
   const [model, setModelState] = useState<string>("openrouter/free");
+  const { prefs: modelPrefs } = useModelPreferences();
   const [loading, setLoading] = useState(false);
   const [rulesFile, setRulesFile] = useState<string | null>(null);
   const [usageText, setUsageText] = useState<string | null>(null);
@@ -194,6 +215,8 @@ export function ChatPanel({
   const [showDebugFeedback, setShowDebugFeedback] = useState(false);
   const [debugRetrySummary, setDebugRetrySummary] = useState<{ attempt1: boolean; attempt2: boolean } | null>(null);
   const [logAttachment, setLogAttachment] = useState<LogAttachment | null>(null);
+  const [attachedImages, setAttachedImages] = useState<string[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [useDebugForLogs, setUseDebugForLogs] = useState(() => {
     if (typeof window === "undefined") return true;
     const stored = window.localStorage.getItem("useDebugForLogs");
@@ -203,6 +226,11 @@ export function ChatPanel({
   const handleToggleLogMessage = useCallback((messageId: string) => {
     setExpandedLogMessageId((id) => (id === messageId ? null : messageId));
   }, []);
+  const [modelsExhaustedModalOpen, setModelsExhaustedModalOpen] = useState(false);
+  const [modelsExhaustedData, setModelsExhaustedData] = useState<{
+    recommendedProviders: string[];
+    recommendedModels: string[];
+  } | null>(null);
 
   const runDebugFromLog = useCallback(
     async (wsId: string, logText: string, options?: { userMessageContent?: string; logAttachment?: LogAttachment }) => {
@@ -239,6 +267,7 @@ export function ChatPanel({
         }
         const explanation = data.explanation ?? data.summary ?? "Analysis complete.";
         const suspectedRootCause = data.suspectedRootCause ?? "";
+        const verificationCommand = data.verificationCommand ?? null;
         const rawEdits = Array.isArray(data.edits) ? data.edits : [];
         const steps: DebugReviewStep[] = [];
         for (const e of rawEdits) {
@@ -267,6 +296,7 @@ export function ChatPanel({
         }
         setDebugSummary(explanation);
         setDebugRootCause(suspectedRootCause || null);
+        setDebugVerificationCommand(verificationCommand);
         setDebugReviewSteps(steps);
         setDebugSelectedPaths(new Set(steps.map((s) => s.path)));
         setDebugExpandedPath(null);
@@ -286,10 +316,11 @@ export function ChatPanel({
         } catch {
           // use fallback
         }
+        const verifyPart = verificationCommand ? `\n\n**How to verify:** Run \`${verificationCommand}\`` : "";
         const body =
           suspectedRootCause.length > 0
-            ? `**Suspected root cause:** ${suspectedRootCause}\n\n${explanation}`
-            : explanation;
+            ? `**Suspected root cause:** ${suspectedRootCause}\n\n${explanation}${verifyPart}`
+            : explanation + verifyPart;
         const sandboxNote = steps.length > 0
           ? `\n\n**Note:** When you apply these changes, they will be tested in a sandbox (lint + tests) before being applied to your workspace. Only passing changes will be applied.`
           : "";
@@ -448,26 +479,55 @@ export function ChatPanel({
     setProviderState(newProvider);
     if (typeof window !== "undefined") {
       const key = workspaceId ? `chat-provider-${workspaceId}` : "chat-provider-default";
+      const modelKey = workspaceId ? `chat-model-${workspaceId}` : "chat-model-default";
       localStorage.setItem(key, newProvider);
-      // Reset model to default if switching away from OpenRouter
       if (newProvider !== "openrouter") {
-        const modelKey = workspaceId ? `chat-model-${workspaceId}` : "chat-model-default";
-        localStorage.removeItem(modelKey);
-        setModelState("");
-      } else if (!model || !OPENROUTER_FREE_MODELS.some(m => m.id === model)) {
-        setModelState("openrouter/free");
+        const defaultModel = newProvider === "perplexity" ? "sonar" : newProvider === "gemini" ? "gemini-2.0-flash" : "";
+        setModelState(defaultModel);
+        localStorage.setItem(modelKey, defaultModel);
+      } else {
+        const openRouterModels = modelPrefs?.preferredModelIds?.length
+          ? getModelsForDropdown()
+          : OPENROUTER_FREE_MODELS;
+        const openRouterIds = openRouterModels.map((m) => m.id).filter((id) => !id.includes(":"));
+        const modelInList = openRouterIds.includes(model);
+        let toSet = model;
+        if (!model || !modelInList) {
+          toSet = openRouterIds[0] ?? "openrouter/free";
+          setModelState(toSet);
+        }
+        localStorage.setItem(modelKey, toSet);
       }
     }
-  }, [workspaceId, model]);
+  }, [workspaceId, model, modelPrefs]);
 
-  // Persist model selection
-  const setModel = useCallback((newModel: string) => {
-    setModelState(newModel);
-    if (typeof window !== "undefined") {
-      const key = workspaceId ? `chat-model-${workspaceId}` : "chat-model-default";
-      localStorage.setItem(key, newModel);
+  // Persist model selection. Handles provider-prefixed ids (e.g. perplexity:sonar).
+  const setModel = useCallback((modelId: string) => {
+    if (typeof window === "undefined") return;
+    const colon = modelId.indexOf(":");
+    if (colon > 0) {
+      const p = modelId.slice(0, colon) as ProviderId;
+      const m = modelId.slice(colon + 1);
+      if (PROVIDERS.includes(p)) {
+        setProviderState(p);
+        setModelState(m);
+        const pk = workspaceId ? `chat-provider-${workspaceId}` : "chat-provider-default";
+        const mk = workspaceId ? `chat-model-${workspaceId}` : "chat-model-default";
+        localStorage.setItem(pk, p);
+        localStorage.setItem(mk, m);
+        return;
+      }
     }
+    setModelState(modelId);
+    setProviderState("openrouter");
+    const pk = workspaceId ? `chat-provider-${workspaceId}` : "chat-provider-default";
+    const mk = workspaceId ? `chat-model-${workspaceId}` : "chat-model-default";
+    localStorage.setItem(pk, "openrouter");
+    localStorage.setItem(mk, modelId);
   }, [workspaceId]);
+
+  const isModelSelected = (m: { id: string }) =>
+    m.id.includes(":") ? (provider === m.id.split(":")[0] && model === m.id.split(":")[1]) : (provider === "openrouter" && model === m.id);
 
   // Client-only: sync provider/model from localStorage when workspace or mount changes; fetch best-default if no stored preference.
   // Single effect with stable deps [workspaceId, mounted] to avoid "useEffect changed size" between renders.
@@ -579,6 +639,7 @@ export function ChatPanel({
         setDebugReviewSteps([]);
         setDebugSummary(null);
         setDebugRootCause(null);
+        setDebugVerificationCommand(null);
         setDebugSelectedPaths(new Set());
         setDebugRunWorkspaceId(null);
         setDebugSandboxChecks(null);
@@ -652,29 +713,33 @@ export function ChatPanel({
   const NO_WORKSPACE_NOTE =
     "I don't know which project this error belongs to; select a workspace and paste the logs again if you want me to modify code.\n\n";
 
-  async function sendMessage(content: string, options?: { prependNoWorkspaceNote?: boolean; treatAsNormal?: boolean; skipAddingUserMessage?: boolean }) {
-    if (!content.trim() || loading) return;
+  async function sendMessage(content: string | ContentPart[], options?: { prependNoWorkspaceNote?: boolean; treatAsNormal?: boolean; skipAddingUserMessage?: boolean }) {
+    const textOnly = typeof content === "string" ? content.trim() : content.filter((p): p is { type: "text"; text: string } => p.type === "text").map((p) => p.text).join(" ").trim();
+    const hasImages = typeof content !== "string" && content.some((p) => p.type === "image_url");
+    if ((!textOnly && !hasImages) || loading) return;
 
     if (!options?.skipAddingUserMessage) {
       const userMessage: Message = {
         id: crypto.randomUUID(),
         role: "user",
-        content: content.trim(),
+        content: typeof content === "string" ? content.trim() : content,
       };
       setMessages((prev) => [...prev, userMessage]);
     }
     setInput("");
+    setAttachedImages([]);
     setLoading(true);
     setUsageText(null);
     setLastContextUsed(null);
     setError(null);
     setNoWorkspaceErrorLogNote(false);
 
+    const lastUserContent = typeof content === "string" ? content.trim() : content;
     const chatMessages = options?.skipAddingUserMessage
       ? messages.map((m) => ({ role: m.role, content: m.content }))
       : [
           ...messages.map((m) => ({ role: m.role, content: m.content })),
-          { role: "user" as const, content: content.trim() },
+          { role: "user" as const, content: lastUserContent },
         ];
     const context = buildContext(
       workspaceId,
@@ -706,7 +771,7 @@ export function ChatPanel({
       }
 
       if (data.requireConfirmation === true && data.kind === "error_log" && data.workspaceId) {
-        setPendingLogMessage(content.trim());
+        setPendingLogMessage(textOnly);
         setWorkspaceIdWhenLogPasted(workspaceId);
         setErrorLogConfirmAlreadyHasUserMessage(true);
         setErrorLogConfirmOpen(true);
@@ -717,6 +782,15 @@ export function ChatPanel({
         setNoWorkspaceErrorLogNote(true);
       }
       if (!res.ok) {
+        const code = data.code as string | undefined;
+        const recommendedProviders = (data.recommendedProviders as string[] | undefined) ?? [];
+        const recommendedModels = (data.recommendedModels as string[] | undefined) ?? [];
+        if (code === "ALL_MODELS_EXHAUSTED") {
+          setModelsExhaustedData({ recommendedProviders, recommendedModels });
+          setModelsExhaustedModalOpen(true);
+          setLoading(false);
+          return;
+        }
         const errorMsg = typeof data.error === "string" ? data.error : (data.error as { message?: string })?.message ?? `Request failed: ${res.status}`;
         if (errorMsg.includes("No API key configured") && provider === "openrouter") {
           throw new Error(`OpenRouter: No API key configured. Click 'Get free key' in API Keys settings to set it up.`);
@@ -845,57 +919,80 @@ export function ChatPanel({
         </p>
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-2">
-            <span className="text-xs text-muted-foreground">Provider:</span>
-            {mounted ? (
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button variant="outline" size="sm" className="h-7 text-xs font-medium">
+            {modelPrefs?.showInChat !== false ? (
+              <>
+                <span className="text-xs text-muted-foreground">Provider:</span>
+                {mounted ? (
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button variant="outline" size="sm" className="h-7 text-xs font-medium">
+                        {PROVIDER_LABELS[provider]} ▼
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="start">
+                      {PROVIDERS.map((p) => (
+                        <DropdownMenuItem
+                          key={p}
+                          onClick={() => setProvider(p)}
+                          className={p === provider ? "bg-accent" : ""}
+                        >
+                          {PROVIDER_LABELS[p]}
+                          {p === provider && <span className="ml-2 text-xs">✓</span>}
+                        </DropdownMenuItem>
+                      ))}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                ) : (
+                  <Button variant="outline" size="sm" className="h-7 text-xs font-medium" disabled>
                     {PROVIDER_LABELS[provider]} ▼
                   </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="start">
-                  {PROVIDERS.map((p) => (
-                    <DropdownMenuItem
-                      key={p}
-                      onClick={() => setProvider(p)}
-                      className={p === provider ? "bg-accent" : ""}
-                    >
-                      {PROVIDER_LABELS[p]}
-                      {p === provider && <span className="ml-2 text-xs">✓</span>}
-                    </DropdownMenuItem>
-                  ))}
-                </DropdownMenuContent>
-              </DropdownMenu>
+                )}
+              </>
             ) : (
-              <Button variant="outline" size="sm" className="h-7 text-xs font-medium" disabled>
-                {PROVIDER_LABELS[provider]} ▼
-              </Button>
+              <span className="text-xs text-muted-foreground">
+                {PROVIDER_LABELS[provider]} · {(() => {
+                  const models = modelPrefs?.preferredModelIds?.length ? getModelsForDropdown() : OPENROUTER_FREE_MODELS;
+                  const sel = models.find((m) => isModelSelected(m));
+                  return sel?.label ?? (provider === "openrouter" ? model : "—");
+                })()}
+              </span>
             )}
           </div>
-        {provider === "openrouter" && (
+        {modelPrefs?.showInChat !== false && (provider === "openrouter" || (modelPrefs?.preferredModelIds?.length ?? 0) > 0) && (
           mounted ? (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button variant="outline" size="sm" className="h-7 text-xs font-medium">
-                  {OPENROUTER_FREE_MODELS.find(m => m.id === model)?.label || model} ▼
+                  {(() => {
+                    const models = modelPrefs?.preferredModelIds?.length ? getModelsForDropdown() : OPENROUTER_FREE_MODELS;
+                    const sel = models.find((m) => isModelSelected(m));
+                    return sel?.label ?? model ?? "—";
+                  })()}{" ▼"}
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                {OPENROUTER_FREE_MODELS.map((m) => (
-                  <DropdownMenuItem
-                    key={m.id}
-                    onClick={() => setModel(m.id)}
-                    className={m.id === model ? "bg-accent" : ""}
-                  >
-                    {m.label}
-                    {m.id === model && <span className="ml-2 text-xs">✓</span>}
-                  </DropdownMenuItem>
-                ))}
+                {(() => {
+                  const models = modelPrefs?.preferredModelIds?.length ? getModelsForDropdown() : OPENROUTER_FREE_MODELS;
+                  return models.map((m) => (
+                    <DropdownMenuItem
+                      key={m.id}
+                      onClick={() => setModel(m.id)}
+                      className={isModelSelected(m) ? "bg-accent" : ""}
+                    >
+                      {m.label}
+                      {isModelSelected(m) && <span className="ml-2 text-xs">✓</span>}
+                    </DropdownMenuItem>
+                  ));
+                })()}
               </DropdownMenuContent>
             </DropdownMenu>
           ) : (
             <Button variant="outline" size="sm" className="h-7 text-xs font-medium" disabled>
-              {OPENROUTER_FREE_MODELS.find(m => m.id === model)?.label || model} ▼
+              {(() => {
+                const models = modelPrefs?.preferredModelIds?.length ? getModelsForDropdown() : OPENROUTER_FREE_MODELS;
+                const sel = models.find((m) => isModelSelected(m));
+                return sel?.label ?? model ?? "—";
+              })()}{" ▼"}
             </Button>
           )
         )}
@@ -1014,6 +1111,12 @@ export function ChatPanel({
               <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-foreground">
                 <span className="font-medium text-amber-700 dark:text-amber-400">Suspected root cause:</span>{" "}
                 {debugRootCause}
+              </div>
+            )}
+            {debugVerificationCommand && (
+              <div className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-foreground">
+                <span className="font-medium text-emerald-700 dark:text-emerald-400">How to verify:</span>{" "}
+                <code className="font-mono text-xs">{debugVerificationCommand}</code>
               </div>
             )}
             {debugSummary && (
@@ -1156,6 +1259,7 @@ export function ChatPanel({
                   setDebugReviewSteps([]);
                   setDebugSummary(null);
                   setDebugRootCause(null);
+        setDebugVerificationCommand(null);
                   setDebugSelectedPaths(new Set());
                   setDebugFromLogMeta(null);
                 }}
@@ -1357,7 +1461,8 @@ export function ChatPanel({
             e.preventDefault();
             const content = input.trim();
             const hasLog = !!logAttachment;
-            const canSend = content || hasLog;
+            const hasImages = attachedImages.length > 0;
+            const canSend = content || hasLog || hasImages;
             if (!canSend || loading) return;
 
             const shouldDebug = hasLog && useDebugForLogs && workspaceId;
@@ -1370,26 +1475,110 @@ export function ChatPanel({
               });
               setInput("");
               setLogAttachment(null);
+              setAttachedImages([]);
               return;
             }
 
-            if (!workspaceId) {
-              sendMessage(textToSend, { prependNoWorkspaceNote: true });
-            } else if (hasLog) {
-              sendMessage(textToSend, { treatAsNormal: true });
+            let messageContent: string | ContentPart[];
+            if (hasImages) {
+              const parts: ContentPart[] = [];
+              if (textToSend) parts.push({ type: "text", text: textToSend });
+              for (const url of attachedImages) {
+                parts.push({ type: "image_url", image_url: { url } });
+              }
+              if (parts.length === 0) parts.push({ type: "text", text: "What's in this image?" });
+              messageContent = parts;
             } else {
-              sendMessage(textToSend);
+              messageContent = textToSend;
+            }
+
+            if (!workspaceId) {
+              sendMessage(messageContent, { prependNoWorkspaceNote: true });
+            } else if (hasLog) {
+              sendMessage(messageContent, { treatAsNormal: true });
+            } else {
+              sendMessage(messageContent);
             }
             setInput("");
             setLogAttachment(null);
+            setAttachedImages([]);
           }}
         >
+          {attachedImages.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 items-center">
+              {attachedImages.map((url, i) => (
+                <div key={i} className="relative group">
+                  <img src={url} alt="" className="h-16 w-16 rounded border border-border object-cover" />
+                  <button
+                    type="button"
+                    onClick={() => setAttachedImages((prev) => prev.filter((_, j) => j !== i))}
+                    className="absolute -top-1 -right-1 rounded-full bg-destructive text-destructive-foreground p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                    aria-label="Remove image"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="flex gap-1 flex-1 min-w-0">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={(e) => {
+              const files = e.target.files;
+              if (files) {
+                for (let i = 0; i < files.length; i++) {
+                  const file = files[i];
+                  if (file.type.startsWith("image/")) {
+                    const reader = new FileReader();
+                    reader.onload = () => {
+                      const dataUrl = reader.result as string;
+                      if (dataUrl) setAttachedImages((prev) => [...prev, dataUrl]);
+                    };
+                    reader.readAsDataURL(file);
+                  }
+                }
+                e.target.value = "";
+              }
+            }}
+          />
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            onClick={() => fileInputRef.current?.click()}
+            title="Upload image"
+            disabled={loading}
+          >
+            <ImagePlus className="h-4 w-4" />
+          </Button>
           <Textarea
             ref={inputRef}
-            placeholder='Ask anything… or use @codebase "query" to search. Paste terminal logs to format with line numbers.'
+            placeholder='Ask anything… Paste or upload screenshots. Use @codebase "query" to search.'
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onPaste={(e) => {
+              const items = e.clipboardData?.items;
+              if (items) {
+                for (const item of items) {
+                  if (item.type.startsWith("image/")) {
+                    e.preventDefault();
+                    const file = item.getAsFile();
+                    if (file) {
+                      const reader = new FileReader();
+                      reader.onload = () => {
+                        const dataUrl = reader.result as string;
+                        if (dataUrl) setAttachedImages((prev) => [...prev, dataUrl]);
+                      };
+                      reader.readAsDataURL(file);
+                    }
+                    return;
+                  }
+                }
+              }
               const pasted = e.clipboardData?.getData("text");
               const fromTerminal = e.clipboardData?.types?.includes("application/x-code-compass-terminal");
               if (fromTerminal && pasted && pasted.includes("\n")) {
@@ -1422,15 +1611,16 @@ export function ChatPanel({
             className="flex-1 min-h-[2.25rem] resize-y max-h-32"
             rows={1}
           />
+          </div>
           <Button
             type="submit"
             size="icon"
-            disabled={loading || (!input.trim() && !logAttachment)}
+            disabled={loading || (!input.trim() && !logAttachment && attachedImages.length === 0)}
             title={
               loading
                 ? "Sending…"
-                : !input.trim() && !logAttachment
-                  ? "Enter a message or paste logs"
+                : !input.trim() && !logAttachment && attachedImages.length === 0
+                  ? "Enter a message, paste logs, or add an image"
                   : "Send message"
             }
           >
@@ -1527,6 +1717,38 @@ export function ChatPanel({
             >
               {debugApplying ? COPY.debug.applying : "Continue"}
             </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={modelsExhaustedModalOpen} onOpenChange={(o) => { setModelsExhaustedModalOpen(o); if (!o) setModelsExhaustedData(null); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Model unavailable</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground py-2">
+            Current AI model is unavailable. Switch to another model or add API key.
+          </p>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setModelsExhaustedModalOpen(false)}>
+              Dismiss
+            </Button>
+            {modelsExhaustedData && modelsExhaustedData.recommendedProviders.length > 0 && (
+              <Button
+                onClick={() => {
+                  const p = modelsExhaustedData.recommendedProviders[0];
+                  const m = modelsExhaustedData.recommendedModels[0];
+                  if (p && PROVIDERS.includes(p as ProviderId)) {
+                    setProvider(p as ProviderId);
+                    if (m && p === "openrouter") setModel(m);
+                  }
+                  setModelsExhaustedModalOpen(false);
+                  setModelsExhaustedData(null);
+                }}
+              >
+                Switch to {modelsExhaustedData.recommendedProviders[0] === "openrouter" ? "OpenRouter" : modelsExhaustedData.recommendedProviders[0]}
+              </Button>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>

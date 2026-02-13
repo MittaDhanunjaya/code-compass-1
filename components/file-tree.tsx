@@ -60,10 +60,13 @@ export function FileTree({ workspaceId }: FileTreeProps) {
 
   const isDirty = (path: string) => getTab(path)?.dirty ?? false;
 
-  const fetchFiles = useCallback(async () => {
+  const fetchFiles = useCallback(async (forceRefresh = false) => {
     if (!workspaceId) return;
     try {
-      const res = await fetch(`/api/workspaces/${workspaceId}/files`);
+      const url = forceRefresh
+        ? `/api/workspaces/${workspaceId}/files?refresh=1`
+        : `/api/workspaces/${workspaceId}/files`;
+      const res = await fetch(url);
       if (res.ok) {
         const data = await res.json();
         setPaths(data);
@@ -128,7 +131,7 @@ export function FileTree({ workspaceId }: FileTreeProps) {
   // Listen for file tree refresh events (e.g., after Agent execution or Re-sync from folder)
   useEffect(() => {
     const handleRefresh = () => {
-      if (workspaceId) fetchFiles();
+      if (workspaceId) fetchFiles(true);
     };
     const handleSynced = (e: Event) => {
       const detail = (e as CustomEvent).detail as { workspaceId?: string };
@@ -313,8 +316,8 @@ export function FileTree({ workspaceId }: FileTreeProps) {
             variant="ghost"
             size="icon"
             className="h-6 w-6"
-            onClick={() => fetchFiles()}
-            title="Refresh file tree"
+            onClick={() => fetchFiles(true)}
+            title="Refresh file tree (reload from workspace)"
           >
             <RefreshCw className="h-4 w-4" />
           </Button>

@@ -1,6 +1,7 @@
 /**
  * Next.js instrumentation - runs when the Node.js server starts.
  * Validates environment config at boot; activates plugins (Phase 13.2.2).
+ * Production: runs preflight checks and blocks startup if any fail.
  */
 export async function register() {
   if (process.env.NEXT_RUNTIME === "nodejs") {
@@ -20,5 +21,17 @@ export async function register() {
         // Placeholder: agent hooks would be stored and invoked by agent pipeline
       },
     });
+
+    // Production safety gate: block startup if preflight checks fail
+    if (process.env.NODE_ENV === "production") {
+      const { runPreflightChecks } = await import("./lib/preflight");
+      const result = await runPreflightChecks();
+      if (!result.ok) {
+        const failed = result.checks.filter((c) => !c.ok);
+        const msg = failed.map((c) => `[${c.name}] ${c.message ?? "failed"}`).join("; ");
+        console.error(`[preflight] Production startup blocked: ${msg}`);
+        process.exit(1);
+      }
+    }
   }
 }

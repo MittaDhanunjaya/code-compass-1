@@ -8,7 +8,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 const DEFAULT_DAILY_LIMIT = 100_000; // tokens per user per day
 const DEFAULT_WORKSPACE_DAILY_LIMIT = 50_000; // Phase 4.2.3: per workspace
 
-function getDailyLimit(): number {
+export function getDailyLimit(): number {
   const env = process.env.TOKEN_BUDGET_DAILY_PER_USER;
   if (env) {
     const n = parseInt(env, 10);
@@ -17,7 +17,7 @@ function getDailyLimit(): number {
   return DEFAULT_DAILY_LIMIT;
 }
 
-function getWorkspaceDailyLimit(): number {
+export function getWorkspaceDailyLimit(): number {
   const env = process.env.TOKEN_BUDGET_WORKSPACE_DAILY;
   if (env) {
     const n = parseInt(env, 10);

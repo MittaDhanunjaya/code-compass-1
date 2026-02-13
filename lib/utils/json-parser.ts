@@ -678,6 +678,59 @@ function fixMissingCommas(jsonStr: string): string {
 }
 
 /**
+ * Phase 1: Strict JSON extraction for agent plans.
+ * 1. Strips markdown fences (```json, ```)
+ * 2. Extracts first valid JSON object from mixed text
+ * 3. Rejects if no JSON object found
+ * Never throws - returns ParseResult with success/error.
+ */
+export function extractAgentPlanJSON<T = unknown>(
+  content: string,
+  expectedKeys: string[] = ["steps"]
+): ParseResult<T> {
+  if (!content || typeof content !== "string") {
+    return { success: false, data: null, error: "Empty or invalid content", raw: "" };
+  }
+
+  let cleaned = content.trim().replace(/^\uFEFF/, "");
+
+  // Strip markdown fences first
+  const codeBlockMatch = cleaned.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
+  if (codeBlockMatch) {
+    cleaned = codeBlockMatch[1].trim();
+  } else {
+    cleaned = cleaned
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/, "")
+      .replace(/\s*```$/g, "");
+  }
+
+  // Find first { (JSON object start)
+  const startIdx = cleaned.indexOf("{");
+  if (startIdx === -1) {
+    return {
+      success: false,
+      data: null,
+      error: "No JSON object found in response",
+      raw: cleaned.slice(0, 500),
+    };
+  }
+
+  // Extract balanced JSON object
+  const extracted = extractBalancedJSON(cleaned, startIdx);
+  if (!extracted || extracted.length <= 2) {
+    return {
+      success: false,
+      data: null,
+      error: "Could not extract complete JSON object (unbalanced braces)",
+      raw: cleaned.slice(startIdx, startIdx + 500),
+    };
+  }
+
+  return parseJSONRobust<T>(extracted, expectedKeys);
+}
+
+/**
  * Extract multiple JSON objects from content.
  */
 export function extractMultipleJSON<T = unknown>(content: string): T[] {

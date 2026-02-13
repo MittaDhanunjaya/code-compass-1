@@ -77,3 +77,40 @@
 .dark .cmd-k-ghost {
   color: #9ca3af;
 }
+
+/* Monaco editor: ensure cursor is visible (block style for dark theme) */
+.monaco-editor .cursors-layer .cursor {
+  background-color: #ffffff !important;
+  border-color: #ffffff !important;
+  border-width: 2px !important;
+  opacity: 1 !important;
+}
+.monaco-editor .cursors-layer .cursor.block {
+  background-color: rgba(255, 255, 255, 0.5) !important;
+  opacity: 1 !important;
+}
+
+/* Monaco: hide sticky scroll */
+.monaco-editor .sticky-widget {
+  display: none !important;
+}
+/* Hide find widget until user presses Ctrl/Cmd+F - use display to fully remove from layout */
+.monaco-editor .find-widget:not(.visible) {
+  display: none !important;
+}
+.monaco-editor .find-widget.visible {
+  display: block !important;
+}
+/* Hide the left gray margin/gutter completely */
+.monaco-editor .margin {
+  display: none !important;
+  width: 0 !important;
+  min-width: 0 !important;
+  max-width: 0 !important;
+  overflow: hidden !important;
+}
+/* Hide minimap and overview ruler (gray boxes on right) */
+.monaco-editor .minimap,
+.monaco-editor .decorationsOverviewRuler {
+  display: none !important;
+}

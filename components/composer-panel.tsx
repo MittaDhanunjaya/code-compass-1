@@ -3,6 +3,12 @@
 import { useCallback, useEffect, useState } from "react";
 import dynamic from "next/dynamic";
 import { Loader2, Wand2, Check, ChevronDown, ChevronRight } from "lucide-react";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -13,7 +19,9 @@ import {
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
 import { useEditor } from "@/lib/editor-context";
-import { PROVIDERS, type ProviderId } from "@/lib/llm/providers";
+import { PROVIDERS, OPENROUTER_FREE_MODELS, type ProviderId } from "@/lib/llm/providers";
+import { useModelPreferences } from "@/hooks/use-model-preferences";
+import { MODEL_CATALOG } from "@/lib/llm/model-catalog";
 import type { FileEditStep, ScopeMode } from "@/lib/agent/types";
 import { computeRunScope } from "@/lib/agent/scope";
 import type { ComposerScope } from "@/lib/composer/types";
@@ -120,6 +128,8 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
   }, [workspaceId]);
 
   // Reuse Chat provider/model from localStorage
+  const [, setPrefsRefresh] = useState(0);
+  const { prefs: modelPrefs } = useModelPreferences();
   const getStoredProvider = (): ProviderId => {
     if (typeof window === "undefined") return "openrouter";
     const key = workspaceId ? `chat-provider-${workspaceId}` : "chat-provider-default";
@@ -135,6 +145,13 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
   };
   const provider = getStoredProvider();
   const model = getStoredModel();
+
+  const setStoredModel = (newModel: string) => {
+    if (typeof window === "undefined") return;
+    const key = workspaceId ? `chat-model-${workspaceId}` : "chat-model-default";
+    localStorage.setItem(key, newModel);
+    setPrefsRefresh((k) => k + 1);
+  };
 
   const generateEdits = useCallback(async () => {
     if (!instruction.trim() || !workspaceId) return;
@@ -345,9 +362,37 @@ export function ComposerPanel({ workspaceId }: ComposerPanelProps) {
     );
   }
 
+  const openRouterModels = modelPrefs?.preferredModelIds?.length
+    ? (modelPrefs.preferredModelIds.map((id) => MODEL_CATALOG.byId(id)).filter(Boolean) as { id: string; label: string }[])
+    : OPENROUTER_FREE_MODELS;
+
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
       <div className="flex shrink-0 flex-col gap-2 border-b border-border p-3">
+        {modelPrefs?.showInComposer && provider === "openrouter" && (
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-muted-foreground">Model:</span>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm" className="h-7 text-xs font-medium">
+                  {openRouterModels.find((m) => m.id === model)?.label || model} ▼
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start">
+                {openRouterModels.map((m) => (
+                  <DropdownMenuItem
+                    key={m.id}
+                    onClick={() => setStoredModel(m.id)}
+                    className={m.id === model ? "bg-accent" : ""}
+                  >
+                    {m.label}
+                    {m.id === model && <span className="ml-2 text-xs">✓</span>}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        )}
         <p className="text-[11px] text-muted-foreground/90 flex items-center gap-1.5 flex-wrap">
           <span>Rules: {rulesFile ?? "No rules file"}</span>
           <button

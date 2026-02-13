@@ -131,7 +131,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
         {workspaceId && !isWorkspaceSettings ? <EditorArea /> : children}
       </main>
 
-      {/* Right: AI panel - min-h-0 + overflow-y-auto so content scrolls when long */}
+      {/* Right: AI panel - content div scrolls when AgentPanel/ChatPanel content overflows */}
       <aside className="flex w-80 flex-col min-h-0 border-l border-border bg-muted/20 overflow-hidden">
         <div className="flex h-12 shrink-0 items-center border-b border-border">
           <div className="flex gap-1 px-2">
@@ -150,7 +150,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
             ))}
           </div>
         </div>
-        <div className="flex flex-1 flex-col min-h-0 overflow-hidden">
+        <div className="flex flex-1 flex-col min-h-0 overflow-y-auto overflow-x-hidden">
           <ChatPanel workspaceId={workspaceId} activeTab={aiPanelTab} />
         </div>
       </aside>

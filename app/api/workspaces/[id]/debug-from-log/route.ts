@@ -198,6 +198,7 @@ You MUST respond with ONLY a JSON object, no markdown, no code blocks, no explan
 {
   "suspectedRootCause": "One clear sentence explaining the root cause (e.g., 'Missing import for useState hook in React component' or 'Variable 'user' is undefined because it's not awaited from async function')",
   "explanation": "Brief explanation of what you found and what changes you made to fix it",
+  "verificationCommand": "Exact shell command to verify the fix (e.g. npm test, npm run dev, pytest)",
   "edits": [
     {
       "path": "exact file path from workspace (must match exactly)",
@@ -247,6 +248,7 @@ export type DebugFromLogEdit = {
 export type DebugFromLogResponse = {
   suspectedRootCause: string | null;
   explanation: string | null;
+  verificationCommand: string | null;
   edits: DebugFromLogEdit[];
   /** Optional events for the frontend to show in Activity Feed / run summary. */
   events?: Array<{ type: string; message: string; meta?: Record<string, unknown> }>;
@@ -422,7 +424,17 @@ export async function POST(request: Request, { params }: RouteParams) {
   const stack = detectStackFromPaths(workspacePaths);
   const stackHints = getDebugPromptHintsForStack(stack);
 
+  const { classifyErrorLog, getClassificationHint } = await import("@/lib/agent/error-classifier");
+  const errorClassification = classifyErrorLog(logText);
+  const classificationHint = getClassificationHint(errorClassification);
+  const env = { os: process.platform, nodeVersion: process.version, framework: stack ?? "unknown" };
+
   const userMessage = `${stackHints}**RUNTIME ERROR ANALYSIS REQUEST**
+
+**Error Classification:** ${errorClassification}
+**Hint:** ${classificationHint}
+
+**Environment:** ${JSON.stringify(env)}
 
 **Error Metadata:**
 ${metaBlob}
@@ -452,8 +464,8 @@ ${fileContext}
 **Your Task:**
 1. Analyze the error thoroughly - understand what's happening, where it fails, and why.
 2. Trace through the code to identify the root cause.
-3. Propose fixes that address the root cause, not just symptoms.
-4. Include ALL necessary edits (imports, variable fixes, logic corrections, etc.).
+3. Propose MINIMAL fixes that address the root cause (surgical edits only).
+4. Explain the root cause in your analysis.
 5. For each edit, provide the EXACT "oldContent" snippet from the file so the tool can match and replace it accurately.
 
 **Important:** 
@@ -539,6 +551,9 @@ ${fileContext}
       ],
       task: "debug",
       candidates,
+      userId: user.id,
+      workspaceId,
+      supabase,
     });
 
     const trimmed = (content ?? "").trim();
@@ -552,6 +567,7 @@ ${fileContext}
       const safeResponse: DebugFromLogResponse = {
         suspectedRootCause: null,
         explanation: "Could not parse model response as JSON.",
+        verificationCommand: null,
         edits: [],
         events,
       };
@@ -564,7 +580,7 @@ ${fileContext}
     }
 
     const validated = validateDebugFromLogOutput(parsed);
-    const { suspectedRootCause, explanation } = validated;
+    const { suspectedRootCause, explanation, verificationCommand } = validated;
     const rawEdits = validated.edits;
     const edits: DebugFromLogEdit[] = [];
     const invalidEdits: string[] = [];
@@ -643,6 +659,7 @@ ${fileContext}
     const response: DebugFromLogResponse = {
       suspectedRootCause: suspectedRootCause ?? null,
       explanation: explanation ?? "Analysis complete.",
+      verificationCommand: verificationCommand ?? null,
       edits,
       events,
     };
@@ -653,6 +670,7 @@ ${fileContext}
     const safeResponse: DebugFromLogResponse = {
       suspectedRootCause: null,
       explanation: `Debug failed: ${msg}`,
+      verificationCommand: null,
       edits: [],
       events,
     };

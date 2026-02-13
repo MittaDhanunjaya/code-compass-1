@@ -3,7 +3,7 @@
  * Fetches plan-stream, parses SSE, updates plan and events.
  */
 
-import { useCallback, useRef } from "react";
+import { useCallback, useRef, useState } from "react";
 import type { AgentPlan, PlanStep, FileEditStep, CommandStep } from "@/lib/agent/types";
 import type { AgentEvent } from "@/lib/agent-events";
 import type { ProviderId } from "@/lib/llm/providers";
@@ -15,6 +15,15 @@ export type ModelSelection =
   | { type: "auto" }
   | { type: "model"; modelId: string; label: string }
   | { type: "group"; modelGroupId: string; label: string };
+
+export type PlanDebugInfo = {
+  modelUsed: string;
+  tokensReserved: number;
+  tokensUsed: { input?: number; output?: number; total?: number } | null;
+  providerErrors: string[];
+  fallbackReason: "rate_limit" | "capability" | null;
+  streamDurationMs: number;
+};
 
 export type RunSummary = {
   editedFiles: Set<string>;
@@ -52,7 +61,8 @@ export type UseAgentPlanParams = {
   setPlanContextUsed: (paths: string[] | null) => void;
   setRunScope: (scope: { fileCount: number; approxLinesChanged: number } | null) => void;
   setPlanUsage: (usage: string | null) => void;
-  setModelFallbackBanner: (banner: { from: string; to: string; availableFreeModels: { id: string; label: string }[] } | null) => void;
+  setModelFallbackBanner: (banner: { from: string; to: string; reason?: "rate_limit" | "capability"; availableFreeModels: { id: string; label: string }[] } | null) => void;
+  setPlanDebugInfo: (info: PlanDebugInfo | null) => void;
   lastActivityRef: React.MutableRefObject<number>;
   abortControllerRef: React.MutableRefObject<AbortController | null>;
   stuckTimeoutAbortRef: React.MutableRefObject<boolean>;
@@ -77,6 +87,7 @@ export function useAgentPlan(params: UseAgentPlanParams) {
     setRunScope,
     setPlanUsage,
     setModelFallbackBanner,
+    setPlanDebugInfo,
     lastActivityRef,
     abortControllerRef,
     stuckTimeoutAbortRef,
@@ -84,14 +95,16 @@ export function useAgentPlan(params: UseAgentPlanParams) {
   } = params;
 
   const autoRetryCountRef = useRef(0);
+  const [budgetExceededModal, setBudgetExceededModal] = useState<{ message: string; scope: "user" | "workspace" } | null>(null);
 
-  const startPlan = useCallback(async () => {
+  const startPlan = useCallback(async (useUserBudgetFallback = false) => {
     if (!instruction.trim() || !workspaceId) return;
 
     onError(null);
     setPlanUsage(null);
     setPlanContextUsed(null);
     setRunScope(null);
+    setPlanDebugInfo(null);
     setAgentEvents([]);
     setRunSummary(null);
     setModelFallbackBanner(null);
@@ -104,7 +117,10 @@ export function useAgentPlan(params: UseAgentPlanParams) {
       const fileList = await fetchFileList();
       const res = await fetch("/api/agent/plan-stream", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(useUserBudgetFallback ? { "X-Budget-Fallback": "user-only" } : {}),
+        },
         body: JSON.stringify({
           instruction: instruction.trim(),
           workspaceId,
@@ -116,12 +132,23 @@ export function useAgentPlan(params: UseAgentPlanParams) {
           fileList,
           useIndex: true,
           scopeMode: scopeMode ?? "normal",
+          mode: "reproducible", // Phase 4: deterministic planning (temp=0, stable prompt)
         }),
         signal: abortController.signal,
       });
 
       if (!res.ok) {
         const errorData = await res.json().catch(() => ({ error: "Plan failed" }));
+        // Soft fallback: workspace budget exceeded → auto-retry with user budget (no modal)
+        if (res.status === 429 && errorData.canFallbackToUser && errorData.scope === "workspace" && !useUserBudgetFallback) {
+          return startPlan(true);
+        }
+        // Hard stop: user budget exceeded (no alternative) → show modal
+        if (res.status === 429 && errorData.code === "BUDGET_EXCEEDED" && errorData.scope === "user") {
+          setBudgetExceededModal({ message: errorData.error || "Daily token budget exceeded. Try again tomorrow.", scope: "user" });
+          onPhase("idle");
+          return;
+        }
         const retryAfter =
           errorData.retryAfter ??
           (parseInt(res.headers.get("Retry-After") || "0", 10) || undefined);
@@ -138,14 +165,16 @@ export function useAgentPlan(params: UseAgentPlanParams) {
 
       const reader = res.body?.getReader();
       const decoder = new TextDecoder();
-      if (!reader) throw new Error("No response body");
+      if (!reader) throw new Error("Stream unavailable. The server returned an empty response. Try again.");
 
       let buffer = "";
       let finalPlan: AgentPlan | null = null;
       let finalUsage: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; inputTokens?: number; outputTokens?: number } | null = null;
-      let finalModelFallback: { from: string; to: string } | undefined;
+      let finalModelFallback: { from: string; to: string; reason?: "rate_limit" | "capability" } | undefined;
+      let finalPlanDebugInfo: PlanDebugInfo | null = null;
       let finalAvailableFreeModels: { id: string; label: string }[] | undefined;
       let lastStatusMessage: string | null = null;
+      let lastErrorCode: string | null = null;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -163,8 +192,26 @@ export function useAgentPlan(params: UseAgentPlanParams) {
               if (data.type === "plan") {
                 finalPlan = data.plan;
                 finalUsage = data.usage;
+                finalPlanDebugInfo = {
+                  modelUsed: data.modelUsed ?? "unknown",
+                  tokensReserved: data.tokensReserved ?? 0,
+                  tokensUsed: data.usage
+                    ? {
+                        input: data.usage.inputTokens ?? data.usage.prompt_tokens,
+                        output: data.usage.outputTokens ?? data.usage.completion_tokens,
+                        total: data.usage.total_tokens ?? (data.usage.inputTokens != null && data.usage.outputTokens != null ? data.usage.inputTokens + data.usage.outputTokens : undefined),
+                      }
+                    : null,
+                  providerErrors: Array.isArray(data.providerErrors) ? data.providerErrors : [],
+                  fallbackReason: data.modelFallback?.reason ?? null,
+                  streamDurationMs: data.durationMs ?? 0,
+                };
                 if (data.modelFallback?.from && data.modelFallback?.to) {
-                  finalModelFallback = { from: data.modelFallback.from, to: data.modelFallback.to };
+                  finalModelFallback = {
+                    from: data.modelFallback.from,
+                    to: data.modelFallback.to,
+                    reason: data.modelFallback.reason === "rate_limit" || data.modelFallback.reason === "capability" ? data.modelFallback.reason : undefined,
+                  };
                 }
                 if (Array.isArray(data.availableFreeModels) && data.availableFreeModels.length > 0) {
                   finalAvailableFreeModels = data.availableFreeModels
@@ -176,7 +223,8 @@ export function useAgentPlan(params: UseAgentPlanParams) {
                   setRunScope({ fileCount: data.scope.fileCount, approxLinesChanged: data.scope.approxLinesChanged ?? 0 });
                 }
               } else if (data.type === "error") {
-                lastStatusMessage = data.error || data.message || "Unknown error";
+                lastStatusMessage = data.error || data.message || data.reason || "Unknown error";
+                lastErrorCode = data.code ?? null;
                 setAgentEvents((prev) => [
                   ...prev,
                   {
@@ -254,11 +302,14 @@ export function useAgentPlan(params: UseAgentPlanParams) {
           setModelFallbackBanner({
             from: finalModelFallback.from,
             to: finalModelFallback.to,
+            reason: finalModelFallback.reason,
             availableFreeModels: finalAvailableFreeModels ?? [],
           });
         } else {
           setModelFallbackBanner(null);
         }
+        if (finalPlanDebugInfo) setPlanDebugInfo(finalPlanDebugInfo);
+        else setPlanDebugInfo(null);
         if (finalUsage) {
           const u = finalUsage;
           const parts: string[] = [];
@@ -283,7 +334,16 @@ export function useAgentPlan(params: UseAgentPlanParams) {
         if (finalPlan && (!finalPlan.steps || finalPlan.steps.length === 0)) {
           throw new Error("Empty plan returned: The agent couldn't generate any steps. Try being more explicit about what needs to be fixed.");
         }
-        const detail = lastStatusMessage ?? "Check the activity feed above for details.";
+        // Phase 5: Use actionable message for AGENT_PROTOCOL_FAILURE / INVALID_AGENT_PLAN
+        if ((lastErrorCode === "AGENT_PROTOCOL_FAILURE" || lastErrorCode === "INVALID_AGENT_PLAN") && lastStatusMessage) {
+          throw new Error(lastStatusMessage);
+        }
+        const detail = lastStatusMessage ?? "The stream may have closed prematurely or the provider failed. Try again or select a different provider.";
+        // Surface budget/token limit errors directly instead of framing as "empty plan"
+        const isBudgetError = /token limit|token budget|BUDGET_EXCEEDED|daily.*limit/i.test(detail);
+        if (isBudgetError) {
+          throw new Error(detail.replace(/^Error:\s*/i, "").trim());
+        }
         throw new Error(`Empty plan returned: The agent didn't return a valid plan. ${detail}`);
       }
     } catch (e) {
@@ -317,8 +377,15 @@ export function useAgentPlan(params: UseAgentPlanParams) {
       const errorMsg = e instanceof Error ? e.message : "Plan failed";
       const isRetryable = /empty plan returned|no valid steps|returned no steps|maximum call stack size exceeded|missing required fields/i.test(errorMsg);
 
-      if (/failed to fetch|network error|load failed|network request failed/i.test(errorMsg)) {
-        onError("Connection lost. Check your network and try again.");
+      const isNetworkError = /failed to fetch|network error|load failed|network request failed|connection refused|econnrefused|econnreset|socket hang up/i.test(errorMsg);
+      if (isNetworkError) {
+        if (process.env.NODE_ENV === "development") {
+          console.error("[useAgentPlan] Network/connection error:", e);
+        }
+        const hint = typeof window !== "undefined" && window.location?.hostname === "localhost"
+          ? ` Ensure the dev server is running (npm run dev).`
+          : "";
+        onError(`Connection lost. Check your network and try again.${hint}`);
       } else if (errorMsg.includes("No API key configured")) {
         if (errorMsg.includes("OpenRouter") || errorMsg.includes("openrouter")) {
           onError(`No API key configured. Get a free OpenRouter key at https://openrouter.ai/keys and add it in Settings → API Keys.`);
@@ -369,7 +436,25 @@ export function useAgentPlan(params: UseAgentPlanParams) {
     onPhase("idle");
     onError(null);
     setModelFallbackBanner(null);
-  }, [onPlan, onPhase, onError, setModelFallbackBanner]);
+    setPlanDebugInfo(null);
+  }, [onPlan, onPhase, onError, setModelFallbackBanner, setPlanDebugInfo]);
 
-  return { startPlan, rejectPlan };
+  const onBudgetExceededContinue = useCallback(() => {
+    setBudgetExceededModal(null);
+    startPlan(true);
+  }, [startPlan]);
+
+  const onBudgetExceededDismiss = useCallback(() => {
+    setBudgetExceededModal(null);
+    onError("Workspace daily token limit exceeded. Try again tomorrow.");
+    onPhase("idle");
+  }, [onError, onPhase]);
+
+  return {
+    startPlan,
+    rejectPlan,
+    budgetExceededModal,
+    onBudgetExceededContinue,
+    onBudgetExceededDismiss,
+  };
 }

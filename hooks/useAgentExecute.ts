@@ -132,7 +132,7 @@ export function useAgentExecute(params: UseAgentExecuteParams) {
 
         const reader = res.body?.getReader();
         const decoder = new TextDecoder();
-        if (!reader) throw new Error("No response body");
+        if (!reader) throw new Error("Stream unavailable. The server returned an empty response. Try again.");
 
         let buffer = "";
         let finalResult: AgentExecuteResult | null = null;
@@ -239,7 +239,7 @@ export function useAgentExecute(params: UseAgentExecuteParams) {
         }
 
         if (!finalResult) {
-          throw new Error("No result received from execution stream. Check console for details.");
+          throw new Error("No result received from execution stream. The stream may have closed prematurely or the provider failed. Try again or select a different provider.");
         }
 
         setExecuteResult(finalResult);
@@ -358,8 +358,15 @@ export function useAgentExecute(params: UseAgentExecuteParams) {
           return;
         }
         const errMsg = e instanceof Error ? e.message : "Execute failed";
-        if (/failed to fetch|network error|load failed|network request failed/i.test(errMsg)) {
-          setError("Connection lost during run. Check your network and try again.");
+        const isNetworkError = /failed to fetch|network error|load failed|network request failed|connection refused|econnrefused|econnreset|socket hang up/i.test(errMsg);
+        if (isNetworkError) {
+          if (process.env.NODE_ENV === "development") {
+            console.error("[useAgentExecute] Network/connection error:", e);
+          }
+          const hint = typeof window !== "undefined" && window.location?.hostname === "localhost"
+            ? ` Ensure the dev server is running (npm run dev).`
+            : "";
+          setError(`Connection lost during run. Check your network and try again.${hint}`);
         } else {
           setError(errMsg);
         }

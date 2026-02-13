@@ -10,15 +10,12 @@ import type { ProviderId } from "./providers";
 import { invokeChat as invokeChatInternal } from "./invoke";
 import type { InvokeChatInput, InvokeChatOutput, InvokeChatCandidate } from "./invoke";
 import { getModelForTask, type TaskType } from "./task-routing";
-import {
-  checkTokenBudget,
-  checkWorkspaceTokenBudget,
-  incrementTokenUsage,
-  incrementWorkspaceTokenUsage,
-} from "@/lib/token-budget";
+import { enforceAndRecordBudget, PER_REQUEST_MAX_TOKENS } from "@/lib/llm/budget-guard";
 
 import { AGENT_CONFIG } from "@/lib/config/constants";
 import { logger } from "@/lib/logger";
+import { classifyErrorClass, AI_TEMPORARILY_UNAVAILABLE, ALL_MODELS_EXHAUSTED } from "@/lib/errors";
+import { isAiEnabled } from "@/lib/ai-providers";
 import { recordLLMLatency } from "@/lib/metrics";
 import { getOrSetWithMeta } from "@/lib/cache";
 
@@ -95,31 +92,18 @@ export async function invokeChat(input: RouterInvokeInput): Promise<RouterInvoke
     ...rest
   } = input;
 
-  // Phase 4.2.1 & 4.2.4: Check token budget before LLM call
-  if (supabase && userId) {
-    const budget = await checkTokenBudget(supabase, userId);
-    if (!budget.ok) {
-      const err = new Error("Daily token budget exceeded. Try again tomorrow.") as Error & {
-        statusCode?: number;
-        retryAfter?: number;
-      };
-      err.statusCode = 429;
-      err.retryAfter = budget.retryAfter;
-      throw err;
-    }
+  if (!isAiEnabled()) {
+    const err = new Error("AI providers disabled") as Error & { code?: string };
+    err.code = AI_TEMPORARILY_UNAVAILABLE;
+    throw err;
   }
-  // Phase 4.2.3: Check per-workspace budget when workspaceId provided
-  if (supabase && workspaceId) {
-    const wsBudget = await checkWorkspaceTokenBudget(supabase, workspaceId);
-    if (!wsBudget.ok) {
-      const err = new Error("Workspace daily token limit exceeded. Try again tomorrow.") as Error & {
-        statusCode?: number;
-        retryAfter?: number;
-      };
-      err.statusCode = 429;
-      err.retryAfter = wsBudget.retryAfter;
-      throw err;
-    }
+  if (process.env.NODE_ENV === "production" && !userId) {
+    throw new Error("LLM calls require user context in production.");
+  }
+  if (supabase && userId) {
+    const maxTokens = input.maxTokens ?? 8192;
+    const tokensToReserve = Math.min(maxTokens * 2, PER_REQUEST_MAX_TOKENS * 2);
+    await enforceAndRecordBudget(supabase, userId, tokensToReserve, workspaceId);
   }
 
   // Resolve provider/model: use explicit override or task-based routing
@@ -185,11 +169,7 @@ export async function invokeChat(input: RouterInvokeInput): Promise<RouterInvoke
         latencyMs: result.latencyMs,
       });
 
-      // Phase 4.2.1 & 4.2.3: Increment token usage (user + workspace)
-      if (supabase && result.usage?.totalTokens) {
-        if (userId) await incrementTokenUsage(supabase, userId, result.usage.totalTokens);
-        if (workspaceId) await incrementWorkspaceTokenUsage(supabase, workspaceId, result.usage.totalTokens);
-      }
+      // Budget already reserved via enforceAndRecordBudget before the call.
     }
 
     return { ...result, requestId };
@@ -199,8 +179,11 @@ export async function invokeChat(input: RouterInvokeInput): Promise<RouterInvoke
         event: "llm_router_error",
         task,
         providerId,
+        model,
         requestId,
         userId,
+        workspaceId,
+        errorClass: classifyErrorClass(e),
         error: e instanceof Error ? e.message : String(e),
       });
     }
@@ -214,16 +197,35 @@ export type RouterInvokeWithFallbackInput = Omit<RouterInvokeInput, "providerId"
 
 /**
  * Invoke chat with fallback over multiple candidates. Uses router for each attempt.
+ * Skips provider+model when isQuotaExceededError (no retry in same request).
  */
 export async function invokeChatWithFallback(
   input: RouterInvokeWithFallbackInput
 ): Promise<RouterInvokeOutput> {
   const { candidates, requestId, userId, workspaceId, task = "chat", ...rest } = input;
-  const last = candidates[candidates.length - 1];
-  if (!last) throw new Error("At least one candidate required");
+  if (candidates.length === 0) throw new Error("At least one candidate required");
 
-  let lastError: unknown;
-  for (const c of candidates) {
+  const { isFallbackableError, isQuotaExceededError } = await import("./rate-limit");
+  const { createProviderAvailabilityTracker, markUnavailable, isMarkedUnavailable } = await import("./provider-availability");
+
+  const tracker = createProviderAvailabilityTracker();
+  const getModel = (c: (typeof candidates)[0]) => c.model ?? "default";
+
+  const throwAllFailed = (code: string) => {
+    const err = new Error("All AI providers failed") as Error & { code?: string; recommendedProviders?: string[]; recommendedModels?: string[] };
+    err.code = code;
+    err.recommendedProviders = [...new Set(candidates.map((x) => x.providerId))];
+    err.recommendedModels = [...new Set(candidates.map((x) => x.model ?? "default"))];
+    throw err;
+  };
+
+  let idx = 0;
+  while (idx < candidates.length) {
+    const c = candidates[idx];
+    if (isMarkedUnavailable(tracker, c.providerId, getModel(c))) {
+      idx++;
+      continue;
+    }
     try {
       return await invokeChat({
         ...rest,
@@ -236,20 +238,28 @@ export async function invokeChatWithFallback(
         workspaceId,
       });
     } catch (e) {
-      lastError = e;
-      const { isFallbackableError } = await import("./rate-limit");
-      if (!isFallbackableError(e) || c === last) throw e;
-      if (process.env.NODE_ENV !== "test") {
+      if (isQuotaExceededError(e)) {
+        markUnavailable(tracker, c.providerId, getModel(c), "quota_exceeded");
+      }
+      if (!isFallbackableError(e)) throw e;
+      const nextIdx = candidates.findIndex((x, i) => i > idx && !isMarkedUnavailable(tracker, x.providerId, getModel(x)));
+      const next = nextIdx >= 0 ? candidates[nextIdx] : undefined;
+      if (!next) {
+        throwAllFailed(isQuotaExceededError(e) ? ALL_MODELS_EXHAUSTED : AI_TEMPORARILY_UNAVAILABLE);
+      }
+      if (process.env.NODE_ENV !== "test" && next) {
         logger.warn({
           event: "llm_router_fallback",
-          task,
-          from: c.providerId,
-          error: e instanceof Error ? e.message : String(e),
+          provider: c.providerId,
+          model: c.model ?? "default",
+          reason: e instanceof Error ? e.message : String(e),
+          retryingWith: next.providerId,
         });
       }
+      idx = nextIdx;
     }
   }
-  throw lastError;
+  throwAllFailed(ALL_MODELS_EXHAUSTED);
 }
 
 // Re-export for consumers that need the raw invoke (e.g. streaming with custom handling)

@@ -6,14 +6,40 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { decrypt } from "@/lib/encrypt";
 import { getProvider, getModelForProvider, PROVIDERS, PROVIDER_LABELS, type ProviderId } from "@/lib/llm/providers";
-import { invokeChat } from "@/lib/llm/router";
+import { invokeChatWithFallback, type InvokeChatCandidate } from "@/lib/llm/router";
 import type { ChatMessage, ChatContext } from "@/lib/llm/types";
+import { getTextFromContent } from "@/lib/llm/types";
 import type { SearchResult } from "@/lib/indexing/types";
 import { detectErrorLogKind } from "@/lib/agent/error-log-utils";
 import { loadRules, formatRulesForPrompt } from "@/lib/rules";
 import { loadChatHistory, saveChatMessage } from "@/lib/chat-memory";
 import { logger } from "@/lib/logger";
-import { safeEnqueue, safeClose, shouldStopStream, STREAM_UPSTREAM_TIMEOUT_MS } from "@/lib/stream-utils";
+import {
+  safeEnqueue,
+  safeEnqueueWithBackpressure,
+  safeClose,
+  shouldStopStream,
+  createStreamAbortSignal,
+  mergeAbortSignals,
+  MAX_STREAM_DURATION_MS,
+  STREAM_FIRST_TOKEN_TIMEOUT_MS,
+} from "@/lib/stream-utils";
+import {
+  emitStreamErrorEvent,
+  emitAllModelsExhaustedEvent,
+  AI_STREAM_FAILED,
+} from "@/lib/stream-resilience";
+import { orderProviderKeysByPreference } from "@/lib/ai-providers";
+import {
+  createProviderAvailabilityTracker,
+  markUnavailable,
+  getAvailablePairs,
+} from "@/lib/llm/provider-availability";
+import { isQuotaExceededError } from "@/lib/llm/rate-limit";
+import { refundBudget, estimateTokensFromChars } from "@/lib/llm/budget-guard";
+import { reconcileBudgetWithUsage } from "@/lib/llm/budget-reconciliation";
+import { recordLLMBudgetRefunded, recordLLMStreamAbortedTimeout, recordLLMStreamAbortedClient } from "@/lib/metrics";
+import type { StreamChunk } from "@/lib/llm/types";
 
 export type ChatCompletionInput = {
   messages: ChatMessage[];
@@ -121,28 +147,30 @@ export async function chatCompletion(input: ChatCompletionInput): Promise<ChatCo
     if (history.length > 0) {
       const historyMap = new Map<string, boolean>();
       history.forEach((m) => {
-        const key = `${m.role}:${m.content.slice(0, 50)}`;
-        historyMap.set(key, true);
+        const text = getTextFromContent(m.content);
+        historyMap.set(`${m.role}:${text.slice(0, 50)}`, true);
       });
       const newHistory = history.filter((h) => {
-        const key = `${h.role}:${h.content.slice(0, 50)}`;
-        return !historyMap.has(key) || !messages.some((m) => m.role === h.role && m.content === h.content);
+        const hText = getTextFromContent(h.content);
+        return !historyMap.has(`${h.role}:${hText.slice(0, 50)}`) || !messages.some((m) => m.role === h.role && getTextFromContent(m.content) === hText);
       });
       messages = [...newHistory, ...messages];
     }
   }
 
-  const keyResult = await getChatApiKey(supabase, userId, provider);
-  if ("error" in keyResult) {
-    throw new ChatServiceError(keyResult.error, keyResult.decryptFailed ? "decrypt_failed" : "no_key");
+  const providerKeys = await getChatProviderKeys(supabase, userId, provider);
+  if (!providerKeys || providerKeys.length === 0) {
+    const keyResult = await getChatApiKey(supabase, userId, provider);
+    if ("error" in keyResult) {
+      throw new ChatServiceError(keyResult.error, keyResult.decryptFailed ? "decrypt_failed" : "no_key");
+    }
+    throw new ChatServiceError("No API key configured. Add one in Settings → API Keys.", "no_key");
   }
-  const { apiKey, providerId } = keyResult;
+  const orderedKeys = orderProviderKeysByPreference(providerKeys);
 
   let searchResults: SearchResult[] = [];
-  const codebaseMatch =
-    typeof lastMessage?.content === "string"
-      ? lastMessage.content.match(/@codebase\s+"([^"]+)"/i) ?? lastMessage.content.match(/@codebase\s+(\S+)/i)
-      : null;
+  const lastText = getTextFromContent(lastMessage?.content ?? "");
+  const codebaseMatch = lastText.match(/@codebase\s+"([^"]+)"/i) ?? lastText.match(/@codebase\s+(\S+)/i);
 
   if (codebaseMatch && workspaceId) {
     const searchQuery = codebaseMatch[1];
@@ -212,29 +240,35 @@ export async function chatCompletion(input: ChatCompletionInput): Promise<ChatCo
     enhancedMessages.splice(enhancedMessages.length - 1, 0, { role: "system", content: rulesPrompt.trim() });
   }
 
-  let modelOpt = getModelForProvider(providerId, model);
-  if (modelOpt == null || modelOpt === "") {
-    if (providerId === "openrouter") modelOpt = "openrouter/free";
-    else if (providerId === "gemini") modelOpt = "gemini-2.0-flash";
-    else if (providerId === "openai") modelOpt = "gpt-4o-mini";
-    else if (providerId === "perplexity") modelOpt = "sonar";
-    else if (providerId === "ollama") modelOpt = "llama3.2";
+  function defaultModelForProvider(p: ProviderId): string {
+    const m = getModelForProvider(p, model);
+    if (m != null && m !== "") return m;
+    if (p === "openrouter") return "openrouter/free";
+    if (p === "gemini") return "gemini-2.0-flash";
+    if (p === "openai") return "gpt-4o-mini";
+    if (p === "perplexity") return "sonar";
+    if (p === "ollama") return "llama3.2";
+    return "default";
   }
 
-  const { content, usage } = await invokeChat({
-    messages: enhancedMessages,
-    apiKey,
+  const candidates: InvokeChatCandidate[] = orderedKeys.map(({ providerId, apiKey }) => ({
     providerId,
-    model: modelOpt ?? undefined,
+    apiKey,
+    model: defaultModelForProvider(providerId),
+  }));
+
+  const { content, usage, providerId } = await invokeChatWithFallback({
+    messages: enhancedMessages,
     context,
     task: "chat",
     userId,
     workspaceId: context?.workspaceId ?? undefined,
     supabase,
+    candidates,
   });
 
   if (workspaceId) {
-    const lastUserContent = typeof lastMessage?.content === "string" ? lastMessage.content : "";
+    const lastUserContent = getTextFromContent(lastMessage?.content ?? "");
     const rt = runType ?? "chat";
     try {
       await saveChatMessage(supabase, workspaceId, userId, "user", lastUserContent, { runType: rt });
@@ -244,7 +278,7 @@ export async function chatCompletion(input: ChatCompletionInput): Promise<ChatCo
     }
   }
 
-  const kind = detectErrorLogKind(typeof lastMessage?.content === "string" ? lastMessage.content : "");
+  const kind = detectErrorLogKind(getTextFromContent(lastMessage?.content ?? ""));
   const noWorkspaceErrorLog = kind === "error_log" && !workspaceId;
   const contextUsed =
     searchResults.length > 0 || rulesPrompt.length > 0
@@ -319,51 +353,243 @@ export type ChatStreamInput = {
   model?: string;
   providerKeys: { providerId: ProviderId; apiKey: string }[];
   request: Request;
+  /** Request correlation for logs (stream_start, stream_first_token, stream_close, fallback). */
+  requestId?: string;
+  /** When provided, refund unused tokens on completion/abort. */
+  budget?: {
+    userId: string;
+    workspaceId?: string | null;
+    tokensReserved: number;
+    supabase: SupabaseClient;
+    /** When provider returns usage, reconcile reserved vs actual. Optional. */
+    usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+    /** Phase 4: Called when stream ends (for releasing stream slot). */
+    onComplete?: () => void | Promise<void>;
+  };
 };
 
+function emitFinalError(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  encoder: TextEncoder,
+  providerId: string,
+  modelOpt: string | undefined,
+  reason: string
+): void {
+  emitStreamErrorEvent(controller, encoder, {
+    type: "error",
+    code: AI_STREAM_FAILED,
+    provider: providerId,
+    model: modelOpt ?? "default",
+    reason,
+  });
+}
+
 /**
- * Create a streaming chat response. Tries providers in order, emits error as [Error: ...] on failure.
- * Caller must resolve providerKeys via getChatProviderKeys before calling.
+ * Create a streaming chat response. Tries providers in order.
+ * On stream failure (before first token): fallback to non-streaming.
+ * Single-writer: once first token yields, stream is locked; no fallback writes.
+ * Guarantees exactly one terminal event: content completion OR structured error.
  */
 export function createChatStream(input: ChatStreamInput): ReadableStream<Uint8Array> {
-  const { messages, context, model, providerKeys, request } = input;
+  const { messages, context, model, providerKeys, request, requestId, budget } = input;
+
+  const orderedKeys = orderProviderKeysByPreference(providerKeys);
+  const availabilityTracker = createProviderAvailabilityTracker();
 
   return new ReadableStream({
     async start(controller) {
       const encoder = new TextEncoder();
       const startTime = Date.now();
+      let abortReason: "timeout" | "client" | null = null;
+      const clientSignal = createStreamAbortSignal(request, MAX_STREAM_DURATION_MS, (reason) => {
+        abortReason = reason;
+      });
+
+      const firstTokenTimeoutController = new AbortController();
+      const firstTokenTimeoutId = setTimeout(() => firstTokenTimeoutController.abort(), STREAM_FIRST_TOKEN_TIMEOUT_MS);
+      const mergedSignal = mergeAbortSignals([clientSignal, firstTokenTimeoutController.signal]);
+
+      let totalChars = 0;
+      let providerUsage: { inputTokens?: number; outputTokens?: number; totalTokens?: number } | null = null;
+      let streamSucceeded = false;
+      let streamLocked = false;
+      let emittedTerminalError = false;
+      let allFailedDueToQuota = true;
+
+      const meta = { requestId };
+      if (process.env.NODE_ENV !== "test") {
+        logger.info({ event: "stream_start", provider: "pending", ...meta });
+      }
+
+      const enqueue = async (data: string) => {
+        await safeEnqueueWithBackpressure(controller, encoder, data);
+      };
+
+      const getModelForPair = (p: { providerId: ProviderId; apiKey: string }) =>
+        getModelForProvider(p.providerId, model) ?? "default";
 
       try {
         let lastError: unknown = null;
-        for (const { providerId, apiKey } of providerKeys) {
-          if (shouldStopStream(request, startTime, STREAM_UPSTREAM_TIMEOUT_MS)) break;
+        let lastProviderId: ProviderId = orderedKeys[0]?.providerId ?? "unknown";
+
+        for (const { providerId, apiKey } of getAvailablePairs(availabilityTracker, orderedKeys, getModelForPair)) {
+          if (mergedSignal.aborted) break;
+          if (shouldStopStream(request, startTime, MAX_STREAM_DURATION_MS)) break;
+
+          const p = getProvider(providerId);
+          const modelOpt = getModelForProvider(providerId, model);
+          lastProviderId = providerId;
+
+          const providerAbortController = new AbortController();
+          const providerSignal = mergeAbortSignals([mergedSignal, providerAbortController.signal]);
+
           try {
-            const p = getProvider(providerId);
-            const modelOpt = getModelForProvider(providerId, model);
-            for await (const chunk of p.stream(messages, apiKey, { context, model: modelOpt })) {
-              if (shouldStopStream(request, startTime, STREAM_UPSTREAM_TIMEOUT_MS)) break;
-              safeEnqueue(controller, encoder, chunk);
+            let firstToken = false;
+            for await (const chunk of p.stream(messages, apiKey, { context, model: modelOpt, signal: providerSignal }) as AsyncIterable<StreamChunk>) {
+              clearTimeout(firstTokenTimeoutId);
+              if (!firstToken) {
+                firstToken = true;
+                streamLocked = true;
+                if (process.env.NODE_ENV !== "test") {
+                  logger.info({ event: "stream_first_token", provider: providerId, latencyMs: Date.now() - startTime, ...meta });
+                }
+              }
+              if (providerSignal.aborted || shouldStopStream(request, startTime, MAX_STREAM_DURATION_MS)) break;
+              if (typeof chunk === "string") {
+                totalChars += chunk.length;
+                await enqueue(chunk);
+              } else if (chunk && typeof chunk === "object" && "type" in chunk && chunk.type === "usage" && chunk.usage) {
+                providerUsage = chunk.usage;
+              }
             }
-            lastError = null;
-            break;
-          } catch (e) {
-            lastError = e;
-            if (!isRateLimitError(e) && !isInvalidModelError(e)) {
-              safeEnqueue(controller, encoder, `[Error: ${getUserFacingChatError(e)}]`);
+
+            if (totalChars === 0) {
+              lastError = new Error("Provider returned no content. Try a different provider or retry.");
+              if (!isRateLimitError(lastError) && !isInvalidModelError(lastError)) {
+                allFailedDueToQuota = false;
+                emitFinalError(controller, encoder, providerId, modelOpt, "Provider returned no content. Try a different provider or retry.");
+                emittedTerminalError = true;
+                break;
+              }
+            } else {
+              streamSucceeded = true;
+              lastError = null;
+              allFailedDueToQuota = false;
               break;
+            }
+          } catch (streamErr) {
+            clearTimeout(firstTokenTimeoutId);
+            if (streamLocked) {
+              lastError = streamErr;
+              allFailedDueToQuota = false;
+              emitFinalError(controller, encoder, providerId, modelOpt, getUserFacingChatError(streamErr));
+              break;
+            }
+
+            if (mergedSignal.aborted) break;
+
+            if (isQuotaExceededError(streamErr)) {
+              markUnavailable(availabilityTracker, providerId, modelOpt ?? "default", "quota_exceeded");
+            }
+
+            providerAbortController.abort();
+
+            const reason = streamErr instanceof Error ? streamErr.message : String(streamErr);
+            if (process.env.NODE_ENV !== "test") {
+              logger.warn({ event: "stream_fallback", provider: providerId, reason, action: "retrying_non_streaming", ...meta });
+            }
+
+            try {
+              const { content, usage } = await p.chat(messages, apiKey, { context, model: modelOpt });
+              providerUsage = usage ?? null;
+              totalChars = content.length;
+              await enqueue(content);
+              streamSucceeded = true;
+              lastError = null;
+              allFailedDueToQuota = false;
+              if (process.env.NODE_ENV !== "test") {
+                logger.info({ event: "stream_fallback_used", provider: providerId, success: true, ...meta });
+              }
+              break;
+            } catch (fallbackErr) {
+              lastError = fallbackErr;
+              if (isQuotaExceededError(fallbackErr)) {
+                markUnavailable(availabilityTracker, providerId, modelOpt ?? "default", "quota_exceeded");
+              } else {
+                allFailedDueToQuota = false;
+              }
+              if (!isRateLimitError(fallbackErr) && !isInvalidModelError(fallbackErr)) {
+                emitFinalError(controller, encoder, providerId, modelOpt, getUserFacingChatError(fallbackErr));
+                break;
+              }
             }
           }
         }
-        if (lastError != null && (isRateLimitError(lastError) || isInvalidModelError(lastError))) {
-          safeEnqueue(
-            controller,
-            encoder,
-            `[Error: ${getUserFacingChatError(lastError)}. Try selecting a different provider (e.g. OpenAI) in the dropdown above if you have an API key.]`
-          );
+
+        if (!streamSucceeded && !emittedTerminalError) {
+          const errProviderId = lastProviderId;
+          const modelOpt = getModelForProvider(errProviderId, model);
+          const recommendedProviders = [...new Set(orderedKeys.map((p) => p.providerId))];
+          const recommendedModels = [...new Set(orderedKeys.map((p) => getModelForProvider(p.providerId, model) ?? "default"))];
+
+          if (allFailedDueToQuota && recommendedProviders.length > 0) {
+            emitAllModelsExhaustedEvent(controller, encoder, {
+              provider: errProviderId,
+              model: modelOpt ?? "default",
+              recommendedProviders,
+              recommendedModels,
+            });
+          } else {
+            const reason = lastError != null
+              ? ((isRateLimitError(lastError) || isInvalidModelError(lastError))
+                ? getUserFacingChatError(lastError) + " Try selecting a different provider (e.g. OpenAI) in the dropdown above if you have an API key."
+                : getUserFacingChatError(lastError))
+              : "Stream closed prematurely (client disconnect or timeout).";
+            emitFinalError(controller, encoder, errProviderId, modelOpt, reason);
+          }
+        }
+
+        if (process.env.NODE_ENV !== "test") {
+          logger.info({ event: "stream_close", reason: streamSucceeded ? "complete" : "error", durationMs: Date.now() - startTime, ...meta });
         }
       } catch (e) {
-        safeEnqueue(controller, encoder, `[Error: ${getUserFacingChatError(e)}]`);
+        emitFinalError(controller, encoder, "unknown", undefined, getUserFacingChatError(e));
+      } finally {
+        clearTimeout(firstTokenTimeoutId);
+        if (abortReason === "timeout") recordLLMStreamAbortedTimeout();
+        if (abortReason === "client") recordLLMStreamAbortedClient();
+        if (budget && budget.tokensReserved > 0 && budget.supabase && budget.userId) {
+          const usage = providerUsage ?? budget.usage;
+          const tokensUsed =
+            usage?.totalTokens ??
+            (typeof usage?.inputTokens === "number" && typeof usage?.outputTokens === "number"
+              ? usage.inputTokens + usage.outputTokens
+              : estimateTokensFromChars(totalChars));
+          const hasProviderUsage = !!(
+            usage?.totalTokens ??
+            (typeof usage?.inputTokens === "number" && typeof usage?.outputTokens === "number")
+          );
+          if (hasProviderUsage && tokensUsed > 0) {
+            reconcileBudgetWithUsage(
+              budget.supabase,
+              budget.userId,
+              budget.tokensReserved,
+              tokensUsed,
+              budget.workspaceId
+            ).catch(() => {});
+            if (tokensUsed < budget.tokensReserved) {
+              recordLLMBudgetRefunded(budget.tokensReserved - tokensUsed);
+            }
+          } else {
+            const toRefund = Math.max(0, budget.tokensReserved - tokensUsed);
+            if (toRefund > 0) {
+              refundBudget(budget.supabase, budget.userId, toRefund, budget.workspaceId).catch(() => {});
+              recordLLMBudgetRefunded(toRefund);
+            }
+          }
+        }
       }
+      await budget?.onComplete?.();
       safeClose(controller);
     },
   });

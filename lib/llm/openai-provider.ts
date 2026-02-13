@@ -27,7 +27,10 @@ function buildMessages(messages: ChatMessage[], context?: ChatOptions["context"]
   }
 
   for (const m of messages) {
-    result.push({ role: m.role as "system" | "user" | "assistant", content: m.content });
+    result.push({
+      role: m.role as "system" | "user" | "assistant",
+      content: m.content,
+    });
   }
 
   return result;
@@ -45,6 +48,7 @@ export const openAIProvider: LLMProvider = {
       model: options?.model ?? "gpt-4o-mini",
       messages: built,
       ...(options?.temperature != null && { temperature: options.temperature }),
+      ...(options?.topP != null && { top_p: options.topP }),
       ...(options?.maxTokens != null && { max_tokens: options.maxTokens }),
     });
     const content = completion.choices[0]?.message?.content ?? "";
@@ -63,20 +67,37 @@ export const openAIProvider: LLMProvider = {
     messages: ChatMessage[],
     apiKey: string,
     options?: ChatOptions
-  ): AsyncIterable<string> {
+  ): AsyncIterable<import("./types").StreamChunk> {
     const client = new OpenAI({ apiKey });
     const built = buildMessages(messages, options?.context);
-    const stream = await client.chat.completions.create({
-      model: options?.model ?? "gpt-4o-mini",
-      messages: built,
-      stream: true,
-      ...(options?.temperature != null && { temperature: options.temperature }),
-      ...(options?.maxTokens != null && { max_tokens: options.maxTokens }),
-    });
+    const stream = await client.chat.completions.create(
+      {
+        model: options?.model ?? "gpt-4o-mini",
+        messages: built,
+        stream: true,
+        stream_options: { include_usage: true },
+        ...(options?.temperature != null && { temperature: options.temperature }),
+        ...(options?.topP != null && { top_p: options.topP }),
+        ...(options?.maxTokens != null && { max_tokens: options.maxTokens }),
+      },
+      options?.signal ? { signal: options.signal } : undefined
+    );
 
     for await (const chunk of stream) {
+      if (options?.signal?.aborted) break;
       const delta = chunk.choices[0]?.delta?.content;
       if (delta) yield delta;
+      if (chunk.usage) {
+        yield {
+          type: "usage",
+          usage: {
+            inputTokens: chunk.usage.prompt_tokens ?? undefined,
+            outputTokens: chunk.usage.completion_tokens ?? undefined,
+            totalTokens: chunk.usage.total_tokens ?? undefined,
+            raw: chunk.usage,
+          },
+        };
+      }
     }
   },
 

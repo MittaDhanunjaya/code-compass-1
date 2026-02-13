@@ -1,0 +1,20 @@
+# Code Compass — Cursor Rules
+
+## Tooling vs AI (Critical Separation)
+
+Never use LLMs for deterministic tasks. Use native tools instead.
+
+| Task | Tool | AI |
+|------|------|-----|
+| Formatting | Prettier, Black, gofmt, clang-format, rustfmt | ❌ |
+| Linting | ESLint, Ruff (sandbox) | ❌ |
+| Validation | Zod | ❌ |
+| Diffs | Monaco | ❌ |
+| File ops | Native FS | ❌ |
+| Planning | — | ✓ |
+| Reasoning | — | ✓ |
+| Refactoring | — | ✓ |
+
+- Use `lib/formatters` and `prepareEditContent()` for edit content; never ask LLM to format.
+- Use Zod for schema validation; never ask LLM to validate.
+- Use `parseJSONRobust` for LLM output parsing.

@@ -1,5 +1,25 @@
 import { GoogleGenAI, createUserContent, createModelContent } from "@google/genai";
-import type { ChatMessage, ChatOptions, LLMProvider } from "./types";
+import type { ChatMessage, ChatOptions, ContentPart, LLMProvider } from "./types";
+import { getTextFromContent } from "./types";
+
+/** Convert OpenAI-style ContentPart[] to Gemini parts (text + inlineData). */
+function toGeminiParts(parts: ContentPart[]): Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> {
+  const result: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
+  for (const p of parts) {
+    if (p.type === "text") {
+      result.push({ text: p.text });
+    } else if (p.type === "image_url" && p.image_url?.url) {
+      const url = p.image_url.url;
+      const dataUrlMatch = url.match(/^data:([^;]+);base64,(.+)$/);
+      if (dataUrlMatch) {
+        const mimeType = dataUrlMatch[1] || "image/png";
+        const data = dataUrlMatch[2] || "";
+        result.push({ inlineData: { mimeType, data } });
+      }
+    }
+  }
+  return result;
+}
 
 function buildContents(messages: ChatMessage[], context?: ChatOptions["context"]) {
   const systemParts: string[] = [];
@@ -15,17 +35,18 @@ function buildContents(messages: ChatMessage[], context?: ChatOptions["context"]
     );
   }
 
-  // Merge consecutive same-role messages; collect system into systemParts.
-  const normalized: { role: "user" | "assistant"; content: string }[] = [];
+  // Merge consecutive same-role text-only messages; multimodal passes through as-is.
+  const normalized: { role: "user" | "assistant"; content: string | ContentPart[] }[] = [];
   for (const m of messages) {
     if (m.role === "system") {
-      systemParts.push(m.content);
+      systemParts.push(getTextFromContent(m.content));
       continue;
     }
     if (m.role !== "user" && m.role !== "assistant") continue;
     const last = normalized[normalized.length - 1];
-    if (last?.role === m.role) {
-      last.content += "\n\n" + m.content;
+    const canMerge = last?.role === m.role && typeof m.content === "string" && typeof last.content === "string";
+    if (canMerge) {
+      last.content = (last.content as string) + "\n\n" + m.content;
     } else {
       normalized.push({ role: m.role, content: m.content });
     }
@@ -38,8 +59,18 @@ function buildContents(messages: ChatMessage[], context?: ChatOptions["context"]
 
   const contents: ReturnType<typeof createUserContent>[] = [];
   for (const { role, content } of normalized) {
-    if (role === "user") contents.push(createUserContent(content));
-    else contents.push(createModelContent(content));
+    if (role === "user") {
+      if (typeof content === "string") {
+        contents.push(createUserContent(content));
+      } else {
+        const geminiParts = toGeminiParts(content);
+        if (geminiParts.length > 0) {
+          contents.push(createUserContent(geminiParts));
+        }
+      }
+    } else {
+      contents.push(createModelContent(getTextFromContent(content)));
+    }
   }
 
   const systemInstruction =
