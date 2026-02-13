@@ -46,6 +46,8 @@ export type RunSummary = {
 export type UseAgentPlanParams = {
   workspaceId: string | null;
   instruction: string;
+  /** Previous plan for drift detection (same goal re-run). */
+  previousPlan?: AgentPlan | null;
   provider: ProviderId;
   model: string;
   modelSelection: ModelSelection;
@@ -64,6 +66,7 @@ export type UseAgentPlanParams = {
   setRunScope: (scope: { fileCount: number; approxLinesChanged: number } | null) => void;
   setPlanUsage: (usage: string | null) => void;
   setModelFallbackBanner: (banner: { from: string; to: string; reason?: "rate_limit" | "capability"; availableFreeModels: { id: string; label: string }[] } | null) => void;
+  setPlanRetryBanner?: (banner: { message: string } | null) => void;
   setPlanDebugInfo: (info: PlanDebugInfo | null) => void;
   lastActivityRef: React.MutableRefObject<number>;
   abortControllerRef: React.MutableRefObject<AbortController | null>;
@@ -75,6 +78,7 @@ export function useAgentPlan(params: UseAgentPlanParams) {
   const {
     workspaceId,
     instruction,
+    previousPlan,
     provider,
     model,
     modelSelection,
@@ -91,6 +95,7 @@ export function useAgentPlan(params: UseAgentPlanParams) {
     setRunScope,
     setPlanUsage,
     setModelFallbackBanner,
+    setPlanRetryBanner,
     setPlanDebugInfo,
     lastActivityRef,
     abortControllerRef,
@@ -113,6 +118,7 @@ export function useAgentPlan(params: UseAgentPlanParams) {
     setAgentEvents([]);
     setRunSummary(null);
     setModelFallbackBanner(null);
+    setPlanRetryBanner?.(null);
     onPhase("loading_plan");
 
     const abortController = new AbortController();
@@ -129,6 +135,7 @@ export function useAgentPlan(params: UseAgentPlanParams) {
         body: JSON.stringify({
           instruction: instruction.trim(),
           workspaceId,
+          ...(previousPlan ? { previousPlan } : {}),
           ...(modelSelection.type === "model"
             ? { modelId: modelSelection.modelId }
             : modelSelection.type === "group"
@@ -228,6 +235,16 @@ export function useAgentPlan(params: UseAgentPlanParams) {
                 if (data.scope?.fileCount != null) {
                   setRunScope({ fileCount: data.scope.fileCount, approxLinesChanged: data.scope.approxLinesChanged ?? 0 });
                 }
+              } else if (data.type === "plan_drift_warning") {
+                setAgentEvents((prev) => [
+                  ...prev,
+                  {
+                    id: `${Date.now()}`,
+                    type: "status",
+                    message: data.message ?? "The plan changed significantly. Enable deterministic mode for consistent results.",
+                    createdAt: new Date().toISOString(),
+                  },
+                ]);
               } else if (data.type === "error") {
                 lastStatusMessage = data.error || data.message || data.reason || "Unknown error";
                 lastErrorCode = data.code ?? null;
@@ -250,6 +267,18 @@ export function useAgentPlan(params: UseAgentPlanParams) {
                 const event = data as AgentEvent;
                 if (event.type === "status" && typeof event.message === "string" && (event.message.startsWith("Error:") || event.message.includes("valid") || event.message.includes("JSON"))) {
                   lastStatusMessage = event.message;
+                }
+                if (event.type === "status" && typeof event.message === "string") {
+                  const msg = event.message;
+                  if (
+                    msg.includes("Planner retrying") ||
+                    msg.includes("Plan layout violation") ||
+                    msg.includes("Retrying with corrective hint") ||
+                    msg.includes("Trying fallback provider") ||
+                    msg.includes("Layout corrective retry")
+                  ) {
+                    setPlanRetryBanner?.({ message: msg });
+                  }
                 }
                 setAgentEvents((prev) => [...prev, event]);
                 setRunSummary((prev) => {
@@ -320,6 +349,7 @@ export function useAgentPlan(params: UseAgentPlanParams) {
         } else {
           setModelFallbackBanner(null);
         }
+        setPlanRetryBanner?.(null);
         if (finalPlanDebugInfo) setPlanDebugInfo(finalPlanDebugInfo);
         else setPlanDebugInfo(null);
         if (finalUsage) {
@@ -423,6 +453,7 @@ export function useAgentPlan(params: UseAgentPlanParams) {
   }, [
     instruction,
     workspaceId,
+    previousPlan,
     provider,
     model,
     modelSelection,

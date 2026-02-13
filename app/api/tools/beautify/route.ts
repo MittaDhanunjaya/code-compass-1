@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { checkRateLimit, getRateLimitIdentifier } from "@/lib/api-rate-limit";
 import { requireAuth, withAuthResponse } from "@/lib/auth/require-auth";
 import { formatCode } from "@/lib/formatters";
+import { isOfflineMode } from "@/lib/config";
 
 const MAX_SIZE = 500 * 1024; // 500KB
 const BEAUTIFY_RATE_LIMIT = 30; // per minute
@@ -56,6 +57,13 @@ export async function POST(request: Request) {
 
   if (!code) {
     return NextResponse.json({ error: "code is required" }, { status: 400 });
+  }
+
+  if (isOfflineMode()) {
+    return NextResponse.json(
+      { error: "Beautify is disabled in offline mode.", code: "OFFLINE_MODE" },
+      { status: 503 }
+    );
   }
 
   if (code.length > MAX_SIZE) {

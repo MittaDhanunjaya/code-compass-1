@@ -1,0 +1,78 @@
+Copy from this .txt file (not the .md) to avoid Jira wrapping as code block. Paste into Jira Description; use Ctrl+Shift+V for plain paste if needed.
+
+h3. Agent (plan + execute)
+* Describe task → plan (file edits + commands) → execute in sandbox
+* Playbooks (Fix failing test, Add API endpoint, Add tests, etc.)
+* Sandbox: lint/test/run must pass before promotion
+* Scope modes, protected paths, over-edit guardrails
+* Deterministic planning mode (DETERMINISTIC_PLANNING env)
+* Plan contract (files[] declaration), canonical layout validation
+* Repair scope enforcement, single-fix repair attempts
+* Structured execution errors (MODULE_NOT_FOUND, COMMAND_NOT_FOUND, etc.)
+
+h3. Debug from logs
+* Paste error in Chat → confirm workspace → run debug
+* Ctrl+Shift+P → "Debug from Log (last error)"
+
+h3. Workspaces and GitHub
+* Create workspace (empty, GitHub URL, local folder)
+* Stack & Commands ({{.code-compass/config.json}}): lint, test, run per service
+* Project rules ({{.code-compass-rules}})
+* Git: branch, commit, push, pull (when GitHub connected)
+
+h3. Settings
+* API Keys (multi-provider)
+* GitHub connection
+* Models / groups per task
+
+h3. CI and PR
+* Propose fixes API ({{POST /api/ci/propose-fixes}})
+* Apply edits script ({{scripts/apply-code-compass-edits.sh}})
+* PR analyze API and UI
+
+h3. Offline mode
+* Offline mode disables cloud-dependent features (beautify, etc.)
+* Local engines (Ollama, LM Studio) for fully offline AI
+
+----
+
+h2. Expected final output / user flow (what "done" looks like)
+* User opens the app
+* Signs in, adds API key(s), creates or imports a workspace
+* User can:
+** Edit files in the editor
+** Use Cmd+K for quick AI actions on selection
+** Chat, run Agent, or use Composer for larger tasks
+** Paste error logs and debug against workspace
+** Run commands in the terminal
+** Use playbooks for common workflows
+* Agent runs: plan → sandbox → execute → promote if checks pass
+* All AI features work with sandboxed edits and protected paths
+
+*Done means:*
+* App works end-to-end with multi-provider LLM support
+* Agent plan + execute flow works with sandbox and promotion
+* Chat, Composer, Cmd+K, debug-from-log all functional
+* Offline mode works correctly (local engines, graceful degradation)
+* CI propose-fixes and PR analyze work as documented
+* Deterministic planning, plan contract, repair scope, and execution error classification behave as specified
+
+----
+
+h2. Out of scope (explicitly what will NOT be done in this version)
+* Real-time collaboration (multi-user editing)
+* Voice or multimodal input
+* Mobile app or native desktop app (Electron)
+* Custom model training or fine-tuning
+* Full VS Code extension parity
+* Self-hosted vector DB or embeddings infra (uses Supabase)
+* Custom LSP servers beyond language support
+
+----
+
+h2. Notes / assumptions / dependencies (if any)
+* *Supabase* — Auth, workspaces, provider_keys, embeddings; optional for local-only use
+* *LLM providers* — OpenRouter, OpenAI, Gemini, Perplexity, Ollama, LM Studio; keys from DB (encrypted) or env
+* *Token budget* — Per-user and per-workspace limits; 429 when over
+* *Sandbox* — Runs in isolated environment; lint/test/run commands from workspace config
+* *Tech stack* — Next.js 15, React, Tailwind, Radix UI, Monaco, Supabase

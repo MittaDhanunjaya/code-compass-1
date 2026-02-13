@@ -99,3 +99,13 @@ export function isOfflineMode(): boolean {
     return false;
   }
 }
+
+/** Deterministic planning: force temp=0, top_p=1, same model, normalize plan, hash after normalization. */
+export function isDeterministicPlanning(): boolean {
+  try {
+    const v = process.env.DETERMINISTIC_PLANNING;
+    return v === "true" || v === "1";
+  } catch {
+    return false;
+  }
+}

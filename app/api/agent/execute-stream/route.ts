@@ -9,6 +9,8 @@ import { executeCommandInWorkspace, executeCommand } from "@/lib/agent/execute-c
 import { classifyCommandKind, classifyCommandResult } from "@/lib/agent/command-classify";
 import { proposeFixSteps, buildTails } from "@/lib/agent/self-debug";
 import { buildSelfDebugContext } from "@/lib/agent/terminal-error-context";
+import { buildRepairScope, isPathInRepairScope } from "@/lib/agent/repair-scope";
+import { classifyExecutionError } from "@/lib/agent/execution-error-classifier";
 import { getAllowedPaths, isPathAllowed, hashPlan } from "@/lib/agent/plan-lock";
 import { isOfflineMode } from "@/lib/config";
 import { validatePathForPlan } from "@/lib/agent/file-safety";
@@ -790,6 +792,14 @@ export async function POST(request: Request) {
 
               const cmdLabel = commandKindToActionLabel(commandKind);
               const firstRunLine = `${step.command} — ${classification.status}${classification.summary ? ` (${classification.summary})` : ""}`;
+              const structuredErr =
+                classification.status === "failed"
+                  ? classifyExecutionError(
+                      cmdResult.stderr ?? "",
+                      cmdResult.stdout ?? "",
+                      cmdResult.exitCode ?? null
+                    )
+                  : undefined;
               const commandEntry: AgentLogEntry = {
                 stepIndex: i,
                 type: "command",
@@ -799,6 +809,7 @@ export async function POST(request: Request) {
                 commandKind,
                 commandStatus: classification.status,
                 commandStatusSummary: classification.summary,
+                structuredError: structuredErr,
                 actionLabel: cmdLabel,
                 statusLine: firstRunLine,
               };
@@ -934,6 +945,12 @@ export async function POST(request: Request) {
                     }
                   }
                   
+                  const repairScope = buildRepairScope(
+                    step.command,
+                    lastResult.stderr ?? "",
+                    lastResult.stdout ?? "",
+                    { failingFile: lastClassification.status === "failed" ? structuredErr?.failingFile : undefined }
+                  );
                   for (let attempt = 1; attempt <= MAX_DEBUG_ATTEMPTS; attempt++) {
                     safeEmit( createAgentEvent('reasoning', `Auto-fix attempt ${attempt}/${MAX_DEBUG_ATTEMPTS}...`));
                     
@@ -945,6 +962,8 @@ export async function POST(request: Request) {
                         stdoutTail: debugCtx.stdoutTail,
                         stderrTail: debugCtx.stderrTail,
                         exitCode: debugCtx.exitCode,
+                        errorClassification: debugCtx.errorClassification,
+                        structuredError: debugCtx.structuredError,
                         filesEdited: [...filesEdited],
                         workspaceFiles: workspaceFileList.length > 0 ? workspaceFileList : undefined,
                         fileContents: Object.keys(relevantFileContents).length > 0 ? relevantFileContents : undefined,
@@ -962,14 +981,45 @@ export async function POST(request: Request) {
                       break;
                     }
 
+                    // Single-fix enforcement: reject multi-edit repairs unless MODULE_NOT_FOUND
+                    const allowMultiEdit = debugCtx.structuredError?.errorType === "MODULE_NOT_FOUND";
+                    if (!allowMultiEdit && fixSteps.length > 1) {
+                      safeEmit(createAgentEvent("status", "Repair attempt rejected: multiple edits not allowed. Propose one fix at a time."));
+                      safeEnqueue(controller, encoder, `data: ${JSON.stringify({
+                        type: "error",
+                        code: "MULTI_EDIT_REPAIR_REJECTED",
+                        message: "Repair attempt rejected: multiple edits not allowed.",
+                      })}\n\n`);
+                      safeClose(controller);
+                      return;
+                    }
+
+                    // Repair scope hard lock: when scope is non-empty, abort if any fix targets file not in scope
+                    if (repairScope.size > 0) {
+                      for (const f of fixSteps) {
+                        const p = f.path.trim();
+                        if (allowedPaths.has(p) && !isPathInRepairScope(p, repairScope)) {
+                        const err = {
+                          type: "error",
+                          code: "REPAIR_SCOPE_VIOLATION",
+                          message: "Fix blocked: attempted to modify unrelated files.",
+                        };
+                        safeEmit(createAgentEvent("status", `Error: ${err.message}`));
+                        safeEnqueue(controller, encoder, `data: ${JSON.stringify(err)}\n\n`);
+                        safeClose(controller);
+                        return;
+                        }
+                      }
+                    }
                     // Plan lock: only apply fix steps whose path is in approved plan
                     const allowedFixSteps = fixSteps.filter((f) => {
-                      const check = isPathAllowed(f.path.trim(), allowedPaths);
+                      const path = f.path.trim();
+                      const check = isPathAllowed(path, allowedPaths);
                       if (!check.allowed) {
-                        safeEmit(createAgentEvent("reasoning", `Plan lock: skipping fix for ${f.path} (not in plan)`));
+                        safeEmit(createAgentEvent("reasoning", `Plan lock: skipping fix for ${path} (not in plan)`));
                         return false;
                       }
-                      return validatePathForPlan(f.path.trim()).ok;
+                      return validatePathForPlan(path).ok;
                     });
 
                     safeEmit( createAgentEvent('tool_result', `Auto-fix attempt ${attempt}: applying ${allowedFixSteps.length} edit(s)...`));
@@ -1019,6 +1069,11 @@ export async function POST(request: Request) {
                     commandEntry.secondRunSummary = lastClassification.summary;
                     commandEntry.statusLine = `${firstRunLine}; Auto-fix: ${totalFixSteps} edit(s) applied over ${previousAttempts.length} attempt(s), still ${lastClassification.status}`;
                     
+                    safeEmit( createAgentEvent('status', 'Repair attempt failed. Manual fix may be required.', {
+                      toolName: 'run_command',
+                      command: step.command,
+                      stepIndex: i,
+                    }));
                     safeEmit( createAgentEvent('tool_result', `Auto-fix exhausted ${previousAttempts.length} attempt(s), final status: ${lastClassification.status}`, {
                       toolName: 'run_command',
                       command: step.command,

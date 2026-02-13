@@ -5,8 +5,9 @@
 
 import { getProvider, type ProviderId } from "@/lib/llm/providers";
 import type { FileEditStep } from "@/lib/agent/types";
+import type { StructuredExecutionError } from "./execution-error-classifier";
 import { extractPortFromError, findAvailablePort } from "./port-utils";
-import { SELF_HEAL_REPAIR_INSTRUCTIONS, normalizeTerminalError } from "./terminal-error-context";
+import { SELF_HEAL_REPAIR_INSTRUCTIONS } from "./terminal-error-context";
 
 const SELF_DEBUG_SYSTEM = `You are an intelligent coding assistant helping to fix a failed command. Analyze the error, understand the codebase structure, and propose targeted fixes.
 
@@ -33,7 +34,7 @@ Your approach:
 Guidelines:
 - path must be relative to workspace root.
 - Include oldContent only when replacing a specific snippet; omit for full file replace.
-- Propose at most 3-5 file_edit steps. Be targeted; only fix what the failure suggests.
+- Propose at most 1 file_edit step per failure. No new files. No new dependencies unless errorType is MODULE_NOT_FOUND.
 - Only modify files directly related to the error. Do not change unrelated code.
 - Think through the problem systematically. Don't guess - use the information provided.
 - If you cannot suggest a fix, return { "steps": [], "reasoning": "Unable to determine fix" }.
@@ -49,6 +50,10 @@ export type SelfDebugContext = {
   stderrTail: string;
   /** Exit code from command (null if unknown). Passed to repair prompt as signal. */
   exitCode?: number | null;
+  /** Error classification (DEPENDENCY_ERROR, etc.) - inject hint into repair prompt. */
+  errorClassification?: { type: string; hint: string };
+  /** Structured execution error for repair prompt (errorType, missingDependency, failingFile). */
+  structuredError?: StructuredExecutionError;
   filesEdited: string[];
   workspaceFiles?: string[]; // List of workspace file paths for context
   fileContents?: Record<string, string>; // File contents for relevant files (e.g., server files for port conflicts)
@@ -73,11 +78,20 @@ export async function proposeFixSteps(
   context: SelfDebugContext,
   options: SelfDebugOptions
 ): Promise<FileEditStep[]> {
-  const { command, stdoutTail, stderrTail, exitCode, filesEdited, workspaceFiles, fileContents, previousAttempts } = context;
-  
+  const { command, stdoutTail, stderrTail, exitCode, errorClassification, structuredError, filesEdited, workspaceFiles, fileContents, previousAttempts } = context;
+
   const userContentParts = [
     `Failed command: ${command}`,
     ...(exitCode != null ? [`exitCode: ${exitCode}`, ""] : []),
+    ...(structuredError
+      ? [
+          `errorType: ${structuredError.errorType}`,
+          ...(structuredError.missingDependency ? [`missingDependency: ${structuredError.missingDependency}`] : []),
+          ...(structuredError.failingFile ? [`failingFile: ${structuredError.failingFile}`] : []),
+          "",
+        ]
+      : []),
+    ...(errorClassification?.hint ? [`${errorClassification.hint}`, ""] : []),
     "stdout (last lines):",
     stdoutTail || "(empty)",
     "",
@@ -186,6 +200,11 @@ export async function proposeFixSteps(
           description: step.description,
         });
       }
+    }
+    // Single-fix enforcement: at most 1 file_edit per failure unless MODULE_NOT_FOUND
+    const allowMulti = structuredError?.errorType === "MODULE_NOT_FOUND";
+    if (!allowMulti && steps.length > 1) {
+      return steps.slice(0, 1);
     }
     return steps;
   } catch {

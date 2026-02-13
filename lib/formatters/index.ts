@@ -1,6 +1,11 @@
 /**
  * Language-aware code formatters. No LLM - deterministic only.
  * Supports: JS, TS, JSON, HTML, CSS, YAML, Python, Go, Java, C#, C, C++, and more.
+ *
+ * Design note (offline build): Ship with Prettier only. Python/Go/Java/etc. use
+ * system formatters (black, gofmt, etc.) which may not be installed. Offline
+ * build should bundle Prettier for JS/TS/JSON/CSS; other languages fall back to
+ * basic whitespace normalization when formatter is not installed.
  */
 
 export type FormatResult = {

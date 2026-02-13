@@ -31,7 +31,10 @@ import { validateDeterministicPlan, hashPlanForValidation } from "@/lib/agent/de
 import { logger, logAgentStarted, logAgentCompleted, getRequestId } from "@/lib/logger";
 import { captureException } from "@/lib/sentry";
 import { recordAgentPlanDuration, recordLLMBudgetReserved, recordLLMBudgetRefunded, recordLLMBudgetExceeded, recordLLMStreamAbortedTimeout, recordLLMStreamAbortedClient } from "@/lib/metrics";
-import { isStreamingEnabled, isWeakModelsEnabled, isOfflineMode } from "@/lib/config";
+import { isStreamingEnabled, isWeakModelsEnabled, isOfflineMode, isDeterministicPlanning } from "@/lib/config";
+import { normalizePlanForDeterministic } from "@/lib/agent/plan-normalizer";
+import { validateCanonicalLayout, LAYOUT_CORRECTIVE_HINT } from "@/lib/agent/canonical-layout";
+import { validatePlanContract, PLAN_CONTRACT_CORRECTIVE_HINT } from "@/lib/agent/plan-contract";
 
 // Same system prompt as plan route, but with instruction to emit reasoning messages
 const PLAN_SYSTEM = `You are an intelligent coding agent planner. Your job is to understand the user's request, analyze the codebase, and create a plan that accomplishes the task.
@@ -79,12 +82,17 @@ Output format:
 1. Reasoning messages (emitted during thinking - see above)
 2. **ONLY** a single JSON object with this exact shape (no text before or after):
 {
+  "files": [{"path": "<file path>", "purpose": "<short purpose>"}],
   "steps": [
     { "type": "file_edit", "path": "<file path>", "oldContent": "<exact snippet to replace or omit for full replace>", "newContent": "<new content>", "description": "<optional>" },
     { "type": "command", "command": "<shell command>", "description": "<optional>" }
   ],
   "summary": "<optional short summary>"
 }
+
+**CRITICAL - files[] declaration:**
+- Declare ALL files you will create or modify in "files" first. Every file_edit step path MUST appear in files[].
+- Do NOT invent new files in steps that are not in files[]. No duplicate paths in files[].
 
 **CRITICAL - "steps" must be an array of OBJECTS, NOT strings:**
 - Each element in "steps" MUST be an object (curly braces {}), never a plain text string.
@@ -677,6 +685,12 @@ ${instruction.slice(0, 8000)}
           if (!aMeets && bMeets) return 1;
           return 0;
         });
+        const deterministicMode = isDeterministicPlanning();
+        const configsForLayoutFallback = [...configsToTry];
+        if (deterministicMode && configsToTry.length > 1) {
+          configsToTry = configsToTry.slice(0, 1);
+          emit(createAgentEvent("reasoning", "Deterministic mode: using single model, no fallback for parse/empty."));
+        }
         let modelFallback: { from: string; to: string; reason?: "rate_limit" | "capability" } | null = null;
         const providerErrors: string[] = [];
         // Proactive switch: if first model doesn't support streaming, switch to one that does
@@ -995,7 +1009,7 @@ ${instruction.slice(0, 8000)}
                 emit(createAgentEvent('reasoning', 'Same-provider retry failed. Trying fallback provider...'));
               }
             }
-            if (!emptyRetryRaw && configsToTry.length > 1 && winningConfig) {
+            if (!emptyRetryRaw && configsToTry.length > 1 && winningConfig && !deterministicMode) {
               const fallbackIdx = configsToTry.findIndex((c) => c.providerId === winningConfig!.providerId && c.modelSlug === winningConfig!.modelSlug);
               const fallbackConfig = findCapableFallback(configsToTry, fallbackIdx >= 0 ? fallbackIdx : 0, ["planning"]);
               if (fallbackConfig) {
@@ -1065,7 +1079,7 @@ ${instruction.slice(0, 8000)}
 
             if (plan) break;
             if (retry < MAX_PARSE_RETRIES && winningConfig) {
-              emit(createAgentEvent('status', `Plan parse failed; retrying (${retry + 1}/${MAX_PARSE_RETRIES})...`));
+              emit(createAgentEvent('status', 'Planner retrying due to invalid output.'));
               const fixHint = `\n\n[System: Your previous response had invalid JSON or schema errors. Fix and output ONLY valid JSON. No markdown. No commentary.\nError: ${lastError}\nRaw output (first 2000 chars):\n${currentRaw.slice(0, 2000)}]\n\n`;
               const retryModel = modelUsed || winningConfig.modelSlug;
               const retryProvider = getProvider(winningConfig.providerId);
@@ -1098,11 +1112,11 @@ ${instruction.slice(0, 8000)}
             }
           }
 
-          if (!plan && configsToTry.length > 1 && winningConfig) {
+          if (!plan && configsToTry.length > 1 && winningConfig && !deterministicMode) {
             const currentIdx = configsToTry.findIndex((c) => c.providerId === winningConfig!.providerId && c.modelSlug === winningConfig!.modelSlug);
             const fallbackConfig = findCapableFallback(configsToTry, currentIdx >= 0 ? currentIdx : 0, ["planning"]);
             if (fallbackConfig) {
-              emit(createAgentEvent('status', `Parse failed with primary provider; retrying with fallback ${fallbackConfig.modelLabel}...`));
+              emit(createAgentEvent('status', `Primary model unavailable. Switched to ${fallbackConfig.modelLabel}.`));
               const fixHint = `\n\n[System: Your previous response had invalid JSON or schema errors. Fix and output ONLY valid JSON. No markdown. No commentary.\nError: ${lastError}\nOutput ONLY a JSON object with "steps" array. Each step: {"type":"file_edit","path":"...","newContent":"..."} or {"type":"command","command":"..."}]\n\n`;
               try {
                 const fallbackProvider = getProvider(fallbackConfig.providerId);
@@ -1177,6 +1191,186 @@ ${instruction.slice(0, 8000)}
             return;
           }
         } // End of "if (!plan)" parsing block
+
+        // Plan contract validation: when files[] present, every file_edit path must be in it
+        if (plan && plan.steps?.length && winningConfig) {
+          const contractResult = validatePlanContract(plan);
+          if (!contractResult.valid) {
+            emit(createAgentEvent('status', `Plan contract violation: steps reference undeclared files. Retrying...`));
+            try {
+              const retryProvider = getProvider(winningConfig.providerId);
+              const retryAbort = new AbortController();
+              const retryTimeout = setTimeout(() => retryAbort.abort(), PLAN_RETRY_TIMEOUT_MS);
+              const retryResponse = await retryProvider.chat(
+                [
+                  { role: "system", content: systemPromptWithRules },
+                  { role: "user", content: userContent + PLAN_CONTRACT_CORRECTIVE_HINT },
+                ],
+                winningConfig.apiKey,
+                { model: winningConfig.modelSlug, temperature: 0, topP: 1, signal: retryAbort.signal }
+              );
+              clearTimeout(retryTimeout);
+              const retryRaw = (retryResponse.content || "").trim();
+              if (retryRaw) {
+                const { extractAgentPlanJSON } = await import("@/lib/utils/json-parser");
+                const retryResult = extractAgentPlanJSON<AgentPlan>(retryRaw, ["steps", "files"]);
+                if (retryResult.success && retryResult.data) {
+                  const schemaCheck = validateDeterministicPlan(retryResult.data);
+                  if (schemaCheck.success && schemaCheck.plan.steps?.length) {
+                    const recheck = validatePlanContract(schemaCheck.plan);
+                    if (recheck.valid) {
+                      plan = schemaCheck.plan;
+                      emit(createAgentEvent('reasoning', 'Plan contract corrective retry succeeded.'));
+                    }
+                  }
+                }
+              }
+            } catch {
+              emit(createAgentEvent('reasoning', 'Plan contract corrective retry failed.'));
+            }
+          }
+          const finalContract = validatePlanContract(plan);
+          if (!finalContract.valid && configsForLayoutFallback.length > 1) {
+            const currentIdx = configsForLayoutFallback.findIndex((c) => c.providerId === winningConfig!.providerId && c.modelSlug === winningConfig!.modelSlug);
+            const fallbackConfig = findCapableFallback(configsForLayoutFallback, currentIdx >= 0 ? currentIdx : 0, ["planning"]);
+            if (fallbackConfig) {
+              emit(createAgentEvent('status', `Trying fallback provider ${fallbackConfig.modelLabel} for plan contract...`));
+              try {
+                const fallbackProvider = getProvider(fallbackConfig.providerId);
+                const fallbackAbort = new AbortController();
+                const fallbackTimeout = setTimeout(() => fallbackAbort.abort(), PLAN_RETRY_TIMEOUT_MS);
+                const fallbackResponse = await fallbackProvider.chat(
+                  [
+                    { role: "system", content: systemPromptWithRules },
+                    { role: "user", content: userContent + PLAN_CONTRACT_CORRECTIVE_HINT },
+                  ],
+                  fallbackConfig.apiKey,
+                  { model: fallbackConfig.modelSlug, temperature: 0, topP: 1, signal: fallbackAbort.signal }
+                );
+                clearTimeout(fallbackTimeout);
+                const fallbackRaw = (fallbackResponse.content || "").trim();
+                if (fallbackRaw) {
+                  const { extractAgentPlanJSON } = await import("@/lib/utils/json-parser");
+                  const fallbackParse = extractAgentPlanJSON<AgentPlan>(fallbackRaw, ["steps", "files"]);
+                  if (fallbackParse.success && fallbackParse.data) {
+                    const schemaCheck = validateDeterministicPlan(fallbackParse.data);
+                    if (schemaCheck.success && schemaCheck.plan.steps?.length) {
+                      const recheck = validatePlanContract(schemaCheck.plan);
+                      if (recheck.valid) {
+                        plan = schemaCheck.plan;
+                        modelUsed = fallbackConfig.modelSlug;
+                        winningConfig = fallbackConfig;
+                        emit(createAgentEvent('reasoning', `Fallback provider succeeded: valid plan contract.`));
+                      }
+                    }
+                  }
+                }
+              } catch {
+                emit(createAgentEvent('reasoning', 'Fallback provider plan contract retry failed.'));
+              }
+            }
+          }
+          const finalContractCheck = validatePlanContract(plan);
+          if (!finalContractCheck.valid) {
+            const undeclared = (finalContractCheck as { undeclaredPaths: string[] }).undeclaredPaths || [];
+            emit(createAgentEvent('status', `Error: Plan references undeclared files: ${undeclared.join(", ")}`));
+            safeEnqueue(controller, encoder, `data: ${JSON.stringify({
+              type: 'error',
+              error: `Plan references undeclared files: ${undeclared.join(", ")}`,
+              code: 'INVALID_PLAN_CONTRACT',
+              undeclaredPaths: undeclared,
+            })}\n\n`);
+            safeClose(controller);
+            return;
+          }
+        }
+
+        // Canonical layout validation: retry once with corrective hint, then fallback, else INVALID_PLAN_LAYOUT
+        if (plan && plan.steps?.length && winningConfig) {
+          let layoutValid = validateCanonicalLayout(plan);
+          if (!layoutValid.valid) {
+            emit(createAgentEvent('status', `Plan layout violation: ${layoutValid.reason}. Retrying with corrective hint...`));
+            try {
+              const retryProvider = getProvider(winningConfig.providerId);
+              const retryAbort = new AbortController();
+              const retryTimeout = setTimeout(() => retryAbort.abort(), PLAN_RETRY_TIMEOUT_MS);
+              const retryResponse = await retryProvider.chat(
+                [
+                  { role: "system", content: systemPromptWithRules },
+                  { role: "user", content: userContent + LAYOUT_CORRECTIVE_HINT },
+                ],
+                winningConfig.apiKey,
+                { model: winningConfig.modelSlug, temperature: 0, topP: 1, signal: retryAbort.signal }
+              );
+              clearTimeout(retryTimeout);
+              const retryRaw = (retryResponse.content || "").trim();
+              if (retryRaw) {
+                const { extractAgentPlanJSON } = await import("@/lib/utils/json-parser");
+                const retryResult = extractAgentPlanJSON<AgentPlan>(retryRaw, ["steps"]);
+                if (retryResult.success && retryResult.data) {
+                  const schemaCheck = validateDeterministicPlan(retryResult.data);
+                  if (schemaCheck.success && schemaCheck.plan.steps?.length) {
+                    const recheck = validateCanonicalLayout(schemaCheck.plan);
+                    if (recheck.valid) {
+                      plan = schemaCheck.plan;
+                      emit(createAgentEvent('reasoning', 'Layout corrective retry succeeded.'));
+                      layoutValid = recheck;
+                    }
+                  }
+                }
+              }
+            } catch {
+              emit(createAgentEvent('reasoning', 'Layout corrective retry failed.'));
+            }
+          }
+          if (!layoutValid.valid && configsForLayoutFallback.length > 1) {
+            const currentIdx = configsForLayoutFallback.findIndex((c) => c.providerId === winningConfig!.providerId && c.modelSlug === winningConfig!.modelSlug);
+            const fallbackConfig = findCapableFallback(configsForLayoutFallback, currentIdx >= 0 ? currentIdx : 0, ["planning"]);
+            if (fallbackConfig) {
+              emit(createAgentEvent('status', `Trying fallback provider ${fallbackConfig.modelLabel} for layout...`));
+              try {
+                const fallbackProvider = getProvider(fallbackConfig.providerId);
+                const fallbackAbort = new AbortController();
+                const fallbackTimeout = setTimeout(() => fallbackAbort.abort(), PLAN_RETRY_TIMEOUT_MS);
+                const fallbackResponse = await fallbackProvider.chat(
+                  [
+                    { role: "system", content: systemPromptWithRules },
+                    { role: "user", content: userContent + LAYOUT_CORRECTIVE_HINT },
+                  ],
+                  fallbackConfig.apiKey,
+                  { model: fallbackConfig.modelSlug, temperature: 0, topP: 1, signal: fallbackAbort.signal }
+                );
+                clearTimeout(fallbackTimeout);
+                const fallbackRaw = (fallbackResponse.content || "").trim();
+                if (fallbackRaw) {
+                  const { extractAgentPlanJSON } = await import("@/lib/utils/json-parser");
+                  const fallbackParse = extractAgentPlanJSON<AgentPlan>(fallbackRaw, ["steps"]);
+                  if (fallbackParse.success && fallbackParse.data) {
+                    const schemaCheck = validateDeterministicPlan(fallbackParse.data);
+                    if (schemaCheck.success && schemaCheck.plan.steps?.length) {
+                      const recheck = validateCanonicalLayout(schemaCheck.plan);
+                      if (recheck.valid) {
+                        plan = schemaCheck.plan;
+                        modelUsed = fallbackConfig.modelSlug;
+                        winningConfig = fallbackConfig;
+                        emit(createAgentEvent('reasoning', `Fallback provider succeeded: valid layout with ${plan.steps.length} step(s).`));
+                        layoutValid = recheck;
+                      }
+                    }
+                  }
+                }
+              } catch {
+                emit(createAgentEvent('reasoning', 'Fallback provider layout retry failed.'));
+              }
+            }
+          }
+          if (!layoutValid.valid) {
+            emit(createAgentEvent('status', `Error: ${layoutValid.reason}`));
+            safeEnqueue(controller, encoder, `data: ${JSON.stringify({ type: 'error', error: layoutValid.reason, code: 'INVALID_PLAN_LAYOUT' })}\n\n`);
+            safeClose(controller);
+            return;
+          }
+        }
 
         // Retry once when model returns valid JSON but empty steps (common with some OpenRouter/free models)
         if (plan && Array.isArray(plan.steps) && plan.steps.length === 0 && winningConfig) {
@@ -1554,8 +1748,43 @@ ${instruction.slice(0, 8000)}
         const finalScope = computeRunScope(fileEditStepsForScope);
         const durationMs = Date.now() - planStart;
 
+        // Deterministic mode: normalize plan (sort, max depth), hash AFTER normalization
+        let planHash = hashPlanForValidation(plan);
+        if (deterministicMode && plan) {
+          const normResult = normalizePlanForDeterministic(plan);
+          if (!normResult.ok) {
+            emit(createAgentEvent('status', `Error: ${normResult.error}`));
+            safeEnqueue(controller, encoder, `data: ${JSON.stringify({ type: 'error', error: normResult.error, code: 'INVALID_PLAN_DEPTH' })}\n\n`);
+            safeClose(controller);
+            return;
+          }
+          plan = normResult.plan;
+          planHash = normResult.planHash;
+        }
+
+        // Planning consistency guard: detect plan drift when previousPlan provided
+        const previousPlan = body.previousPlan;
+        if (previousPlan && plan) {
+          const prevPaths = new Set(
+            previousPlan.steps.filter((s): s is FileEditStep => s.type === "file_edit").map((s) => s.path.trim())
+          );
+          const currPaths = new Set(
+            plan.steps.filter((s): s is FileEditStep => s.type === "file_edit").map((s) => s.path.trim())
+          );
+          const union = new Set([...prevPaths, ...currPaths]);
+          const intersection = new Set([...prevPaths].filter((p) => currPaths.has(p)));
+          const driftRatio = union.size > 0 ? 1 - intersection.size / union.size : 0;
+          if (driftRatio > 0.3) {
+            emit(createAgentEvent("status", "The plan changed significantly. This may indicate model instability. Enable deterministic mode for consistent results."));
+            safeEnqueue(controller, encoder, `data: ${JSON.stringify({
+              type: "plan_drift_warning",
+              message: "The plan changed significantly. This may indicate model instability. Enable deterministic mode for consistent results.",
+              driftRatio: Math.round(driftRatio * 100),
+            })}\n\n`);
+          }
+        }
+
         // Send the plan as a final event (include model info for free-model fallback UI)
-        const planHash = hashPlanForValidation(plan);
         safeEnqueue(controller, encoder, `data: ${JSON.stringify({
           type: 'plan',
           plan,

@@ -96,6 +96,8 @@ export const agentPlanStreamBodySchema = z.object({
   useIndex: z.boolean().optional(),
   scopeMode: scopeModeSchema.optional(),
   mode: planModeSchema,
+  /** Previous plan for drift detection (same goal + context re-run). */
+  previousPlan: agentPlanSchema.optional(),
 });
 
 /** /api/agent/execute-stream */

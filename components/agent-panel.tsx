@@ -160,6 +160,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
     reason?: "rate_limit" | "capability";
     availableFreeModels: { id: string; label: string }[];
   } | null>(null);
+  const [planRetryBanner, setPlanRetryBanner] = useState<{ message: string } | null>(null);
   const [modelsAvailable, setModelsAvailable] = useState<{
     defaultModels: AvailableModel[];
     userModels: (AvailableModel & { id?: string; modelId: string; enabled: boolean })[];
@@ -445,6 +446,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
   } = useAgentPlan({
     workspaceId,
     instruction,
+    previousPlan: plan,
     provider,
     model,
     modelSelection,
@@ -464,6 +466,7 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
     setRunScope,
     setPlanUsage,
     setModelFallbackBanner,
+    setPlanRetryBanner,
     setPlanDebugInfo,
     lastActivityRef,
     abortControllerRef,
@@ -807,19 +810,11 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
             <div className="flex items-start justify-between gap-2">
               <div className="space-y-1">
                 <p className="font-medium text-foreground">
-                  {modelFallbackBanner.reason === "capability"
-                    ? "Model switched for compatibility"
-                    : "Model switched to complete task"}
-                </p>
-                <p className="text-muted-foreground">
-                  {modelFallbackBanner.reason === "capability"
-                    ? <>Model <span className="font-mono text-foreground/90">{modelFallbackBanner.from}</span> doesn&apos;t support streaming. Using <span className="font-mono text-foreground/90">{modelFallbackBanner.to}</span> instead.</>
-                    : <>Model <span className="font-mono text-foreground/90">{modelFallbackBanner.from}</span> hit limits. Switched to <span className="font-mono text-foreground/90">{modelFallbackBanner.to}</span> to complete the task.</>}
+                  Primary model unavailable. Switched to <span className="font-mono text-foreground/90">{modelFallbackBanner.to}</span>.
                 </p>
                 {modelFallbackBanner.availableFreeModels.length > 0 && (
-                  <p className="pt-1 text-muted-foreground">
-                    Other free models you can try:{" "}
-                    {modelFallbackBanner.availableFreeModels.map((m) => m.label || m.id).join(", ")}
+                  <p className="pt-1 text-muted-foreground text-xs">
+                    Other free models: {modelFallbackBanner.availableFreeModels.map((m) => m.label || m.id).join(", ")}
                   </p>
                 )}
               </div>
@@ -828,6 +823,24 @@ export function AgentPanel({ workspaceId }: AgentPanelProps) {
                 size="icon"
                 className="h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground"
                 onClick={() => setModelFallbackBanner(null)}
+                aria-label="Dismiss"
+              >
+                <X className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* Plan retry / layout banner */}
+        {(phase === "loading_plan" || phase === "plan_ready") && planRetryBanner && (
+          <div className="rounded-lg border border-blue-500/40 bg-blue-500/10 p-3 text-sm">
+            <div className="flex items-start justify-between gap-2">
+              <p className="text-foreground">{planRetryBanner.message}</p>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground"
+                onClick={() => setPlanRetryBanner(null)}
                 aria-label="Dismiss"
               >
                 <X className="h-3.5 w-3.5" />

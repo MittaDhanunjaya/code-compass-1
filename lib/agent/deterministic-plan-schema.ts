@@ -51,7 +51,8 @@ const planStepSchema = z.discriminatedUnion("type", [fileEditStepSchema, command
 /** Strict deterministic plan schema (canonical format from LLM). */
 export const deterministicPlanSchema = z
   .object({
-    goal: z.string().min(1, "goal is required"),
+    goal: z.string().optional(),
+    summary: z.string().optional(),
     architecture: architectureSchema.default("monolith"),
     stack: planStackSchema.optional(),
     files: z
@@ -87,7 +88,11 @@ export const deterministicPlanSchema = z
       return true;
     },
     { message: "every file_edit step path must be declared in files" }
-  );
+  )
+  .transform((data) => ({
+    ...data,
+    goal: data.goal || data.summary || "Plan",
+  }));
 
 export type DeterministicPlan = z.infer<typeof deterministicPlanSchema>;
 
@@ -112,6 +117,7 @@ export function validateDeterministicPlan(parsed: unknown): PlanValidationResult
       const plan: AgentPlan = {
         steps: d.steps as (FileEditStep | CommandStep)[],
         summary: d.goal,
+        files: d.files.map((f) => ({ path: f.path.trim(), purpose: f.purpose })),
       };
       const allowedPaths = new Set(d.files.map((f) => f.path.trim()));
       const planHash = hashPlanForValidation(plan);

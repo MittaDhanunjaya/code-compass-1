@@ -40,6 +40,7 @@ vi.mock("@/lib/config", () => ({
   isStreamingEnabled: vi.fn().mockReturnValue(true),
   isWeakModelsEnabled: vi.fn().mockReturnValue(true),
   isOfflineMode: vi.fn().mockReturnValue(false),
+  isDeterministicPlanning: vi.fn().mockReturnValue(false),
 }));
 
 vi.mock("@/lib/api-rate-limit", () => ({

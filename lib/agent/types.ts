@@ -26,10 +26,21 @@ export type CommandStep = {
 
 export type PlanStep = FileEditStep | CommandStep;
 
+export type PlanFileDeclaration = {
+  path: string;
+  purpose: string;
+};
+
 export type AgentPlan = {
   steps: PlanStep[];
   /** Optional short summary of the plan. */
   summary?: string;
+  /** Optional: declared files (path + purpose). When present, every file_edit step path must be in this list. */
+  files?: PlanFileDeclaration[];
+  /** Optional: architecture hint (monolith, microservices, serverless). */
+  architecture?: string;
+  /** Optional: stack hints (frontend, backend, database). */
+  stack?: string[];
 };
 
 /** Command result status (for failure detection). */
@@ -47,6 +58,16 @@ export type LogActionLabel =
   | "AUTO-FIX"
   | "SUMMARY";
 
+/** Structured execution error (from classifyExecutionError). */
+export type StructuredExecutionErrorRef = {
+  errorType: string;
+  missingDependency?: string;
+  failingFile?: string;
+  exitCode: number | null;
+  stderr: string;
+  stdout: string;
+};
+
 /** Execution log entry. */
 export type AgentLogEntry = {
   stepIndex: number;
@@ -59,6 +80,8 @@ export type AgentLogEntry = {
   commandKind?: CommandKind;
   commandStatus?: CommandResultStatus;
   commandStatusSummary?: string;
+  /** Structured error (when command failed). */
+  structuredError?: StructuredExecutionErrorRef;
   /** Self-debug: one auto-fix attempt for failed test commands. */
   autoFixAttempted?: boolean;
   secondRunStatus?: CommandResultStatus;
